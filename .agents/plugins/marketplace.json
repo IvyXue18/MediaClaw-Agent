@@ -1,0 +1,20 @@
+{
+  "name": "mediaclaw-agent",
+  "interface": {
+    "displayName": "MediaClaw Agent"
+  },
+  "plugins": [
+    {
+      "name": "mediaclaw",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mediaclaw"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

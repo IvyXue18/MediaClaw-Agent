@@ -1,0 +1,15 @@
+{
+  "name": "mediaclaw-agent",
+  "version": "0.3.0",
+  "private": true,
+  "description": "MediaClaw Agent host integration package",
+  "type": "module",
+  "scripts": {
+    "check": "node --check plugins/mediaclaw/scripts/device-identity.mjs && node --check plugins/mediaclaw/scripts/websocket-server.mjs && node --check plugins/mediaclaw/scripts/mcp-server.mjs && npm run validate:methods && npm test",
+    "test": "node --test tests/*.test.js",
+    "validate:methods": "node plugins/mediaclaw/skills/mediaclaw-content-research/scripts/validate-method-assets.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

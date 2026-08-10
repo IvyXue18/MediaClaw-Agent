@@ -1,0 +1,82 @@
+{
+  "registryVersion": "1.0.0",
+  "framework": {
+    "id": "mediaclaw-trace-build-v1",
+    "version": "1.0.0",
+    "reference": "references/evidence-to-content-framework.md"
+  },
+  "qualityGate": {
+    "id": "mediaclaw-content-quality-gate-v1",
+    "version": "1.0.0",
+    "reference": "references/content-quality-gate.md"
+  },
+  "methods": [
+    {
+      "id": "keyword-topic-trends-v1",
+      "version": "2.0.0",
+      "kind": "analysis",
+      "tool": "mediaclaw_research_keyword_topics",
+      "reference": "references/keyword-topic-trends.md"
+    },
+    {
+      "id": "keyword-longtail-demand-v1",
+      "version": "2.0.0",
+      "kind": "analysis",
+      "tool": "mediaclaw_research_longtail_keywords",
+      "reference": "references/keyword-longtail-demand.md"
+    },
+    {
+      "id": "account-content-strategy-v1",
+      "version": "1.0.0",
+      "kind": "analysis",
+      "tool": "mediaclaw_scan_account",
+      "reference": "references/account-content-strategy.md"
+    },
+    {
+      "id": "account-recent-hits-v1",
+      "version": "2.0.0",
+      "kind": "analysis",
+      "tool": "mediaclaw_research_account_hits",
+      "reference": "references/account-recent-hits.md"
+    },
+    {
+      "id": "benchmark-account-discovery-v1",
+      "version": "2.0.0",
+      "kind": "analysis",
+      "tool": "mediaclaw_research_benchmark_accounts",
+      "reference": "references/benchmark-account-discovery.md"
+    },
+    {
+      "id": "single-note-breakdown-v1",
+      "version": "2.0.0",
+      "kind": "analysis",
+      "tool": "mediaclaw_research_single_note",
+      "reference": "references/single-note-breakdown.md"
+    },
+    {
+      "id": "evidence-topic-ideation-v1",
+      "version": "1.0.0",
+      "kind": "generation",
+      "reference": "references/topic-ideation.md"
+    },
+    {
+      "id": "evidence-content-brief-v1",
+      "version": "1.0.0",
+      "kind": "generation",
+      "reference": "references/content-brief.md"
+    },
+    {
+      "id": "evidence-content-draft-v1",
+      "version": "1.0.0",
+      "kind": "generation",
+      "reference": "references/content-drafting.md"
+    },
+    {
+      "id": "saved-style-adaptation-v1",
+      "version": "1.0.0",
+      "kind": "generation_modifier",
+      "tool": "mediaclaw_get_style_profile",
+      "reference": "references/saved-account-style.md"
+    }
+  ]
+}

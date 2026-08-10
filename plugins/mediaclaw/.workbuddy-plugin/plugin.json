@@ -1,0 +1,14 @@
+{
+  "name": "mediaclaw",
+  "version": "0.3.0",
+  "description": "Collect Xiaohongshu and Douyin evidence, then apply MediaClaw's versioned TRACE and BUILD methods for analysis and content creation.",
+  "author": {
+    "name": "MediaClaw",
+    "url": "https://mediaclaw.app"
+  },
+  "homepage": "https://github.com/IvyXue18/MediaClaw-Agent",
+  "repository": "https://github.com/IvyXue18/MediaClaw-Agent",
+  "license": "Apache-2.0",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

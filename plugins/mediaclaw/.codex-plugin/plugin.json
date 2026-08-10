@@ -1,0 +1,29 @@
+{
+  "name": "mediaclaw",
+  "version": "0.3.0",
+  "description": "Collect Xiaohongshu and Douyin evidence, then apply MediaClaw's versioned TRACE and BUILD methods for analysis and content creation.",
+  "author": {
+    "name": "MediaClaw",
+    "url": "https://mediaclaw.app"
+  },
+  "homepage": "https://github.com/IvyXue18/MediaClaw-Agent",
+  "repository": "https://github.com/IvyXue18/MediaClaw-Agent",
+  "license": "Apache-2.0",
+  "keywords": ["mediaclaw", "xiaohongshu", "douyin", "content-research"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "MediaClaw 内容研究",
+    "shortDescription": "用专有证据方法完成社媒研究、选题和内容生成。",
+    "longDescription": "让 Agent 调用 MediaClaw 获取真实平台证据，再执行版本化 TRACE 分析、BUILD 内容生成和质量闸门，完成趋势、账号、对标、单篇、选题、大纲与成稿任务。",
+    "developerName": "MediaClaw",
+    "category": "Productivity",
+    "capabilities": ["MCP tools", "Skills"],
+    "defaultPrompt": [
+      "检查 MediaClaw 是否已连接，并告诉我当前可以使用哪些能力。",
+      "采集这篇小红书笔记并拆解它为什么表现好。",
+      "扫描这个关键词的基础数据，先给我内容机会判断。"
+    ],
+    "brandColor": "#625BF6"
+  },
+  "mcpServers": "./.mcp.json"
+}

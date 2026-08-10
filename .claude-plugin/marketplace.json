@@ -1,0 +1,18 @@
+{
+  "name": "mediaclaw-agent",
+  "description": "MediaClaw Agent host integration for evidence collection and content research.",
+  "owner": {
+    "name": "MediaClaw"
+  },
+  "plugins": [
+    {
+      "name": "mediaclaw",
+      "source": "./plugins/mediaclaw",
+      "description": "Connect Claude Code to the MediaClaw browser extension for authorized Xiaohongshu and Douyin research.",
+      "version": "0.3.0",
+      "license": "Apache-2.0",
+      "category": "productivity",
+      "tags": ["content-research", "xiaohongshu", "douyin"]
+    }
+  ]
+}
