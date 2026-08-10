@@ -1,6 +1,6 @@
 {
   "name": "mediaclaw",
-  "version": "0.3.0",
+  "version": "0.3.0-alpha.1",
   "description": "Collect Xiaohongshu and Douyin evidence, then apply MediaClaw's versioned TRACE and BUILD methods for analysis and content creation.",
   "author": {
     "name": "MediaClaw",

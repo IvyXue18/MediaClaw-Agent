@@ -170,6 +170,9 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       ...process.env,
       MEDIACLAW_AGENT_PORT: String(port),
       MEDIACLAW_AGENT_STATE_DIR: agentStateDir,
+      MEDIACLAW_AGENT_ADAPTER_TTL_MS: "500",
+      MEDIACLAW_AGENT_ADAPTER_SWEEP_MS: "100",
+      MEDIACLAW_AGENT_BROKER_IDLE_MS: "500",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -177,11 +180,11 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     child.kill("SIGTERM");
   });
   const reader = createLineReader(child.stdout);
-  await waitForText(child.stderr, /listening on/);
+  await waitForText(child.stderr, /Adapter connected/);
   if (process.platform !== "win32") {
     assert.equal((await stat(agentStateDir)).mode & 0o777, 0o700);
     assert.equal(
-      (await stat(path.join(agentStateDir, "device-identity.json"))).mode & 0o777,
+      (await stat(path.join(agentStateDir, "hosts", "codex", "device-identity.json"))).mode & 0o777,
       0o600,
     );
   }
@@ -196,7 +199,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     })}\n`,
   );
   const initialized = await reader.waitFor((message) => message.id === 1);
-  assert.equal(initialized.result.serverInfo.name, "mediaclaw-codex-bridge");
+  assert.equal(initialized.result.serverInfo.name, "mediaclaw-agent-adapter");
   assert.equal(initialized.result.capabilities.tasks, undefined);
 
   child.stdin.write(
@@ -237,17 +240,18 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       resolveRecoveredAck(message);
       return;
     }
-    if (message.type === "server.hello") {
+    if (message.type === "broker.hello") {
+      const device = message.devices[0];
       socket.send(
         JSON.stringify({
           type: "session.challenge",
           challenge: {
             purpose: "pairing",
-            deviceId: message.device.deviceId,
+            deviceId: device.deviceId,
             challengeId: "test-challenge",
             nonce: "test-nonce",
             extensionId: "test-extension",
-            protocolVersion: "2",
+            protocolVersion: "3",
             expiresAt: Date.now() + 60_000,
           },
         }),
@@ -258,7 +262,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       socket.send(
         JSON.stringify({
           type: "extension.hello",
-          protocolVersion: "2",
+          protocolVersion: "3",
           deviceId: message.deviceId,
           sessionId: "test-session",
           extensionId: "test-extension",
@@ -1376,7 +1380,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     satellite.kill("SIGTERM");
   });
   const satelliteReader = createLineReader(satellite.stdout);
-  await waitForText(satellite.stderr, /proxying through existing bridge/);
+  await waitForText(satellite.stderr, /Adapter connected to shared Broker/);
   satellite.stdin.write(
     `${JSON.stringify({
       jsonrpc: "2.0",
@@ -1504,5 +1508,208 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(
     recoveredStatus.result.structuredContent.result.records[0].title,
     "断线后恢复的结果",
+  );
+});
+
+test("shared Broker isolates Codex and Claude device identities and task results", async (t) => {
+  const port = 19000 + Math.floor(Math.random() * 1000);
+  const serverPath = path.resolve("plugins/mediaclaw/scripts/mcp-server.mjs");
+  const agentStateDir = await mkdtemp(
+    path.join(tmpdir(), "mediaclaw-agent-multihost-"),
+  );
+  t.after(() => rm(agentStateDir, {recursive: true, force: true}));
+  const baseEnv = {
+    ...process.env,
+    MEDIACLAW_AGENT_PORT: String(port),
+    MEDIACLAW_AGENT_STATE_DIR: agentStateDir,
+    MEDIACLAW_AGENT_ADAPTER_TTL_MS: "500",
+    MEDIACLAW_AGENT_ADAPTER_SWEEP_MS: "100",
+    MEDIACLAW_AGENT_BROKER_IDLE_MS: "500",
+  };
+  const codex = spawn(process.execPath, [serverPath], {
+    env: {
+      ...baseEnv,
+      MEDIACLAW_AGENT_HOST: "codex",
+      MEDIACLAW_AGENT_DEVICE_NAME: "MediaClaw Agent (Codex)",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const claude = spawn(process.execPath, [serverPath], {
+    env: {
+      ...baseEnv,
+      MEDIACLAW_AGENT_HOST: "claude-code",
+      MEDIACLAW_AGENT_DEVICE_NAME: "MediaClaw Agent (Claude Code)",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => codex.kill("SIGTERM"));
+  t.after(() => claude.kill("SIGTERM"));
+  const codexReader = createLineReader(codex.stdout);
+  const claudeReader = createLineReader(claude.stdout);
+  await Promise.all([
+    waitForText(codex.stderr, /Adapter connected/),
+    waitForText(claude.stderr, /Adapter connected/),
+  ]);
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/extension`);
+  t.after(() => socket.close());
+  const devicesByHost = new Map();
+  const authenticatedDeviceIds = new Set();
+  const announcedDeviceIds = new Set();
+
+  function challengeDevice(device) {
+    if (!device?.deviceId || announcedDeviceIds.has(device.deviceId)) return;
+    announcedDeviceIds.add(device.deviceId);
+    devicesByHost.set(device.host, device);
+    socket.send(
+      JSON.stringify({
+        type: "session.challenge",
+        challenge: {
+          purpose: "pairing",
+          deviceId: device.deviceId,
+          challengeId: `challenge-${device.host}`,
+          nonce: `nonce-${device.host}`,
+          extensionId: "test-extension",
+          protocolVersion: "3",
+          expiresAt: Date.now() + 60_000,
+        },
+      }),
+    );
+  }
+
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(String(event.data));
+    if (message.type === "broker.hello") {
+      for (const device of message.devices || []) challengeDevice(device);
+      return;
+    }
+    if (message.type === "device.hello") {
+      challengeDevice(message.device);
+      return;
+    }
+    if (message.type === "session.proof") {
+      authenticatedDeviceIds.add(message.deviceId);
+      socket.send(
+        JSON.stringify({
+          type: "extension.hello",
+          protocolVersion: "3",
+          deviceId: message.deviceId,
+          sessionId: `session-${message.deviceId}`,
+          extensionId: "test-extension",
+          extensionVersion: "0.3.0",
+        }),
+      );
+      return;
+    }
+    if (message.type !== "task.start") return;
+    const host = [...devicesByHost.entries()].find(
+      ([, device]) => device.deviceId === message.deviceId,
+    )?.[0];
+    socket.send(
+      JSON.stringify({
+        type: "task.result",
+        taskId: message.taskId,
+        deviceId: message.deviceId,
+        response: {
+          ok: true,
+          data: {
+            records: [
+              {
+                basic: {
+                  noteId: `${host}-note`,
+                  title: `${host} isolated result`,
+                  url: `https://www.xiaohongshu.com/explore/${host}-note`,
+                },
+              },
+            ],
+          },
+        },
+      }),
+    );
+  });
+
+  const handshakeDeadline = Date.now() + 5_000;
+  while (
+    (authenticatedDeviceIds.size < 2 || devicesByHost.size < 2) &&
+    Date.now() < handshakeDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(devicesByHost.size, 2);
+  assert.equal(authenticatedDeviceIds.size, 2);
+  assert.notEqual(
+    devicesByHost.get("codex").deviceId,
+    devicesByHost.get("claude-code").deviceId,
+  );
+
+  for (const [child, id] of [
+    [codex, 1],
+    [claude, 2],
+  ]) {
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "initialize",
+        params: {protocolVersion: "2025-11-25"},
+      })}\n`,
+    );
+  }
+  await Promise.all([
+    codexReader.waitFor((message) => message.id === 1),
+    claudeReader.waitFor((message) => message.id === 2),
+  ]);
+
+  codex.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_capture_search_basic",
+        arguments: {keyword: "codex", limit: 1},
+      },
+    })}\n`,
+  );
+  claude.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_capture_search_basic",
+        arguments: {keyword: "claude", limit: 1},
+      },
+    })}\n`,
+  );
+  const [codexResult, claudeResult] = await Promise.all([
+    codexReader.waitFor((message) => message.id === 11),
+    claudeReader.waitFor((message) => message.id === 12),
+  ]);
+  assert.equal(
+    codexResult.result.structuredContent.result.records[0].title,
+    "codex isolated result",
+  );
+  assert.equal(
+    claudeResult.result.structuredContent.result.records[0].title,
+    "claude-code isolated result",
+  );
+
+  const claudeTaskId = claudeResult.result.structuredContent.task.taskId;
+  codex.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 13,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_task_status",
+        arguments: {taskId: claudeTaskId},
+      },
+    })}\n`,
+  );
+  const crossHostRead = await codexReader.waitFor((message) => message.id === 13);
+  assert.equal(
+    crossHostRead.result.structuredContent.error.code,
+    "TASK_NOT_FOUND",
   );
 });

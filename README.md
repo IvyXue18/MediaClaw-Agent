@@ -2,7 +2,7 @@
 
 MediaClaw Agent 是 MediaClaw 浏览器插件的本机 Agent 接入包。它把同一套 Skill、MCP 工具和本机连接能力安装到 Codex、Claude Code 等 Agent 宿主；真正的平台读取、采集、会员校验、积分扣除和人工确认仍由浏览器插件执行。
 
-> 当前状态：V0.3 技术预览，供联调和验收使用。Codex、Claude Code 可以开始测试；WorkBuddy 清单已预留，但尚未完成真实宿主安装验证。
+> 当前状态：V0.3 Alpha，供联调和验收使用。Codex、Claude Code 可以开始测试；WorkBuddy 清单已预留，但尚未完成真实宿主安装验证。
 
 ## 用户需要安装什么
 
@@ -42,6 +42,12 @@ claude plugin install mediaclaw@mediaclaw-agent
 ### WorkBuddy
 
 仓库已包含 `.workbuddy-plugin/plugin.json`，但在拿到可测试的 WorkBuddy 宿主前，不把它标记为“已支持”。插件设置页应显示“待安装”；只有检测到真实启动过的 adapter 后才显示“可测试”。
+
+## 本机运行时
+
+用户不需要单独安装 Broker、MCP adapter 或 Node.js。宿主启动 MediaClaw 时会自动运行接入入口：如果本机已有 Node.js 22 及以上版本，就直接使用仓库源码；否则首次启动会从当前固定 GitHub Release 下载对应的 macOS/Linux 单文件运行时，校验 SHA-256 后缓存并启动。首次下载期间会显示“正在下载”和“正在建立本机连接”，之后复用本地缓存。
+
+每台电脑只运行一个共享 Broker，但 Codex、Claude Code、WorkBuddy 各自保留独立设备身份和授权。卸载浏览器插件不会自动修改 Agent 宿主；卸载 Agent 包也不会删除浏览器插件。
 
 ## 能力边界
 

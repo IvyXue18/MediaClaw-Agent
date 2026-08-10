@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-function resolveStateDirectory(env = process.env) {
+export function resolveStateDirectory(env = process.env) {
   if (env.MEDIACLAW_AGENT_STATE_DIR) {
     return path.resolve(env.MEDIACLAW_AGENT_STATE_DIR);
   }
@@ -45,7 +45,7 @@ export function buildDeviceProofPayload({
   challengeId,
   nonce,
   extensionId,
-  protocolVersion = "2",
+  protocolVersion = "3",
 } = {}) {
   return [
     "mediaclaw-agent",

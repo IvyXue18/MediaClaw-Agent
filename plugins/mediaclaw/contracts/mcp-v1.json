@@ -1,8 +1,8 @@
 {
   "contractVersion": "2.0.0",
-  "serverVersion": "0.3.0",
+  "serverVersion": "0.3.0-alpha.1",
   "transport": "stdio+loopback_websocket",
-  "protocolVersion": "2",
+  "protocolVersion": "3",
   "principles": {
     "extensionOwnsAuthorizationAndExecution": true,
     "agentNeverParsesPlatformPages": true,

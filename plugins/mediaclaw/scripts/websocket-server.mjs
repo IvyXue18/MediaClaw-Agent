@@ -142,6 +142,7 @@ function createSocketPeer(socket, handlers = {}) {
 export function createLoopbackWebSocketServer({
   port = 17373,
   path = "/extension",
+  serviceName = "mediaclaw-agent-broker",
   onHttpRequest,
   onConnection,
   onMessage,
@@ -161,7 +162,7 @@ export function createLoopbackWebSocketServer({
       response.end(
         JSON.stringify({
           ok: true,
-          service: "mediaclaw-codex-bridge",
+          service: serviceName,
           websocketPath: path,
         }),
       );
