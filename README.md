@@ -1,74 +1,70 @@
 # MediaClaw Agent
 
-MediaClaw Agent 是 MediaClaw 浏览器插件的本机 Agent 接入包。它把同一套 Skill、MCP 工具和本机连接能力安装到 Codex、Claude Code 等 Agent 宿主；真正的平台读取、采集、会员校验、积分扣除和人工确认仍由浏览器插件执行。
+MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包，面向 Codex 和 WorkBuddy 提供安装入口。连接成功后，你可以直接使用 MediaClaw 浏览器插件已经提供的内容采集、资料读取和社媒研究能力，并继续完成选题、策划与内容创作。
 
-> 当前状态：V0.3 Alpha，供联调和验收使用。Codex、Claude Code 可以开始测试；WorkBuddy 清单已预留，但尚未完成真实宿主安装验证。
+它不能单独使用：你还需要安装 MediaClaw 浏览器插件、完成有效会员验证，并在浏览器中批准当前 Agent。页面访问、积分消耗和需要人工确认的操作，始终以浏览器插件中的提示为准。
 
-## 用户需要安装什么
+> 当前版本为 `0.3.0 RC`。请以 [Releases](https://github.com/IvyXue18/MediaClaw-Agent/releases) 中的版本说明和 MediaClaw 插件实际提示为准。
 
-用户需要两部分，缺一不可：
+## 可以做什么
 
-1. 从浏览器插件市场安装或升级 MediaClaw 浏览器插件。
-2. 在每个要使用的 Agent 宿主中安装一次本仓库的接入包。
+连接成功后，你可以直接让 Agent：
 
-浏览器插件不会自动修改 Codex、Claude Code 或 WorkBuddy 的配置；本仓库也不会替代浏览器插件。Agent 安装完成后，打开 MediaClaw 设置中的“Agent 接管”，批准该宿主的设备配对即可。
+- 读取 MediaClaw 中已经保存的数据、账号分析、风格档案、选题和生成结果。
+- 获取小红书、抖音的单篇内容，采集关键词搜索结果、账号内容和评论。
+- 补充内容详情、识别图片文字，并在服务可用时获取视频逐字稿。
+- 研究关键词趋势、长尾需求、账号内容策略、近期高表现内容和赛道对标账号。
+- 拆解一篇内容的选题、结构、表达和互动信号。
+- 基于真实证据生成选题、标题、内容方案、大纲、图文稿、口播稿或视频脚本。
+- 使用已保存的账号风格完成适配、改写，并输出 Markdown 或 HTML 报告。
+- 查询长任务进度，或取消仍在执行的任务。
 
-## 直接交给 Agent 安装
+例如，你可以这样说：
 
-可以把下面这句话连同仓库链接发给当前 Agent：
+> 分析“小户型收纳”最近有哪些内容机会，先检查我已有的数据，不够再补充采集，最后给我 10 个选题。
 
-> 请从 https://github.com/IvyXue18/MediaClaw-Agent 安装 MediaClaw Agent 接入包。先识别当前宿主，只安装这个宿主需要的入口；安装后检查连接状态，并引导我到浏览器插件里批准配对。不要要求我手工填写端口或令牌。
+> 拆解这个小红书链接为什么表现好，再结合我保存的账号风格写一篇新稿。
 
-当前可用的安装命令入口：
+> 研究这个抖音账号近期高表现内容，给我下一阶段的内容方向和 7 天选题计划。
 
-### Codex
+Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展示预计积分并再次确认；Agent 不应在未确认时替你产生费用。
 
-```bash
-codex plugin marketplace add IvyXue18/MediaClaw-Agent
-codex plugin add mediaclaw@mediaclaw-agent
-```
+## 自动检查 Agent 更新
 
-安装后新建一个 Codex 任务，使 Skill 与 MCP 工具完成加载。
+每个新会话第一次使用 MediaClaw 时，Agent 会检查官方接入包版本。发现新版本后，它会先说明版本变化并征求你的授权；同意后由 Agent 刷新对应宿主的 marketplace、验证安装结果，并创建一个已经加载新版本的新任务继续原需求。你不需要手动输入升级命令、重新描述需求或重新配对。
 
-### Claude Code
+当前会话已经加载的 Skill 和 MCP 不能热更新，因此升级完成后必须由新任务续接。更新检查失败不会阻塞当前版本使用；未经授权不会修改本机安装。
 
-```bash
-claude plugin marketplace add IvyXue18/MediaClaw-Agent
-claude plugin install mediaclaw@mediaclaw-agent
-```
+## 安装前准备
 
-安装后重启 Claude Code 会话。仓库清单已通过 Claude Code 严格格式校验；正式对外前还需完成整套配对和真实采集验收。
+你需要：
 
-### WorkBuddy
+1. 安装或升级 MediaClaw 浏览器插件。
+2. 在 MediaClaw 插件中完成有效会员验证。
+3. 在浏览器中登录你要使用的小红书或抖音账号。
+4. 在 Codex 或 WorkBuddy 中安装本仓库的 MediaClaw 接入包。
+5. 打开 MediaClaw 插件的“Agent 接管”，批准当前 Agent。
 
-仓库已包含 `.workbuddy-plugin/plugin.json`，但在拿到可测试的 WorkBuddy 宿主前，不把它标记为“已支持”。插件设置页应显示“待安装”；只有检测到真实启动过的 adapter 后才显示“可测试”。
+## 把这一段发给 Agent
 
-## 本机运行时
+你可以直接把下面的话发给 Codex 或 WorkBuddy：
 
-用户不需要单独安装 Broker、MCP adapter 或 Node.js。宿主启动 MediaClaw 时会自动运行接入入口：如果本机已有 Node.js 22 及以上版本，就直接使用仓库源码；否则首次启动会从当前固定 GitHub Release 下载对应的 macOS/Linux 单文件运行时，校验 SHA-256 后缓存并启动。首次下载期间会显示“正在下载”和“正在建立本机连接”，之后复用本地缓存。
+> 请识别你当前运行在 Codex 还是 WorkBuddy，并从 https://github.com/IvyXue18/MediaClaw-Agent 安装对应的 MediaClaw 官方接入包。安装完成后新建或提示我新建一个会话，检查 MediaClaw 连接状态，再引导我到浏览器插件的“Agent 接管”中批准当前设备。不要向我索取激活码、Cookie、平台 Token、端口或本机令牌。
 
-每台电脑只运行一个共享 Broker，但 Codex、Claude Code、WorkBuddy 各自保留独立设备身份和授权。卸载浏览器插件不会自动修改 Agent 宿主；卸载 Agent 包也不会删除浏览器插件。
+也可以查看分宿主安装步骤：[安装与连接](docs/INSTALLATION.md)。
 
-## 能力边界
+## 使用边界
 
-- Agent：理解任务、调用 MCP、读取获准数据、使用 Skill 组织分析与内容生成。
-- 本机接入包：保存宿主设备身份、连接浏览器插件、转发任务、统一协议和结果结构。
-- 浏览器插件：访问已登录页面、执行读取/采集/提取、实施免费与会员能力差异、积分和人工确认。
-- Agent 不直接解析小红书或抖音页面，不持有浏览器登录态，也不能绕过插件授权。
-- 逐字稿只走浏览器插件现有的报价与确认流程；V0.3 不提供 BYOK 和本地绕过方案。
+- MediaClaw Agent 必须配合官方浏览器插件使用，不能替代浏览器插件。
+- Agent 只能使用你在浏览器插件中批准的能力。
+- 遇到登录失效、验证码、平台限制或风险提示时，任务可能暂停并请你在浏览器中处理。
+- 涉及会员、积分或外部写入的操作，以执行前显示的范围和确认信息为准。
+- 请不要在对话、Issue 或日志中提交 Cookie、Token、激活码、设备私钥或真实用户数据。
 
-详细说明见 [安装与配对](docs/INSTALLATION.md)、[架构与权限边界](docs/ARCHITECTURE.md) 和 [开发状态](docs/DEVELOPMENT.md)。
+## 更多信息
 
-## 本地开发验证
-
-```bash
-npm run check
-python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/mediaclaw
-claude plugin validate --strict .
-```
-
-本项目当前只使用 Node.js 内置模块，没有运行时 npm 依赖。
-
-## 许可与发布
-
-本仓库采用 [Apache License 2.0](LICENSE)。它允许使用、修改和商业分发，并要求保留许可证与相关声明；已经按该许可证发布的版本，其既有授权不能通过后续换证追回。
+- MediaClaw 官网：[mediaclaw.app](https://mediaclaw.app)
+- 安装与连接：[docs/INSTALLATION.md](docs/INSTALLATION.md)
+- 安全问题：[SECURITY.md](SECURITY.md)
+- 版本记录：[CHANGELOG.md](CHANGELOG.md)
+- 开源许可：[Apache License 2.0](LICENSE)

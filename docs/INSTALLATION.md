@@ -1,40 +1,88 @@
-# 安装与配对
+# 安装与连接 MediaClaw Agent
 
-## 安装模型
+MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户不需要自行配置端口、令牌或运行服务。
 
-MediaClaw 采用“双安装、按宿主配对”：
-
-- 浏览器侧只安装一个 MediaClaw 扩展，负责真实平台能力。
-- Codex、Claude Code、WorkBuddy 等宿主各自安装一次 Agent 接入包。
-- 同一台电脑的每个宿主拥有独立设备身份，用户可以分别批准、查看状态和撤销。
-- 浏览器插件中的总开关统一控制是否允许本机 Agent 调用；已授权设备在同一页面分卡片显示。
-
-接入包内部已经包含 Skill、宿主 MCP 清单、薄 adapter 和共享 Broker。普通用户不需要逐项安装，也不需要预装 Node.js：本机没有 Node.js 22 时，启动器会从当前固定 GitHub Release 下载并校验官方单文件运行时。V0.3 Alpha 的自动运行时覆盖 macOS arm64/x64 与 Linux arm64/x64；Windows 和 WorkBuddy 真实宿主安装尚未验收。
-
-分别配对的目的不是重复收费，而是让用户知道是哪一个宿主在调用，并能只撤销其中一个。如果多个宿主共用同一身份，审计、撤销和任务归属都会混在一起。
-
-## 首次配对
+## 第一步：准备浏览器插件
 
 1. 安装或升级 MediaClaw 浏览器插件。
-2. 在当前 Agent 宿主安装本仓库接入包并新建会话。
-3. 对 Agent 说：“检查 MediaClaw 连接状态。”
-4. 打开浏览器插件 → 设置 → Agent 接管。
-5. 打开“允许本机 Agent 调用”。
-6. 在“待确认 Agent”中核对宿主名称和指纹，点击“批准”。
-7. 回到 Agent，再次说：“检查 MediaClaw 连接状态，并列出已配对设备。”
+2. 在 MediaClaw 插件中完成有效会员验证。
+3. 在浏览器中登录需要使用的小红书或抖音账号。
+4. 确认插件可以正常打开。
 
-首次启动若需要下载运行时，会先显示“正在下载首次运行所需的官方组件”，完成校验后再显示“正在建立本机连接”。这一步取决于 GitHub 下载速度，后续启动直接使用缓存。任何阶段都不应要求用户提供激活码、Cookie、平台 Token、端口或本机令牌。
+## 第二步：安装到 Agent
 
-连接过程必须显示明确状态：等待本机服务、等待插件连接、等待批准、正在建立安全连接、已连接或失败原因。正常本机握手应是秒级；如果达到分钟级，应按故障处理，而不是让用户持续等待。
+### Codex
 
-## 多宿主规则
+```bash
+codex plugin marketplace add IvyXue18/MediaClaw-Agent
+codex plugin add mediaclaw@mediaclaw-agent
+```
 
-- 多个宿主可以同时保持配对，不采用“后配对者顶掉前配对者”。
-- 读取已落地本地数据可以并发。
-- 会操作浏览器页面的采集任务由共享 Broker 全局排队，V0.3 默认同一时刻只执行一个。
-- 每个任务记录 `host`、`deviceId`、`taskId` 和创建时间，结果只返回给发起宿主。
-- 撤销某一宿主后，它的新任务立即被拒绝；其他已授权宿主不受影响。
+安装完成后，新建一个 Codex 任务。
+
+### WorkBuddy
+
+在 WorkBuddy 中执行：
+
+```text
+/plugin marketplace add IvyXue18/MediaClaw-Agent
+/plugin install mediaclaw@mediaclaw-agent
+```
+
+安装完成后，新建一个 WorkBuddy 会话。
+
+## 后续更新
+
+每个新会话首次使用 MediaClaw 时都会检查官方 Agent 版本。发现新版后，Agent 会先请求授权，再自动刷新 marketplace、更新接入包并创建加载新版的新会话继续原任务。正常情况下不需要用户手动运行以下命令。
+
+如果自动升级失败，可让 Agent 报告失败阶段。宿主实际执行的固定命令为：
+
+Codex：
+
+```bash
+codex plugin marketplace upgrade mediaclaw-agent
+```
+
+WorkBuddy：
+
+```bash
+codebuddy plugin marketplace update mediaclaw-agent
+codebuddy plugin update mediaclaw@mediaclaw-agent
+```
+
+升级必须经过用户明确授权。新版任务启动时会自动替换仍存活的旧版共享 Broker，并复用已有设备批准；除非协议确实不兼容，否则不需要重新配对。
+
+## 第三步：批准连接
+
+1. 在新会话中说：“检查 MediaClaw 连接状态。”
+2. 打开 MediaClaw 浏览器插件 → 设置 → Agent 接管。
+3. 开启“允许本机 Agent 调用”。
+4. 核对当前 Agent 名称，在待确认列表中点击“批准”。
+5. 回到 Agent，再次说：“检查 MediaClaw 连接状态，并告诉我现在能做什么。”
+
+每个 Agent 需要分别批准。撤销其中一个不会影响其他已经批准的 Agent。
+
+## 常见问题
+
+### 安装后没有检测到 Agent
+
+- 确认安装完成后创建了全新的 Agent 会话。
+- 确认 MediaClaw 浏览器插件已经开启。
+- 回到 Agent 再次要求它检查连接状态。
+- 如果仍未连接，让 Agent 报告具体安装状态和错误信息，不要反复重装。
+
+### 一直显示等待批准
+
+打开浏览器插件的“Agent 接管”，检查待确认列表并批准当前 Agent。不要把激活码、Cookie、Token 或任何本机令牌发给 Agent。
+
+### 采集过程中要求处理浏览器
+
+登录失效、验证码、平台限制或页面异常时，MediaClaw 可能暂停任务。按浏览器中的提示处理后，再让 Agent 查询原任务状态。
+
+### 为什么有些能力不能使用
+
+Agent 接管需要有效会员；逐字稿等计费能力还需要足够积分和执行前确认。平台登录状态、页面状态和安全限制也可能影响任务。让 Agent 说明缺少的条件和最小下一步，不要让它尝试绕过插件提示。
 
 ## 卸载
 
-先在浏览器插件中撤销对应设备，再使用宿主自己的插件卸载命令。卸载一个宿主接入包不应删除其他宿主的授权或共享任务数据。
+先在 MediaClaw 浏览器插件的“Agent 接管”中撤销对应 Agent，再使用 Codex 或 WorkBuddy 自己的插件管理入口卸载 MediaClaw。

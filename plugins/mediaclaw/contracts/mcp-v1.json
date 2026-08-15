@@ -1,6 +1,6 @@
 {
   "contractVersion": "2.0.0",
-  "serverVersion": "0.3.0-alpha.1",
+  "serverVersion": "0.3.0-rc.1",
   "transport": "stdio+loopback_websocket",
   "protocolVersion": "3",
   "principles": {
@@ -10,6 +10,8 @@
     "basicListCaptureNeverImplicitlyEnhances": true,
     "largeResultsUseChunkedExtensionTransport": true,
     "videoTranscriptRequiresOneTimeQuote": true,
+    "destructiveDataClearRequiresPreviewToken": true,
+    "agentUpdateRequiresUserApproval": true,
     "videoTranscriptSupportsLocalExecution": false,
     "byokSupported": false
   },
@@ -19,18 +21,22 @@
     "persistentRecordKey": "assetId or recordId",
     "limitationsField": "limitations",
     "paywallField": "paywall",
-    "transcriptConfirmationField": "quoteId"
+    "transcriptConfirmationField": "quoteId",
+    "agentUpdateField": "agentUpdate"
   },
   "tools": [
     {"name": "mediaclaw_connection_status", "kind": "control", "stability": "stable"},
     {"name": "mediaclaw_list_paired_devices", "kind": "control", "stability": "stable"},
     {"name": "mediaclaw_list_assets", "kind": "asset", "stability": "stable"},
     {"name": "mediaclaw_get_asset", "kind": "asset", "stability": "stable"},
+    {"name": "mediaclaw_get_video_transcript", "kind": "asset", "stability": "stable"},
     {"name": "mediaclaw_capture_note", "kind": "capture", "stability": "stable"},
     {"name": "mediaclaw_capture_search_basic", "kind": "capture", "stability": "stable"},
     {"name": "mediaclaw_capture_profile_basic", "kind": "capture", "stability": "stable"},
     {"name": "mediaclaw_enhance_records", "kind": "capture", "stability": "stable", "requiresCredential": true, "confirmationArgument": "confirmed"},
     {"name": "mediaclaw_capture_comments", "kind": "capture", "stability": "stable"},
+    {"name": "mediaclaw_preview_clear_data", "kind": "control", "stability": "stable"},
+    {"name": "mediaclaw_confirm_clear_data", "kind": "control", "stability": "stable", "confirmationArgument": "confirmationToken"},
     {"name": "mediaclaw_extract_image_text", "kind": "extract", "stability": "stable", "requiresCredential": true},
     {"name": "mediaclaw_quote_video_transcript", "kind": "quote", "stability": "stable", "requiresCredential": true},
     {"name": "mediaclaw_confirm_video_transcript", "kind": "extract", "stability": "stable", "requiresCredential": true, "metered": true, "confirmationArgument": "quoteId"},

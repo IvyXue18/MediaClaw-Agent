@@ -39,6 +39,9 @@ jobs:
           cd dist
           sha256sum mediaclaw-agent-* > checksums.txt
 
+      - name: Smoke test standalone runtime
+        run: node tests/standalone-runtime-smoke.mjs dist/mediaclaw-agent-linux-x64
+
       - name: Attest runtime provenance
         uses: actions/attest-build-provenance@v2
         with:

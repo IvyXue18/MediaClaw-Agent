@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import {AsyncLocalStorage} from "node:async_hooks";
 import METHOD_REGISTRY from "../contracts/methods-v1.json" with {type: "json"};
+import {compareVersions} from "./agent-update.mjs";
 import {createLoopbackWebSocketServer} from "./websocket-server.mjs";
 import {
   buildDeviceProofPayload,
@@ -12,11 +13,11 @@ import {
 } from "./device-identity.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-broker";
-const SERVER_VERSION = "0.3.0-alpha.1";
+const SERVER_VERSION = "0.3.0-rc.1";
 const PROTOCOL_VERSION = "3";
 const DEFAULT_PORT = Number(process.env.MEDIACLAW_AGENT_PORT || 17373);
 const DEFAULT_SCAN_LIMIT = 80;
-const MAX_SCAN_LIMIT = 500;
+const MAX_SCAN_LIMIT = 300;
 const TASK_TTL_MS = 24 * 60 * 60 * 1000;
 const LEGACY_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const BRIDGE_HTTP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORT}`;
@@ -82,6 +83,7 @@ let bridgeStatus = {
   port: DEFAULT_PORT,
   error: null,
 };
+let brokerUpgradeScheduled = false;
 
 function normalizeHostKey(value) {
   const normalized = String(value || "")
@@ -90,14 +92,19 @@ function normalizeHostKey(value) {
     .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 64);
+  if (
+    ["claude", "claude-code", "claude-desktop", "claude-cowork"].includes(
+      normalized,
+    )
+  ) {
+    return "claude";
+  }
   return normalized || "agent";
 }
 
 function defaultHostDisplayName(hostKey) {
   if (hostKey === "codex") return "MediaClaw Agent (Codex)";
-  if (hostKey === "claude" || hostKey === "claude-code") {
-    return "MediaClaw Agent (Claude Code)";
-  }
+  if (hostKey === "claude") return "MediaClaw Agent (Claude)";
   if (hostKey === "workbuddy") return "MediaClaw Agent (WorkBuddy)";
   return `MediaClaw Agent (${hostKey})`;
 }
@@ -1486,6 +1493,7 @@ async function runDeepBatch(parent, input = {}) {
       options: {
         includeComments: input.includeComments === true,
         includeBloggerMetrics: input.includeBloggerMetrics === true,
+        confirmation: {confirmed: true, source: "mediaclaw_deep_collect"},
       },
     });
     parent.childTaskIds.push(child.taskId);
@@ -2267,8 +2275,8 @@ async function runSingleNoteResearch(parent, input = {}) {
         platform,
         featureKey: "capture.comments",
         limit: Math.min(
-          200,
-          Math.max(1, Math.floor(Number(input.commentLimit) || 60)),
+          500,
+          Math.max(1, Math.floor(Number(input.commentLimit) || 30)),
         ),
       }),
     );
@@ -2554,7 +2562,7 @@ const tools = [
       properties: {
         keyword: {type: "string"},
         platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
-        limit: {type: "integer", minimum: 1, maximum: 500, default: 80},
+        limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
         timeRange: {type: "string", enum: ["any", "7d", "30d", "6m", "1y"]},
         sortBy: {type: "string", enum: ["default", "likes", "collects", "comments"]},
         contentType: {type: "string", enum: ["all", "image", "video"]},
@@ -2575,7 +2583,7 @@ const tools = [
       properties: {
         profileUrl: {type: "string"},
         platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
-        limit: {type: "integer", minimum: 1, maximum: 500, default: 80},
+        limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
         idempotencyKey: {type: "string"},
         async: {type: "boolean", default: false},
       },
@@ -2624,7 +2632,7 @@ const tools = [
           enum: ["xiaohongshu", "douyin"],
           default: "xiaohongshu",
         },
-        limit: {type: "integer", minimum: 1, maximum: 500, default: 80},
+        limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
         timeRange: {
           type: "string",
           enum: ["any", "7d", "30d", "6m", "1y"],
@@ -2685,7 +2693,7 @@ const tools = [
           enum: ["xiaohongshu", "douyin"],
           default: "xiaohongshu",
         },
-        limit: {type: "integer", minimum: 10, maximum: 500, default: 80},
+        limit: {type: "integer", minimum: 10, maximum: 300, default: 80},
         timeRange: {
           type: "string",
           enum: ["any", "7d", "30d", "6m", "1y"],
@@ -2741,7 +2749,7 @@ const tools = [
           enum: ["xiaohongshu", "douyin"],
           default: "xiaohongshu",
         },
-        limit: {type: "integer", minimum: 1, maximum: 500, default: 80},
+        limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
         async: {type: "boolean", default: false},
       },
       required: ["profileUrl"],
@@ -2785,7 +2793,7 @@ const tools = [
         scanLimit: {
           type: "integer",
           minimum: 5,
-          maximum: 500,
+          maximum: 300,
           default: 80,
         },
         recentPostLimit: {
@@ -2825,7 +2833,7 @@ const tools = [
         scanLimit: {
           type: "integer",
           minimum: 10,
-          maximum: 500,
+          maximum: 300,
           default: 80,
         },
         candidateLimit: {
@@ -2936,8 +2944,9 @@ const tools = [
         commentLimit: {
           type: "integer",
           minimum: 1,
-          maximum: 200,
-          default: 60,
+          maximum: 500,
+          default: 30,
+          description: "单轮安全上限 500；超过后需要分批并遵循插件连续采集保护。",
         },
         includeMediaText: {type: "boolean", default: true},
         forceMediaExtraction: {type: "boolean", default: false},
@@ -2976,7 +2985,7 @@ const tools = [
   },
   {
     name: "mediaclaw_capture_comments",
-    description: "调用插件现有的单条评论采集能力，不增加 Agent 专属条数限制。",
+    description: "调用插件现有的单篇评论采集能力。单篇不设会员数量权益墙；为降低账号风控风险，单轮安全上限为 500 条，连续任务还会受插件累计预算和冷却保护。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -2987,7 +2996,7 @@ const tools = [
           enum: ["xiaohongshu", "douyin"],
           default: "xiaohongshu",
         },
-        limit: {type: "integer", minimum: 1, maximum: 200, default: 60},
+        limit: {type: "integer", minimum: 1, maximum: 500, default: 30},
         idempotencyKey: {type: "string"},
         async: {type: "boolean", default: false},
       },
@@ -2998,7 +3007,7 @@ const tools = [
   {
     name: "mediaclaw_capture_comments_full",
     description:
-      "套餐能力：深度采集指定内容的完整评论样本，最多 200 条。未激活、过期或冻结时会返回结构化付费墙。",
+      "兼容旧调用的单篇评论采集别名；不再单独要求会员，建议新调用使用 mediaclaw_capture_comments。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -3009,7 +3018,7 @@ const tools = [
           enum: ["xiaohongshu", "douyin"],
           default: "xiaohongshu",
         },
-        limit: {type: "integer", minimum: 21, maximum: 200, default: 60},
+        limit: {type: "integer", minimum: 1, maximum: 500, default: 60},
         async: {type: "boolean", default: false},
       },
       required: ["url"],
@@ -3042,6 +3051,34 @@ const tools = [
     },
   },
   {
+    name: "mediaclaw_preview_clear_data",
+    description:
+      "预览清空插件采集数据的影响，返回记录、评论、逐字稿数量、预计释放空间和一次性 confirmationToken；只预览，不删除。必须先向用户展示结果并取得明确确认。",
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        async: {type: "boolean", default: false},
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_confirm_clear_data",
+    description:
+      "使用 mediaclaw_preview_clear_data 返回的未过期 confirmationToken 清空插件采集数据和采集进度。仅在用户看到预览并明确确认后调用；保留登录、设置、同步目标和 Studio 数据。",
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        confirmationToken: {type: "string"},
+        async: {type: "boolean", default: false},
+      },
+      required: ["confirmationToken"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "mediaclaw_get_data_pool_record",
     description:
       "按 recordId 读取 MediaClaw 数据池中的一条完整记录，供后续 OCR、逐字稿或自定义分析使用。",
@@ -3050,6 +3087,34 @@ const tools = [
       type: "object",
       properties: {
         recordId: {type: "string"},
+        async: {type: "boolean", default: false},
+      },
+      required: ["recordId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_get_video_transcript",
+    description:
+      "按 recordId 轻量读取插件已经保存的视频逐字稿，不重新提取、不重复扣积分。默认返回 12000 字符；hasMore=true 时必须继续使用 nextOffset 读取，直到完整取回。",
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        recordId: {type: "string"},
+        format: {
+          type: "string",
+          enum: ["plain", "sentence"],
+          default: "plain",
+          description: "plain 为完整逐字稿，sentence 为带时间码的分句节奏稿",
+        },
+        offset: {type: "integer", minimum: 0, default: 0},
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 50000,
+          default: 12000,
+        },
         async: {type: "boolean", default: false},
       },
       required: ["recordId"],
@@ -3310,16 +3375,16 @@ async function executeCaptureTool(name, args) {
     return startSingleCapture("comments", {
       ...args,
       featureKey: "capture.comments",
-      limit: Math.min(200, Math.max(1, Math.floor(Number(args.limit) || 60))),
+      limit: Math.min(500, Math.max(1, Math.floor(Number(args.limit) || 30))),
     });
   }
   if (name === "mediaclaw_capture_comments_full") {
     return startSingleCapture("comments", {
       ...args,
-      featureKey: "capture.comments_full",
+      featureKey: "capture.comments",
       limit: Math.min(
-        200,
-        Math.max(21, Math.floor(Number(args.limit) || 60)),
+        500,
+        Math.max(1, Math.floor(Number(args.limit) || 60)),
       ),
     });
   }
@@ -3337,12 +3402,39 @@ async function executeCaptureTool(name, args) {
       },
     });
   }
+  if (name === "mediaclaw_preview_clear_data") {
+    return startSingleCapture("data_pool_maintenance", {
+      ...args,
+      options: {action: "preview_clear"},
+    });
+  }
+  if (name === "mediaclaw_confirm_clear_data") {
+    return startSingleCapture("data_pool_maintenance", {
+      ...args,
+      options: {
+        action: "confirm_clear",
+        confirmationToken: args.confirmationToken,
+      },
+    });
+  }
   if (name === "mediaclaw_get_data_pool_record") {
     return startSingleCapture("data_pool_query", {
       ...args,
       options: {
         operation: "get",
         recordId: args.recordId,
+      },
+    });
+  }
+  if (name === "mediaclaw_get_video_transcript") {
+    return startSingleCapture("data_pool_query", {
+      ...args,
+      options: {
+        operation: "transcript",
+        recordId: args.recordId,
+        format: args.format || "plain",
+        offset: args.offset || 0,
+        limit: args.limit || 12_000,
       },
     });
   }
@@ -3536,10 +3628,24 @@ function resolveAdapterToken(payload = {}) {
 async function registerAdapter(payload = {}) {
   const hostKey = normalizeHostKey(payload.hostKey || payload.host);
   const instanceId = normalizeText(payload.instanceId, 160) || createId("adapter");
+  const adapterVersion = normalizeText(payload.adapterVersion, 80);
+  if (compareVersions(adapterVersion, SERVER_VERSION) === 1) {
+    scheduleBrokerUpgrade(adapterVersion);
+    return {
+      ok: false,
+      restartRequired: true,
+      error: {
+        code: "BROKER_RESTART_REQUIRED",
+        message: `MediaClaw Broker ${SERVER_VERSION} 正在切换到 ${adapterVersion}`,
+      },
+      brokerVersion: SERVER_VERSION,
+      adapterVersion,
+    };
+  }
   const adapter = await ensureAdapterIdentity({
     hostKey,
     displayName: normalizeText(payload.displayName, 160),
-    adapterVersion: normalizeText(payload.adapterVersion, 80),
+    adapterVersion,
   });
   const previous = adapter.instances.get(instanceId);
   if (previous?.token) adapterTokens.delete(previous.token);
@@ -3560,6 +3666,19 @@ async function registerAdapter(payload = {}) {
     protocolVersion: PROTOCOL_VERSION,
     device: publicDevice(adapter),
   };
+}
+
+function scheduleBrokerUpgrade(adapterVersion) {
+  if (brokerUpgradeScheduled) return;
+  brokerUpgradeScheduled = true;
+  process.stderr.write(
+    `[mediaclaw] newer Adapter ${adapterVersion} requested Broker ${SERVER_VERSION} restart\n`,
+  );
+  const timer = setTimeout(() => {
+    extensionPeer?.close(1012, "MediaClaw Agent is loading a newer Broker");
+    void websocketServer.close().finally(() => process.exit(0));
+  }, 100);
+  timer.unref?.();
 }
 
 function unregisterAdapter(payload = {}) {
@@ -3614,7 +3733,8 @@ async function handleBridgeHttpRequest(request, response) {
   }
   const payload = await readJsonRequest(request);
   if (request.url === "/v1/adapters/register") {
-    sendJson(response, 200, await registerAdapter(payload));
+    const registration = await registerAdapter(payload);
+    sendJson(response, registration.restartRequired ? 409 : 200, registration);
     return true;
   }
   if (request.url === "/v1/adapters/unregister") {

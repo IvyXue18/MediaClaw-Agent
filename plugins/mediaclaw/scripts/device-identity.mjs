@@ -25,6 +25,7 @@ function exportPublicKey(publicKey) {
 }
 
 function normalizeStoredIdentity(value = {}) {
+  value ||= {};
   const privateKeyPem = String(value.privateKeyPem || "").trim();
   const publicKey = String(value.publicKey || "").trim();
   if (!privateKeyPem || !publicKey) return null;
@@ -37,6 +38,43 @@ function normalizeStoredIdentity(value = {}) {
     privateKey,
     createdAt: String(value.createdAt || new Date().toISOString()),
   };
+}
+
+async function migrateLegacyClaudeIdentity({stateDirectory, host}) {
+  if (host !== "claude") return null;
+  const parentDirectory = path.dirname(stateDirectory);
+  for (const legacyHost of ["claude-code", "claude-desktop", "claude-cowork"]) {
+    const legacyPath = path.join(
+      parentDirectory,
+      legacyHost,
+      "device-identity.json",
+    );
+    try {
+      const stored = JSON.parse(await fs.readFile(legacyPath, "utf8"));
+      if (!normalizeStoredIdentity(stored)) continue;
+      const targetPath = path.join(stateDirectory, "device-identity.json");
+      await fs.writeFile(targetPath, `${JSON.stringify(stored, null, 2)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      return stored;
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        try {
+          return JSON.parse(
+            await fs.readFile(
+              path.join(stateDirectory, "device-identity.json"),
+              "utf8",
+            ),
+          );
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 export function buildDeviceProofPayload({
@@ -73,6 +111,11 @@ export async function loadOrCreateDeviceIdentity({
     );
   } catch {
     identity = null;
+  }
+  if (!identity) {
+    identity = normalizeStoredIdentity(
+      await migrateLegacyClaudeIdentity({stateDirectory, host}),
+    );
   }
   if (!identity) {
     const {privateKey, publicKey} = crypto.generateKeyPairSync("ed25519");

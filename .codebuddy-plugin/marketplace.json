@@ -8,11 +8,10 @@
     {
       "name": "mediaclaw",
       "source": "./plugins/mediaclaw",
-      "description": "Connect Claude Code to the MediaClaw browser extension for authorized Xiaohongshu and Douyin research.",
-      "version": "0.3.0-alpha.1",
+      "description": "Connect WorkBuddy to the MediaClaw browser extension for authorized Xiaohongshu and Douyin research.",
+      "version": "0.3.0-rc.1",
       "license": "Apache-2.0",
-      "category": "productivity",
-      "tags": ["content-research", "xiaohongshu", "douyin"]
+      "category": "productivity"
     }
   ]
 }

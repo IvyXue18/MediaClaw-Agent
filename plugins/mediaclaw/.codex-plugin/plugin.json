@@ -1,6 +1,6 @@
 {
   "name": "mediaclaw",
-  "version": "0.3.0-alpha.1",
+  "version": "0.3.0-rc.1",
   "description": "Collect Xiaohongshu and Douyin evidence, then apply MediaClaw's versioned TRACE and BUILD methods for analysis and content creation.",
   "author": {
     "name": "MediaClaw",
@@ -23,7 +23,9 @@
       "采集这篇小红书笔记并拆解它为什么表现好。",
       "扫描这个关键词的基础数据，先给我内容机会判断。"
     ],
-    "brandColor": "#625BF6"
+    "brandColor": "#625BF6",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png"
   },
   "mcpServers": "./.mcp.json"
 }

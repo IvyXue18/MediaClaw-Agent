@@ -173,6 +173,8 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       MEDIACLAW_AGENT_ADAPTER_TTL_MS: "500",
       MEDIACLAW_AGENT_ADAPTER_SWEEP_MS: "100",
       MEDIACLAW_AGENT_BROKER_IDLE_MS: "500",
+      MEDIACLAW_AGENT_UPDATE_MANIFEST_URL:
+        "data:application/json,%5B%7B%22tag_name%22%3A%22v0.3.1%22%2C%22draft%22%3Afalse%7D%5D",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -200,6 +202,20 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   const initialized = await reader.waitFor((message) => message.id === 1);
   assert.equal(initialized.result.serverInfo.name, "mediaclaw-agent-adapter");
+  assert.deepEqual(initialized.result.serverInfo.icons[0].sizes, ["128x128"]);
+  assert.equal(initialized.result.serverInfo.icons[0].mimeType, "image/png");
+  assert.deepEqual(
+    Buffer.from(
+      initialized.result.serverInfo.icons[0].src.replace(
+        "data:image/png;base64,",
+        "",
+      ),
+      "base64",
+    ),
+    await readFile(
+      path.resolve("plugins/mediaclaw/assets/logo.png"),
+    ),
+  );
   assert.equal(initialized.result.capabilities.tasks, undefined);
 
   child.stdin.write(
@@ -220,6 +236,31 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   assert.equal(connectionStatus.result.structuredContent.bridge.port, port);
   assert.equal(connectionStatus.result.structuredContent.connected, false);
+  assert.equal(
+    connectionStatus.result.structuredContent.agentUpdate.status,
+    "update_available",
+  );
+  assert.equal(
+    connectionStatus.result.structuredContent.agentUpdate.currentVersion,
+    "0.3.0-rc.1",
+  );
+  assert.equal(
+    connectionStatus.result.structuredContent.agentUpdate.latestVersion,
+    "0.3.1",
+  );
+  assert.equal(
+    connectionStatus.result.structuredContent.agentUpdate.approvalRequired,
+    true,
+  );
+  assert.deepEqual(
+    connectionStatus.result.structuredContent.agentUpdate.execution.commands,
+    ["codex plugin marketplace upgrade mediaclaw-agent"],
+  );
+  assert.equal(
+    connectionStatus.result.structuredContent.agentUpdate.continuation.createNewTask,
+    true,
+  );
+  assert.match(connectionStatus.result.content[0].text, /agentUpdate/);
 
   const socket = new WebSocket(`ws://127.0.0.1:${port}/extension`);
   t.after(() => socket.close());
@@ -561,6 +602,10 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       const id = message.task.targetUrl.split("/").pop();
       if (id.startsWith("deep-")) {
         assert.equal(message.task.featureKey, "capture.detail_batch");
+        assert.deepEqual(message.task.options.confirmation, {
+          confirmed: true,
+          source: "mediaclaw_deep_collect",
+        });
       }
       socket.send(
         JSON.stringify({
@@ -935,8 +980,19 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.ok(toolNames.includes("mediaclaw_research_benchmark_accounts"));
   assert.ok(toolNames.includes("mediaclaw_research_single_note"));
   assert.ok(toolNames.includes("mediaclaw_capture_comments_full"));
+  const singleCommentTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_capture_comments",
+  );
+  assert.equal(singleCommentTool.inputSchema.properties.limit.maximum, 500);
+  const basicSearchTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_capture_search_basic",
+  );
+  assert.equal(basicSearchTool.inputSchema.properties.limit.maximum, 300);
   assert.ok(toolNames.includes("mediaclaw_query_data_pool"));
+  assert.ok(toolNames.includes("mediaclaw_preview_clear_data"));
+  assert.ok(toolNames.includes("mediaclaw_confirm_clear_data"));
   assert.ok(toolNames.includes("mediaclaw_get_data_pool_record"));
+  assert.ok(toolNames.includes("mediaclaw_get_video_transcript"));
   assert.ok(toolNames.includes("mediaclaw_extract_image_text"));
   assert.ok(toolNames.includes("mediaclaw_quote_video_transcript"));
   assert.ok(toolNames.includes("mediaclaw_confirm_video_transcript"));
@@ -1368,7 +1424,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   const singleNote = singleNoteResponse.result.structuredContent.result;
   assert.equal(singleNote.recommendedMethodId, "single-note-breakdown-v1");
   assert.equal(singleNote.recommendedMethodVersion, "2.0.0");
-  assert.equal(singleNote.coverage.commentCount, 60);
+  assert.equal(singleNote.coverage.commentCount, 30);
   assert.equal(singleNote.mediaText.text, "图片中的文案");
   assert.equal(singleNote.coverage.recordId, "rec-note-single-research");
 
@@ -1511,7 +1567,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
 });
 
-test("shared Broker isolates Codex and Claude device identities and task results", async (t) => {
+test("shared Broker isolates Codex and WorkBuddy device identities and task results", async (t) => {
   const port = 19000 + Math.floor(Math.random() * 1000);
   const serverPath = path.resolve("plugins/mediaclaw/scripts/mcp-server.mjs");
   const agentStateDir = await mkdtemp(
@@ -1534,21 +1590,21 @@ test("shared Broker isolates Codex and Claude device identities and task results
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  const claude = spawn(process.execPath, [serverPath], {
+  const workbuddy = spawn(process.execPath, [serverPath], {
     env: {
       ...baseEnv,
-      MEDIACLAW_AGENT_HOST: "claude-code",
-      MEDIACLAW_AGENT_DEVICE_NAME: "MediaClaw Agent (Claude Code)",
+      MEDIACLAW_AGENT_HOST: "workbuddy",
+      MEDIACLAW_AGENT_DEVICE_NAME: "MediaClaw Agent (WorkBuddy)",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
   t.after(() => codex.kill("SIGTERM"));
-  t.after(() => claude.kill("SIGTERM"));
+  t.after(() => workbuddy.kill("SIGTERM"));
   const codexReader = createLineReader(codex.stdout);
-  const claudeReader = createLineReader(claude.stdout);
+  const workbuddyReader = createLineReader(workbuddy.stdout);
   await Promise.all([
     waitForText(codex.stderr, /Adapter connected/),
-    waitForText(claude.stderr, /Adapter connected/),
+    waitForText(workbuddy.stderr, /Adapter connected/),
   ]);
 
   const socket = new WebSocket(`ws://127.0.0.1:${port}/extension`);
@@ -1639,12 +1695,12 @@ test("shared Broker isolates Codex and Claude device identities and task results
   assert.equal(authenticatedDeviceIds.size, 2);
   assert.notEqual(
     devicesByHost.get("codex").deviceId,
-    devicesByHost.get("claude-code").deviceId,
+    devicesByHost.get("workbuddy").deviceId,
   );
 
   for (const [child, id] of [
     [codex, 1],
-    [claude, 2],
+    [workbuddy, 2],
   ]) {
     child.stdin.write(
       `${JSON.stringify({
@@ -1657,7 +1713,7 @@ test("shared Broker isolates Codex and Claude device identities and task results
   }
   await Promise.all([
     codexReader.waitFor((message) => message.id === 1),
-    claudeReader.waitFor((message) => message.id === 2),
+    workbuddyReader.waitFor((message) => message.id === 2),
   ]);
 
   codex.stdin.write(
@@ -1671,31 +1727,31 @@ test("shared Broker isolates Codex and Claude device identities and task results
       },
     })}\n`,
   );
-  claude.stdin.write(
+  workbuddy.stdin.write(
     `${JSON.stringify({
       jsonrpc: "2.0",
       id: 12,
       method: "tools/call",
       params: {
         name: "mediaclaw_capture_search_basic",
-        arguments: {keyword: "claude", limit: 1},
+        arguments: {keyword: "workbuddy", limit: 1},
       },
     })}\n`,
   );
-  const [codexResult, claudeResult] = await Promise.all([
+  const [codexResult, workbuddyResult] = await Promise.all([
     codexReader.waitFor((message) => message.id === 11),
-    claudeReader.waitFor((message) => message.id === 12),
+    workbuddyReader.waitFor((message) => message.id === 12),
   ]);
   assert.equal(
     codexResult.result.structuredContent.result.records[0].title,
     "codex isolated result",
   );
   assert.equal(
-    claudeResult.result.structuredContent.result.records[0].title,
-    "claude-code isolated result",
+    workbuddyResult.result.structuredContent.result.records[0].title,
+    "workbuddy isolated result",
   );
 
-  const claudeTaskId = claudeResult.result.structuredContent.task.taskId;
+  const workbuddyTaskId = workbuddyResult.result.structuredContent.task.taskId;
   codex.stdin.write(
     `${JSON.stringify({
       jsonrpc: "2.0",
@@ -1703,7 +1759,7 @@ test("shared Broker isolates Codex and Claude device identities and task results
       method: "tools/call",
       params: {
         name: "mediaclaw_task_status",
-        arguments: {taskId: claudeTaskId},
+        arguments: {taskId: workbuddyTaskId},
       },
     })}\n`,
   );

@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "mediaclaw": {
-      "command": "bash",
-      "args": ["./scripts/launch-agent.sh"],
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "plugin_root=\"${CODEBUDDY_PLUGIN_ROOT:-$PWD}\"; exec node \"$plugin_root/scripts/mcp-server.mjs\""
+      ],
       "cwd": ".",
       "env": {
         "MEDIACLAW_AGENT_HOST": "workbuddy",
