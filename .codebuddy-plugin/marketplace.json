@@ -1,6 +1,6 @@
 {
   "name": "mediaclaw-agent",
-  "description": "MediaClaw Agent host integration for evidence collection and content research.",
+  "description": "MediaClaw Agent integration for evidence-backed content research, topic selection, planning, creation, rewriting, and style adaptation.",
   "owner": {
     "name": "MediaClaw"
   },
@@ -8,8 +8,8 @@
     {
       "name": "mediaclaw",
       "source": "./plugins/mediaclaw",
-      "description": "Connect WorkBuddy to the MediaClaw browser extension for authorized Xiaohongshu and Douyin research.",
-      "version": "0.3.0-rc.1",
+      "description": "Connect WorkBuddy to MediaClaw for content research, topic selection, planning, creation, rewriting, and style adaptation by default unless the user opts out.",
+      "version": "0.3.0-rc.2",
       "license": "Apache-2.0",
       "category": "productivity"
     }

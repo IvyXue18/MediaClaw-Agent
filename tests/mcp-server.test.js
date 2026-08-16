@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {spawn} from "node:child_process";
-import {mkdtemp, readFile, rm, stat} from "node:fs/promises";
+import {chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile} from "node:fs/promises";
 import {connect} from "node:net";
 import {tmpdir} from "node:os";
 import path from "node:path";
@@ -164,6 +164,20 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "plugins/mediaclaw/scripts/mcp-server.mjs",
   );
   const agentStateDir = await mkdtemp(path.join(tmpdir(), "mediaclaw-agent-test-"));
+  const fakeBinDir = path.join(agentStateDir, "fake-bin");
+  await mkdir(fakeBinDir);
+  const fakeCodexPath = path.join(
+    fakeBinDir,
+    process.platform === "win32" ? "codex.cmd" : "codex",
+  );
+  await writeFile(
+    fakeCodexPath,
+    process.platform === "win32"
+      ? "@echo off\r\nif \"%1 %2\"==\"plugin list\" (echo mediaclaw@mediaclaw-agent  installed, enabled  0.3.1  C:\\fake) else (echo upgraded)\r\n"
+      : "#!/bin/sh\nif [ \"$1 $2\" = \"plugin list\" ]; then\n  echo 'mediaclaw@mediaclaw-agent  installed, enabled  0.3.1  /tmp/fake'\nelse\n  echo 'upgraded'\nfi\n",
+    "utf8",
+  );
+  if (process.platform !== "win32") await chmod(fakeCodexPath, 0o755);
   t.after(() => rm(agentStateDir, {recursive: true, force: true}));
   const child = spawn(process.execPath, [serverPath], {
     env: {
@@ -175,6 +189,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       MEDIACLAW_AGENT_BROKER_IDLE_MS: "500",
       MEDIACLAW_AGENT_UPDATE_MANIFEST_URL:
         "data:application/json,%5B%7B%22tag_name%22%3A%22v0.3.1%22%2C%22draft%22%3Afalse%7D%5D",
+      PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH || ""}`,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -242,7 +257,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.currentVersion,
-    "0.3.0-rc.1",
+    "0.3.0-rc.2",
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.latestVersion,
@@ -251,6 +266,10 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.approvalRequired,
     true,
+  );
+  assert.match(
+    connectionStatus.result.structuredContent.agentUpdate.approvalId,
+    /^update_/,
   );
   assert.deepEqual(
     connectionStatus.result.structuredContent.agentUpdate.execution.commands,
@@ -261,6 +280,49 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     true,
   );
   assert.match(connectionStatus.result.content[0].text, /agentUpdate/);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4001,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_manage_agent_update",
+        arguments: {
+          decision: "reject",
+          approvalId:
+            connectionStatus.result.structuredContent.agentUpdate.approvalId,
+        },
+      },
+    })}\n`,
+  );
+  const rejectedUpdate = await reader.waitFor((message) => message.id === 4001);
+  assert.equal(rejectedUpdate.result.structuredContent.ok, true);
+  assert.equal(
+    rejectedUpdate.result.structuredContent.changedInstallation,
+    false,
+  );
+  assert.equal(
+    rejectedUpdate.result.structuredContent.agentUpdate.status,
+    "dismissed",
+  );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4002,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_connection_status",
+        arguments: {},
+      },
+    })}\n`,
+  );
+  const dismissedStatus = await reader.waitFor((message) => message.id === 4002);
+  assert.equal(
+    dismissedStatus.result.structuredContent.agentUpdate.status,
+    "dismissed",
+  );
 
   const socket = new WebSocket(`ws://127.0.0.1:${port}/extension`);
   t.after(() => socket.close());
@@ -1564,6 +1626,72 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(
     recoveredStatus.result.structuredContent.result.records[0].title,
     "断线后恢复的结果",
+  );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4003,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_manage_agent_update",
+        arguments: {
+          decision: "approve",
+          approvalId:
+            connectionStatus.result.structuredContent.agentUpdate.approvalId,
+          originalGoal: "继续完成真实采集任务",
+        },
+      },
+    })}\n`,
+  );
+  const approvedUpdate = await reader.waitFor((message) => message.id === 4003);
+  assert.equal(approvedUpdate.result.structuredContent.ok, true);
+  assert.equal(
+    approvedUpdate.result.structuredContent.agentUpdate.installedVersion,
+    "0.3.1",
+  );
+  assert.equal(
+    approvedUpdate.result.structuredContent.agentUpdate.oldSessionFenced,
+    true,
+  );
+  assert.equal(
+    approvedUpdate.result.structuredContent.continuation.originalGoal,
+    "继续完成真实采集任务",
+  );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4004,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_list_paired_devices",
+        arguments: {},
+      },
+    })}\n`,
+  );
+  const fencedCall = await reader.waitFor((message) => message.id === 4004);
+  assert.equal(fencedCall.result.isError, true);
+  assert.equal(
+    fencedCall.result.structuredContent.error.code,
+    "OLD_SESSION_FENCED",
+  );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4005,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_connection_status",
+        arguments: {},
+      },
+    })}\n`,
+  );
+  const fencedStatus = await reader.waitFor((message) => message.id === 4005);
+  assert.equal(
+    fencedStatus.result.structuredContent.agentUpdate.status,
+    "installed_restart_required",
   );
 });
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import path from "node:path";
 import {AsyncLocalStorage} from "node:async_hooks";
 import METHOD_REGISTRY from "../contracts/methods-v1.json" with {type: "json"};
@@ -13,7 +14,7 @@ import {
 } from "./device-identity.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-broker";
-const SERVER_VERSION = "0.3.0-rc.1";
+const SERVER_VERSION = "0.3.0-rc.2";
 const PROTOCOL_VERSION = "3";
 const DEFAULT_PORT = Number(process.env.MEDIACLAW_AGENT_PORT || 17373);
 const DEFAULT_SCAN_LIMIT = 80;
@@ -33,6 +34,10 @@ const BROKER_IDLE_TIMEOUT_MS = Number(
 );
 const MAX_RESULT_TRANSFER_CHUNKS = 1024;
 const MAX_RESULT_TRANSFER_CHARS = 32 * 1024 * 1024;
+const TASK_CANCEL_TIMEOUT_MS = Math.max(
+  100,
+  Number(process.env.MEDIACLAW_AGENT_CANCEL_TIMEOUT_MS || 10_000),
+);
 const AGENT_PRICING_URL =
   "https://mediaclaw.app/pricing?source=agent";
 const KEYWORD_TOPIC_METHOD_ID = "keyword-topic-trends-v1";
@@ -73,6 +78,9 @@ const AGENT_DEEP_CAPTURE_UPGRADE = Object.freeze({
 const tasks = new Map();
 const idempotentTaskIds = new Map();
 const resultTransfers = new Map();
+const pendingTaskCancellations = new Map();
+const TASK_STATE_PATH = path.join(BROKER_STATE_DIRECTORY, "tasks-v1.json");
+let taskStateWrite = Promise.resolve();
 let extensionPeer = null;
 let extensionInfo = null;
 let activeExtensionTaskId = "";
@@ -258,8 +266,102 @@ function taskSnapshot(task) {
   };
 }
 
+function serializableTask(task) {
+  return {
+    taskId: task.taskId,
+    kind: task.kind,
+    status: task.status,
+    message: task.message,
+    input: task.input,
+    idempotencyKey: task.idempotencyKey || "",
+    captureTask: task.captureTask,
+    owner: task.owner,
+    progress: task.progress,
+    result: task.result,
+    error: task.error,
+    childTaskIds: task.childTaskIds,
+    currentChildTaskId: task.currentChildTaskId,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+  };
+}
+
+function scheduleTaskStatePersist() {
+  const payload = JSON.stringify({
+    version: 1,
+    tasks: [...tasks.values()].map(serializableTask),
+  });
+  taskStateWrite = taskStateWrite
+    .catch(() => null)
+    .then(async () => {
+      await fs.mkdir(BROKER_STATE_DIRECTORY, {recursive: true, mode: 0o700});
+      const temporaryPath = `${TASK_STATE_PATH}.${process.pid}.tmp`;
+      await fs.writeFile(temporaryPath, payload, {mode: 0o600});
+      await fs.rename(temporaryPath, TASK_STATE_PATH);
+    })
+    .catch((error) => {
+      process.stderr.write(
+        `[mediaclaw] cannot persist Agent task state: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+    });
+  return taskStateWrite;
+}
+
+async function restoreTaskState() {
+  let payload;
+  try {
+    payload = JSON.parse(await fs.readFile(TASK_STATE_PATH, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      process.stderr.write(
+        `[mediaclaw] cannot restore Agent task state: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+    }
+    return;
+  }
+  const expiresBefore = Date.now() - TASK_TTL_MS;
+  for (const snapshot of Array.isArray(payload?.tasks) ? payload.tasks : []) {
+    const taskId = normalizeText(snapshot?.taskId, 160);
+    const updatedAtMs = Date.parse(String(snapshot?.updatedAt || ""));
+    if (!taskId || !Number.isFinite(updatedAtMs) || updatedAtMs < expiresBefore) {
+      continue;
+    }
+    let resolveCompletion;
+    const completion = new Promise((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const wasInFlight = [
+      "running",
+      "cancel_pending",
+      "waiting_for_extension",
+    ].includes(snapshot.status);
+    const task = {
+      ...snapshot,
+      taskId,
+      status: wasInFlight ? "waiting_for_extension" : snapshot.status,
+      message: wasInFlight
+        ? "任务已从持久状态恢复，等待浏览器插件断点续跑"
+        : snapshot.message,
+      completion,
+      resolveCompletion,
+    };
+    tasks.set(taskId, task);
+    if (task.idempotencyKey) {
+      idempotentTaskIds.set(task.idempotencyKey, taskId);
+    }
+    if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+      resolveCompletion(task);
+    }
+  }
+}
+
 function updateTask(task, patch = {}) {
   Object.assign(task, patch, {updatedAt: nowIso()});
+  void scheduleTaskStatePersist();
   return task;
 }
 
@@ -300,6 +402,7 @@ function createTask({
         ? "等待用户在 MediaClaw 插件中批准设备配对"
         : "等待 MediaClaw 插件开启 Agent 调用",
     input,
+    idempotencyKey,
     captureTask,
     owner: owner
       ? {
@@ -320,6 +423,7 @@ function createTask({
   };
   tasks.set(taskId, task);
   if (idempotencyKey) idempotentTaskIds.set(idempotencyKey, taskId);
+  void scheduleTaskStatePersist();
   return task;
 }
 
@@ -1158,6 +1262,14 @@ function acceptTaskResultMessage(message = {}) {
     const alreadyFinished = ["succeeded", "failed"].includes(task.status);
     if (!alreadyFinished) {
       const response = message.response || {};
+      if (response.canceled === true) {
+        finishTask(task, {
+          status: "cancelled",
+          result: null,
+          error: null,
+          message: "浏览器已确认任务取消",
+        });
+      } else {
       const result = attachPaywall(
         compactCaptureResponse(response, task.captureTask),
         response,
@@ -1170,10 +1282,19 @@ function acceptTaskResultMessage(message = {}) {
           ? null
           : result.error || {
               code: "CAPTURE_FAILED",
-              message: "浏览器采集失败",
-            },
+            message: "浏览器采集失败",
+          },
       });
+      }
     }
+  }
+  const cancellation = pendingTaskCancellations.get(taskId);
+  if (cancellation) {
+    cancellation.resolve({
+      ok: task.status === "cancelled",
+      canceled: task.status === "cancelled",
+      reason: task.status === "cancelled" ? "confirmed_by_result" : "task_completed",
+    });
   }
   if (activeExtensionTaskId === taskId) {
     activeExtensionTaskId = "";
@@ -1378,6 +1499,23 @@ function handleExtensionMessage(message = {}) {
     return;
   }
 
+  if (message.type === "task.cancel.result") {
+    const taskId = normalizeText(message.taskId, 160);
+    const task = tasks.get(taskId);
+    const cancellation = pendingTaskCancellations.get(taskId);
+    if (
+      !task ||
+      !cancellation ||
+      (task.owner?.deviceId &&
+        normalizeText(message.deviceId || task.owner.deviceId, 160) !==
+          task.owner.deviceId)
+    ) {
+      return;
+    }
+    cancellation.resolve(message.response || {});
+    return;
+  }
+
   const taskId = normalizeText(message.taskId, 160);
   const task = tasks.get(taskId);
 
@@ -1408,6 +1546,13 @@ function handleExtensionClose(peer) {
   extensionInfo = null;
   deviceSessions.clear();
   resultTransfers.clear();
+  for (const cancellation of pendingTaskCancellations.values()) {
+    cancellation.resolve({
+      ok: false,
+      canceled: false,
+      reason: "extension_disconnected",
+    });
+  }
   if (activeExtensionTaskId) {
     const task = tasks.get(activeExtensionTaskId);
     if (task && task.status === "running") {
@@ -2443,25 +2588,107 @@ async function cancelTask(taskId) {
   if (["succeeded", "failed", "cancelled"].includes(task.status)) {
     return {ok: true, canceled: false, task: taskSnapshot(task)};
   }
-  updateTask(task, {status: "cancelled", message: "任务已取消"});
   if (
     (task.kind === "batch" || task.kind === "workflow") &&
     task.currentChildTaskId
   ) {
-    await cancelTask(task.currentChildTaskId);
+    const childResult = await cancelTask(task.currentChildTaskId);
+    if (!childResult.canceled) return childResult;
   }
-  if (activeExtensionTaskId === task.taskId && extensionPeer) {
-    extensionPeer.send({
-      type: "task.cancel",
-      taskId: task.taskId,
-      deviceId: task.owner?.deviceId || "",
-      sessionId: deviceSessions.get(task.owner?.deviceId)?.sessionId || "",
+  if (task.status === "queued" && activeExtensionTaskId !== task.taskId) {
+    updateTask(task, {status: "cancelled", message: "等待中的任务已取消"});
+    task.resolveCompletion(task);
+    pumpQueue();
+    return {ok: true, canceled: true, task: taskSnapshot(task)};
+  }
+  if (!extensionPeer) {
+    return {
+      ok: false,
+      canceled: false,
+      error: {code: "EXTENSION_DISCONNECTED", message: "浏览器插件未连接，无法确认取消"},
+      task: taskSnapshot(task),
+    };
+  }
+  if (pendingTaskCancellations.has(taskId)) {
+    return await pendingTaskCancellations.get(taskId).promise;
+  }
+
+  const previousStatus = task.status;
+  updateTask(task, {status: "cancel_pending", message: "正在等待浏览器确认取消"});
+  let settle;
+  const responsePromise = new Promise((resolve) => {
+    settle = resolve;
+  });
+  let timer;
+  const promise = (async () => {
+    const response = await Promise.race([
+      responsePromise,
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve({ok: false, canceled: false, reason: "timeout"}),
+          TASK_CANCEL_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    clearTimeout(timer);
+    pendingTaskCancellations.delete(taskId);
+    if (response?.ok === true && response?.canceled === true) {
+      updateTask(task, {status: "cancelled", message: "浏览器已确认任务取消"});
+      if (activeExtensionTaskId === taskId) activeExtensionTaskId = "";
+      task.resolveCompletion(task);
+      pumpQueue();
+      return {ok: true, canceled: true, task: taskSnapshot(task)};
+    }
+    if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+      return {
+        ok: task.status === "cancelled",
+        canceled: task.status === "cancelled",
+        error:
+          task.status === "cancelled"
+            ? undefined
+            : {code: "CANCEL_TOO_LATE", message: "任务已在取消确认前结束"},
+        task: taskSnapshot(task),
+      };
+    }
+    updateTask(task, {
+      status:
+        extensionPeer && activeExtensionTaskId === taskId
+          ? previousStatus === "waiting_for_extension" ? "waiting_for_extension" : "running"
+          : "waiting_for_extension",
+      message:
+        response?.reason === "timeout"
+          ? "取消确认超时，任务未标记为已取消"
+          : "浏览器未确认取消，任务保持可恢复",
     });
-    activeExtensionTaskId = "";
-  }
-  task.resolveCompletion(task);
-  pumpQueue();
-  return {ok: true, canceled: true, task: taskSnapshot(task)};
+    const code =
+      response?.reason === "timeout"
+        ? "CANCEL_TIMEOUT"
+        : response?.reason === "extension_disconnected"
+          ? "EXTENSION_DISCONNECTED"
+          : "CANCEL_REJECTED";
+    return {
+      ok: false,
+      canceled: false,
+      error: {
+        code,
+        message:
+          response?.message ||
+          response?.error?.message ||
+          (code === "CANCEL_TIMEOUT"
+            ? "等待浏览器确认取消超时"
+            : "浏览器未确认任务取消"),
+      },
+      task: taskSnapshot(task),
+    };
+  })();
+  pendingTaskCancellations.set(taskId, {resolve: settle, promise});
+  extensionPeer.send({
+    type: "task.cancel",
+    taskId: task.taskId,
+    deviceId: task.owner?.deviceId || "",
+    sessionId: deviceSessions.get(task.owner?.deviceId)?.sessionId || "",
+  });
+  return await promise;
 }
 
 // Keep the portable async:true + task_status contract as the advertised path.
@@ -3509,7 +3736,9 @@ async function handleToolCall(params = {}) {
       recoveredTaskIds: [...recoveredTaskIds],
       waitingTaskCount: [...tasks.values()].filter((task) =>
         adapterOwnsTask(adapter, task) &&
-        ["queued", "waiting_for_extension", "running"].includes(task.status),
+        ["queued", "waiting_for_extension", "running", "cancel_pending"].includes(
+          task.status,
+        ),
       ).length,
       message,
     });
@@ -3758,11 +3987,14 @@ async function handleBridgeHttpRequest(request, response) {
       {adapter},
       () => handleBrokerMcp(adapter, payload),
     );
+    await scheduleTaskStatePersist();
     sendJson(response, 200, result);
     return true;
   }
   return false;
 }
+
+await restoreTaskState();
 
 const websocketServer = createLoopbackWebSocketServer({
   port: DEFAULT_PORT,

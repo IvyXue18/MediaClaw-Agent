@@ -65,7 +65,7 @@ test("a newer Adapter makes an older shared Broker exit for replacement", async 
   const body = await response.json();
   assert.equal(body.restartRequired, true);
   assert.equal(body.error.code, "BROKER_RESTART_REQUIRED");
-  assert.equal(body.brokerVersion, "0.3.0-rc.1");
+  assert.equal(body.brokerVersion, "0.3.0-rc.2");
   assert.equal(body.adapterVersion, "0.3.1");
 
   const exitCode = await Promise.race([

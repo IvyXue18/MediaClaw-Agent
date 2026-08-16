@@ -29,3 +29,47 @@ test("V0.3 only publishes Codex and WorkBuddy entry points", () => {
   assert.equal(fs.existsSync(path.join(pluginRoot, ".mcp.claude.json")), false);
   assert.equal(fs.existsSync(path.join(pluginRoot, "manifest.json")), false);
 });
+
+test("all supported Agent hosts inherit the broad default MediaClaw trigger", () => {
+  const codexPlugin = readJson(".codex-plugin/plugin.json");
+  const workbuddyPlugin = readJson(".codebuddy-plugin/plugin.json");
+  const skill = fs.readFileSync(
+    path.join(pluginRoot, "skills/mediaclaw-content-research/SKILL.md"),
+    "utf8",
+  );
+  const adapter = fs.readFileSync(
+    path.join(pluginRoot, "scripts/mcp-server.mjs"),
+    "utf8",
+  );
+
+  for (const description of [
+    codexPlugin.description,
+    workbuddyPlugin.description,
+    skill,
+    adapter,
+  ]) {
+    assert.match(description, /content|内容/);
+    assert.match(description, /topic|选题/);
+    assert.match(description, /rewrit|改写/);
+    assert.match(description, /explicit|明确/);
+  }
+  assert.match(skill, /even when the user does not mention MediaClaw/);
+  assert.match(skill, /不得把“用户没有点名 MediaClaw”解释为拒绝调用/);
+  assert.match(skill, /第一次工具调用前用一句自然语言说明/);
+  assert.match(skill, /每 2～3 秒复查，最多 3 次/);
+});
+
+test("Agent update instructions use the orchestrator and preserve host continuation", () => {
+  const skill = fs.readFileSync(
+    path.join(pluginRoot, "skills/mediaclaw-content-research/SKILL.md"),
+    "utf8",
+  );
+  assert.match(skill, /mediaclaw_manage_agent_update/);
+  assert.match(skill, /decision=approve/);
+  assert.match(skill, /decision=reject/);
+  assert.match(skill, /不得自行调用终端或拼接升级命令/);
+  assert.match(skill, /oldSessionFenced=true/);
+  assert.match(skill, /创建 projectless 新任务/);
+  assert.match(skill, /continuation\.originalGoal/);
+  assert.match(skill, /本会话状态改为 `dismissed`/);
+});

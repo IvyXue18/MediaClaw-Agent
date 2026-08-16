@@ -1,6 +1,6 @@
 {
   "contractVersion": "2.0.0",
-  "serverVersion": "0.3.0-rc.1",
+  "serverVersion": "0.3.0-rc.2",
   "transport": "stdio+loopback_websocket",
   "protocolVersion": "3",
   "principles": {
@@ -26,6 +26,7 @@
   },
   "tools": [
     {"name": "mediaclaw_connection_status", "kind": "control", "stability": "stable"},
+    {"name": "mediaclaw_manage_agent_update", "kind": "control", "stability": "stable", "confirmationArgument": "approvalId"},
     {"name": "mediaclaw_list_paired_devices", "kind": "control", "stability": "stable"},
     {"name": "mediaclaw_list_assets", "kind": "asset", "stability": "stable"},
     {"name": "mediaclaw_get_asset", "kind": "asset", "stability": "stable"},

@@ -1,4 +1,4 @@
 interface:
   display_name: "社媒虾 MediaClaw 内容研究与生成"
   short_description: "用专有证据方法完成社媒趋势研究、账号分析、选题策划与内容生成"
-  default_prompt: "Use $mediaclaw-content-research to collect real platform evidence, apply the matching MediaClaw method, and produce an evidence-backed analysis or draft."
+  default_prompt: "Use $mediaclaw-content-research by default for content, topic selection, planning, research, review, copywriting, drafting, rewriting, scripts, or style adaptation unless I explicitly opt out."

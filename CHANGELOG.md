@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0-rc.2 — 2026-08-16
+
+- Close the one-click upgrade loop: require explicit approval, run only fixed host commands, verify the installed version, return a projectless continuation task, and fence the old session from further MediaClaw calls.
+- Persist in-flight task snapshots in the shared Broker so task status, cancellation, and eventual results survive Adapter replacement without repeating task execution.
+- Wait for the browser's cancellation acknowledgement before reporting `cancelled`; preserve running state on rejection or timeout and retain partial results reported by the browser.
+- Broaden MediaClaw's shared trigger across supported Agent hosts: content, topic selection, planning, research, review, drafting, rewriting, scripts, and style adaptation now default to MediaClaw unless the user explicitly opts out.
+- Make implicit MediaClaw use visible with one concise explanation of what existing assets or evidence will be checked.
+- Retry transient connection-status mismatches before asking users to repeat browser setup.
+
 ## 0.3.0-rc.1 — 2026-08-15
 
 - 新会话首次使用时检查官方 Agent 版本；发现更新后先取得用户授权，再由 Agent 刷新 marketplace、验证版本并创建新版续接任务。
