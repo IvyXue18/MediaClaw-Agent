@@ -271,12 +271,16 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     connectionStatus.result.structuredContent.agentUpdate.approvalId,
     /^update_/,
   );
-  assert.deepEqual(
-    connectionStatus.result.structuredContent.agentUpdate.execution.commands,
-    ["codex plugin marketplace upgrade mediaclaw-agent"],
+  assert.equal(
+    connectionStatus.result.structuredContent.agentUpdate.execution.userRunsCommands,
+    false,
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.continuation.createNewTask,
+    false,
+  );
+  assert.equal(
+    connectionStatus.result.structuredContent.agentUpdate.continuation.restartHostRequired,
     true,
   );
   assert.match(connectionStatus.result.content[0].text, /agentUpdate/);
@@ -1725,6 +1729,14 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(
     approvedUpdate.result.structuredContent.agentUpdate.oldSessionFenced,
     true,
+  );
+  assert.equal(
+    approvedUpdate.result.structuredContent.agentUpdate.restartHostRequired,
+    true,
+  );
+  assert.equal(
+    approvedUpdate.result.structuredContent.continuation.createNewTask,
+    false,
   );
   assert.equal(
     approvedUpdate.result.structuredContent.continuation.originalGoal,

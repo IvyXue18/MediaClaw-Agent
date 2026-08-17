@@ -9,48 +9,21 @@ MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户�
 3. 在浏览器中登录需要使用的小红书或抖音账号。
 4. 确认插件可以正常打开。
 
-## 第二步：安装到 Agent
+## 第二步：把安装交给 Agent
 
-### Codex
+在 Codex 或 WorkBuddy 的新对话中直接发送：
 
-```bash
-codex plugin marketplace add IvyXue18/MediaClaw-Agent
-codex plugin add mediaclaw@mediaclaw-agent
-```
+> 请从 https://github.com/IvyXue18/MediaClaw-Agent 安装当前宿主对应的 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。所有可以自动完成的步骤都由你完成，不要让我使用终端。
 
-安装完成后，新建一个 Codex 任务。
-
-### WorkBuddy
-
-在 WorkBuddy 中执行：
-
-```text
-/plugin marketplace add IvyXue18/MediaClaw-Agent
-/plugin install mediaclaw@mediaclaw-agent
-```
-
-安装完成后，新建一个 WorkBuddy 会话。
+Agent 负责识别宿主、注册官方来源和安装接入包。首次安装发生在当前对话已经启动之后时，宿主可能要求重新打开应用或进入一个已加载插件的新对话；Agent 应说明原因并把下一步收敛为一个明确的界面动作，不要求用户输入安装命令。
 
 ## 后续更新
 
-每个新会话首次使用 MediaClaw 时都会检查官方 Agent 版本。发现新版后，Agent 会先请求授权，再自动刷新 marketplace、更新接入包并创建加载新版的新会话继续原任务。正常情况下不需要用户手动运行以下命令。
+在已有 MediaClaw 的 Codex 或 WorkBuddy 对话中直接说“升级 MediaClaw Agent”即可。这句话本身代表明确授权；Agent 会自行刷新官方 marketplace、安装、核验版本并保存原任务，不向用户展示或要求用户执行终端、CLI、斜杠命令、缓存清理或路径操作。
 
-如果自动升级失败，可让 Agent 报告失败阶段。宿主实际执行的固定命令为：
+安装完成后必须完全退出并重新打开当前宿主。运行中的旧对话不能热加载新 Skill/MCP，同一进程里再建对话也不能作为新版生效证据。重开后只有状态显示新版已经真实激活，才会自动继续原任务；已有设备批准默认复用。正式版更新只跟随正式 Release，不跟随 prerelease。
 
-Codex：
-
-```bash
-codex plugin marketplace upgrade mediaclaw-agent
-```
-
-WorkBuddy：
-
-```bash
-codebuddy plugin marketplace update mediaclaw-agent
-codebuddy plugin update mediaclaw@mediaclaw-agent
-```
-
-升级必须经过用户明确授权。新版任务启动时会自动替换仍存活的旧版共享 Broker，并复用已有设备批准；除非协议确实不兼容，否则不需要重新配对。
+如果自动升级失败，让 Agent 直接说明失败发生在“检查、安装、验版、重开激活”中的哪一步即可，不需要用户改用命令行修复。
 
 ## 第三步：批准连接
 

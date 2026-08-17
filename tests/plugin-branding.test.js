@@ -67,9 +67,10 @@ test("Agent update instructions use the orchestrator and preserve host continuat
   assert.match(skill, /mediaclaw_manage_agent_update/);
   assert.match(skill, /decision=approve/);
   assert.match(skill, /decision=reject/);
-  assert.match(skill, /不得自行调用终端或拼接升级命令/);
+  assert.match(skill, /不得向用户展示或要求用户执行任何终端/);
   assert.match(skill, /oldSessionFenced=true/);
-  assert.match(skill, /创建 projectless 新任务/);
+  assert.match(skill, /完全重新打开当前宿主/);
+  assert.match(skill, /不得在同一宿主进程里创建新任务/);
   assert.match(skill, /continuation\.originalGoal/);
   assert.match(skill, /本会话状态改为 `dismissed`/);
 });

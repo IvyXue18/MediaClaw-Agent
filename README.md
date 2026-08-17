@@ -31,9 +31,13 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 
 ## 自动检查 Agent 更新
 
-每个新会话第一次使用 MediaClaw 时，Agent 会检查官方接入包版本。发现新版本后，它会先说明版本变化并征求你的授权；同意后由 Agent 刷新对应宿主的 marketplace、验证安装结果，并创建一个已经加载新版本的新任务继续原需求。你不需要手动输入升级命令、重新描述需求或重新配对。
+每个新会话第一次使用 MediaClaw 时，Agent 会检查官方稳定版。你也可以在 Codex 或 WorkBuddy 的 MediaClaw 对话里直接说：
 
-当前会话已经加载的 Skill 和 MCP 不能热更新，因此升级完成后必须由新任务续接。更新检查失败不会阻塞当前版本使用；未经授权不会修改本机安装。
+> 升级 MediaClaw Agent。
+
+这句话本身就是升级授权。Agent 会自行刷新官方来源、安装并核验新版本，同时保存你升级前没有做完的请求；不会让你打开终端、输入命令、寻找缓存目录或重新描述需求。
+
+宿主不会给运行中的旧对话热加载已经替换的 Skill 和 MCP。安装完成后，Agent 会明确提示你完全退出并重新打开 Codex 或 WorkBuddy；这是用户唯一需要做的动作。重开后只有当前运行版本确实等于目标版本，Agent 才会宣布升级完成并继续原请求。安装记录变了但旧进程仍在运行时，不算升级成功。更新检查失败不会阻塞当前版本使用；正式版不会自动跟随 prerelease。
 
 ## 安装前准备
 
@@ -45,11 +49,11 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 4. 在 Codex 或 WorkBuddy 中安装本仓库的 MediaClaw 接入包。
 5. 打开 MediaClaw 插件的“Agent 接管”，批准当前 Agent。
 
-## 把这一段发给 Agent
+## 第一次安装也可以交给 Agent
 
 你可以直接把下面的话发给 Codex 或 WorkBuddy：
 
-> 请识别你当前运行在 Codex 还是 WorkBuddy，并从 https://github.com/IvyXue18/MediaClaw-Agent 安装对应的 MediaClaw 官方接入包。安装完成后新建或提示我新建一个会话，检查 MediaClaw 连接状态，再引导我到浏览器插件的“Agent 接管”中批准当前设备。不要向我索取激活码、Cookie、平台 Token、端口或本机令牌。
+> 请从 https://github.com/IvyXue18/MediaClaw-Agent 安装当前宿主对应的 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。所有可以自动完成的步骤都由你完成，不要让我使用终端，也不要向我索取激活码、Cookie、平台 Token、端口或本机令牌。
 
 也可以查看分宿主安装步骤：[安装与连接](docs/INSTALLATION.md)。
 

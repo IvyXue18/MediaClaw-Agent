@@ -39,9 +39,7 @@ test("WorkBuddy plugin launches the shared adapter with an independent host", ()
   );
   const server = mcpConfig.mcpServers.mediaclaw;
   assert.equal(server.command, "/bin/bash");
-  assert.equal(server.args[0], "-lc");
-  assert.match(server.args[1], /CODEBUDDY_PLUGIN_ROOT/);
-  assert.match(server.args[1], /scripts\/mcp-server\.mjs/);
+  assert.deepEqual(server.args, ["./scripts/launch-agent.sh"]);
   assert.equal(server.cwd, ".");
   assert.equal(server.env.MEDIACLAW_AGENT_HOST, "workbuddy");
   assert.equal(

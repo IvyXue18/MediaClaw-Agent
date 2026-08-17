@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
 import {spawn} from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
+import {resolveStateDirectory} from "./device-identity.mjs";
 
 const DEFAULT_RELEASES_URL =
   "https://api.github.com/repos/IvyXue18/MediaClaw-Agent/releases?per_page=5";
@@ -8,11 +11,15 @@ const PLUGIN_SELECTOR = "mediaclaw@mediaclaw-agent";
 const UPDATE_CHECK_TIMEOUT_MS = 3_000;
 const UPDATE_COMMAND_TIMEOUT_MS = 2 * 60 * 1000;
 const UPDATE_OUTPUT_LIMIT = 64 * 1024;
+const UPDATE_STATE_VERSION = 1;
+const WORKBUDDY_CLI_FALLBACKS = [
+  "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
+];
 
 export const AGENT_UPDATE_TOOL = {
   name: "mediaclaw_manage_agent_update",
   description:
-    "仅在用户已经明确同意或拒绝当前 agentUpdate 后调用。拒绝不会改动安装；同意后由 Adapter 执行固定升级命令、验证实际版本，并锁定当前旧会话等待宿主创建新版续接任务。",
+    "仅在用户已经明确同意或拒绝当前 agentUpdate 后调用。拒绝不会改动安装；同意后由 Adapter 自动安装并验版。插件文件更新必须等宿主重新打开、新版 Adapter 真实启动后才算激活。",
   inputSchema: {
     type: "object",
     properties: {
@@ -80,14 +87,20 @@ function updateCommandPlan(hostKey) {
       commands: [
         {
           file: "codebuddy",
+          fallbackFiles: WORKBUDDY_CLI_FALLBACKS,
           args: ["plugin", "marketplace", "update", MARKETPLACE_NAME],
         },
         {
           file: "codebuddy",
+          fallbackFiles: WORKBUDDY_CLI_FALLBACKS,
           args: ["plugin", "update", PLUGIN_SELECTOR],
         },
       ],
-      verify: {file: "codebuddy", args: ["plugin", "list", "--json"]},
+      verify: {
+        file: "codebuddy",
+        fallbackFiles: WORKBUDDY_CLI_FALLBACKS,
+        args: ["plugin", "list", "--json"],
+      },
     };
   }
   return {
@@ -101,17 +114,59 @@ function updateCommandPlan(hostKey) {
   };
 }
 
-function commandDisplay(command) {
-  return [command.file, ...command.args].join(" ");
-}
-
 function updateExecution(hostKey) {
-  const plan = updateCommandPlan(hostKey);
   return {
     type: "adapter_orchestrated",
     tool: AGENT_UPDATE_TOOL.name,
-    commands: plan.commands.map(commandDisplay),
-    verifyCommand: commandDisplay(plan.verify),
+    host: hostKey,
+    userRunsCommands: false,
+  };
+}
+
+function normalizedHostKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+export function createAgentUpdateStateStore({
+  hostKey,
+  stateDirectory = resolveStateDirectory(),
+} = {}) {
+  const safeHostKey = normalizedHostKey(hostKey);
+  if (!safeHostKey) throw new TypeError("agent update state host is required");
+  const directory = path.join(stateDirectory, "updates");
+  const filePath = path.join(directory, `${safeHostKey}.json`);
+  return {
+    async read() {
+      try {
+        const value = JSON.parse(await fs.readFile(filePath, "utf8"));
+        return value?.schemaVersion === UPDATE_STATE_VERSION ? value : null;
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        return null;
+      }
+    },
+    async write(value) {
+      await fs.mkdir(directory, {recursive: true, mode: 0o700});
+      await fs.chmod(directory, 0o700).catch(() => {});
+      const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      await fs.writeFile(
+        temporaryPath,
+        `${JSON.stringify({...value, schemaVersion: UPDATE_STATE_VERSION}, null, 2)}\n`,
+        {encoding: "utf8", mode: 0o600},
+      );
+      await fs.rename(temporaryPath, filePath);
+      await fs.chmod(filePath, 0o600).catch(() => {});
+    },
+    async clear() {
+      await fs.unlink(filePath).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
+    },
   };
 }
 
@@ -143,23 +198,27 @@ function buildUpdateState({currentVersion, latestVersion, hostKey, checkedAt}) {
     checkedAt,
     blocking: true,
     approvalRequired: true,
-    message: `发现 MediaClaw Agent 新版本 ${latestVersion}。升级会更新本机 Agent 接入包，并需要在新任务中继续。`,
+    message: `发现 MediaClaw Agent 新版本 ${latestVersion}。你只需确认升级；安装、验版和原任务保存都由 Agent 完成。插件更新后需要重新打开当前宿主才能激活。`,
     releaseUrl: `https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v${latestVersion}`,
     execution: updateExecution(hostKey),
     continuation: {
       required: true,
-      createNewTask: true,
+      createNewTask: false,
       projectless: true,
-      openWhenSupported: true,
-      reason: "当前任务已经加载旧版 Skill 和 MCP，不能热切换到刚升级的版本。",
-      prompt: `MediaClaw Agent 已升级到 ${latestVersion}。请先调用 mediaclaw_connection_status 验证 agentUpdate.currentVersion=${latestVersion}，然后继续用户升级前尚未完成的 MediaClaw 请求。不要要求用户重复描述需求。`,
+      openWhenSupported: false,
+      restartHostRequired: true,
+      reason:
+        "当前宿主进程已经加载旧版 Skill 和 MCP；在同一进程中创建新任务仍可能引用旧缓存。",
+      prompt: `重新打开宿主后，请先调用 mediaclaw_connection_status；只有 agentUpdate.status=activated 且 activeVersion=${latestVersion} 才继续升级前尚未完成的请求。不要要求用户重复描述需求。`,
     },
   };
 }
 
 function latestPublishedVersion(payload) {
   if (Array.isArray(payload)) {
-    const release = payload.find((item) => item?.draft !== true);
+    const release = payload.find(
+      (item) => item?.draft !== true && item?.prerelease !== true,
+    );
     return parseVersion(release?.tag_name)?.raw || null;
   }
   return parseVersion(payload?.version || payload?.tag_name)?.raw || null;
@@ -242,48 +301,70 @@ export function runAgentUpdateCommand(
     env = process.env,
   } = {},
 ) {
-  return new Promise((resolve) => {
-    let settled = false;
-    let stdout = "";
-    let stderr = "";
-    let child;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({...result, stdout, stderr});
-    };
-    const timer = setTimeout(() => {
-      child?.kill?.("SIGTERM");
-      finish({code: null, timedOut: true});
-    }, timeoutMs);
-    timer.unref?.();
-    try {
-      child = spawnImpl(command.file, command.args, {
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        env,
-      });
-      child.stdout?.on("data", (chunk) => {
-        stdout = appendLimited(stdout, chunk);
-      });
-      child.stderr?.on("data", (chunk) => {
-        stderr = appendLimited(stderr, chunk);
-      });
-      child.on("error", (error) => {
-        finish({code: null, error: error.message, timedOut: false});
-      });
-      child.on("close", (code, signal) => {
-        finish({code, signal: signal || null, timedOut: false});
-      });
-    } catch (error) {
-      finish({
-        code: null,
-        error: error instanceof Error ? error.message : String(error),
-        timedOut: false,
-      });
-    }
-  });
+  const candidates = [command.file, ...(command.fallbackFiles || [])].filter(
+    (value, index, values) => value && values.indexOf(value) === index,
+  );
+
+  function runCandidate(candidateIndex) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let stdout = "";
+      let stderr = "";
+      let child;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({...result, stdout, stderr});
+      };
+      const timer = setTimeout(() => {
+        child?.kill?.("SIGTERM");
+        finish({code: null, timedOut: true});
+      }, timeoutMs);
+      timer.unref?.();
+      try {
+        child = spawnImpl(candidates[candidateIndex], command.args, {
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+          env,
+        });
+        child.stdout?.on("data", (chunk) => {
+          stdout = appendLimited(stdout, chunk);
+        });
+        child.stderr?.on("data", (chunk) => {
+          stderr = appendLimited(stderr, chunk);
+        });
+        child.on("error", (error) => {
+          if (
+            error?.code === "ENOENT" &&
+            candidateIndex + 1 < candidates.length
+          ) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(runCandidate(candidateIndex + 1));
+            return;
+          }
+          finish({
+            code: null,
+            error: error.message,
+            errorCode: error?.code || "",
+            timedOut: false,
+          });
+        });
+        child.on("close", (code, signal) => {
+          finish({code, signal: signal || null, timedOut: false});
+        });
+      } catch (error) {
+        finish({
+          code: null,
+          error: error instanceof Error ? error.message : String(error),
+          timedOut: false,
+        });
+      }
+    });
+  }
+
+  return runCandidate(0);
 }
 
 function findVersionInJson(value) {
@@ -356,6 +437,7 @@ export function createAgentUpdateOrchestrator({
   currentVersion,
   commandRunner = runAgentUpdateCommand,
   approvalIdFactory = () => `update_${crypto.randomUUID()}`,
+  stateStore = createAgentUpdateStateStore({hostKey}),
 } = {}) {
   if (!checker || typeof checker.check !== "function") {
     throw new TypeError("agent update checker is required");
@@ -365,6 +447,63 @@ export function createAgentUpdateOrchestrator({
   let dismissed = false;
   let fencedState = null;
   let pendingApply = null;
+  let durableStatePromise = null;
+  let activatedState = null;
+
+  async function durableState() {
+    if (activatedState) return activatedState;
+    if (!durableStatePromise) {
+      durableStatePromise = (async () => {
+        const record = await stateStore.read();
+        if (!record?.targetVersion) return null;
+        if (compareVersions(currentVersion, record.targetVersion) === 0) {
+          activatedState = {
+            status: "activated",
+            currentVersion,
+            installedVersion: record.installedVersion || record.targetVersion,
+            activeVersion: currentVersion,
+            latestVersion: record.targetVersion,
+            activatedAt: new Date().toISOString(),
+            blocking: false,
+            approvalRequired: false,
+            oldSessionFenced: false,
+            continuation: {
+              required: true,
+              originalGoal: String(record.originalGoal || ""),
+              resumeAutomatically: true,
+            },
+            message:
+              "新版 Agent 已在重新打开的宿主中真实启动并完成激活，可以继续升级前的原任务。",
+          };
+          await stateStore.clear();
+          return activatedState;
+        }
+        if (compareVersions(currentVersion, record.targetVersion) === -1) {
+          return {
+            status: "installed_restart_required",
+            currentVersion,
+            installedVersion: record.installedVersion || record.targetVersion,
+            latestVersion: record.targetVersion,
+            blocking: true,
+            approvalRequired: false,
+            oldSessionFenced: true,
+            restartHostRequired: true,
+            continuation: {
+              required: true,
+              createNewTask: false,
+              restartHostRequired: true,
+              originalGoal: String(record.originalGoal || ""),
+            },
+            message:
+              "新版已经安装，但当前宿主仍在运行旧版。请完全重新打开当前宿主；不要在本进程中继续创建新任务。",
+          };
+        }
+        await stateStore.clear();
+        return null;
+      })();
+    }
+    return durableStatePromise;
+  }
 
   async function baseState() {
     if (!baseStatePromise) baseStatePromise = checker.check();
@@ -376,6 +515,8 @@ export function createAgentUpdateOrchestrator({
   }
 
   async function status() {
+    const persisted = await durableState();
+    if (persisted) return persisted;
     const state = await baseState();
     if (fencedState) return fencedState;
     if (dismissed && state.status === "update_available") {
@@ -438,7 +579,6 @@ export function createAgentUpdateOrchestrator({
     pendingApply = (async () => {
       dismissed = false;
       const plan = updateCommandPlan(hostKey);
-      const completedCommands = [];
       for (let index = 0; index < plan.commands.length; index += 1) {
         const command = plan.commands[index];
         const result = normalizeCommandResult(await commandRunner(command));
@@ -456,7 +596,6 @@ export function createAgentUpdateOrchestrator({
             },
           };
         }
-        completedCommands.push(commandDisplay(command));
       }
       const verifyResult = normalizeCommandResult(await commandRunner(plan.verify));
       if (verifyResult.code !== 0) {
@@ -495,8 +634,18 @@ export function createAgentUpdateOrchestrator({
         ...state.continuation,
         originalGoal: goal.slice(0, 12_000),
         hostActionRequired: true,
-        hostAction: "create_projectless_task",
+        hostAction: "restart_host",
       };
+      const installedAt = new Date().toISOString();
+      await stateStore.write({
+        hostKey,
+        status: "installed_restart_required",
+        fromVersion: currentVersion,
+        targetVersion: state.latestVersion,
+        installedVersion,
+        originalGoal: continuation.originalGoal,
+        installedAt,
+      });
       fencedState = {
         status: "installed_restart_required",
         currentVersion,
@@ -506,10 +655,11 @@ export function createAgentUpdateOrchestrator({
         blocking: true,
         approvalRequired: false,
         oldSessionFenced: true,
-        completedCommands,
-        verifyCommand: commandDisplay(plan.verify),
+        restartHostRequired: true,
+        installedAt,
         continuation,
-        message: "新版已安装并验版成功；当前旧会话已锁定，必须由宿主创建新版任务续接。",
+        message:
+          "新版已安装并完成静态验版，但尚未激活。请完全重新打开当前宿主；新版 Adapter 真实启动并回报目标版本后，才会继续原任务。",
       };
       return {ok: true, agentUpdate: fencedState, continuation};
     })();

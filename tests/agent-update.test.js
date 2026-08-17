@@ -10,7 +10,9 @@ import {
 function manifestFetch(version) {
   return async () => ({
     ok: true,
-    json: async () => [{tag_name: `v${version}`, draft: false}],
+    json: async () => [
+      {tag_name: `v${version}`, draft: false, prerelease: false},
+    ],
   });
 }
 
@@ -22,7 +24,24 @@ test("version comparison orders prereleases and stable releases", () => {
   assert.equal(compareVersions("invalid", "0.3.9"), null);
 });
 
-test("Codex update plan requires approval and a new task", async () => {
+test("stable installations ignore newer prerelease channels", async () => {
+  const result = await createAgentUpdateChecker({
+    currentVersion: "0.3.0",
+    hostKey: "codex",
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => [
+        {tag_name: "v0.4.0-rc.1", draft: false, prerelease: true},
+        {tag_name: "v0.3.0", draft: false, prerelease: false},
+      ],
+    }),
+  }).check();
+
+  assert.equal(result.status, "up_to_date");
+  assert.equal(result.latestVersion, "0.3.0");
+});
+
+test("Codex update plan requires approval and a host restart without user commands", async () => {
   const checker = createAgentUpdateChecker({
     currentVersion: "0.3.0-rc.1",
     hostKey: "codex",
@@ -31,12 +50,11 @@ test("Codex update plan requires approval and a new task", async () => {
   const result = await checker.check();
   assert.equal(result.status, "update_available");
   assert.equal(result.approvalRequired, true);
-  assert.deepEqual(result.execution.commands, [
-    "codex plugin marketplace upgrade mediaclaw-agent",
-  ]);
   assert.equal(result.execution.type, "adapter_orchestrated");
   assert.equal(result.execution.tool, "mediaclaw_manage_agent_update");
-  assert.equal(result.continuation.createNewTask, true);
+  assert.equal(result.execution.userRunsCommands, false);
+  assert.equal(result.continuation.createNewTask, false);
+  assert.equal(result.continuation.restartHostRequired, true);
   assert.equal(result.continuation.projectless, true);
 });
 
@@ -47,11 +65,8 @@ test("WorkBuddy refreshes the marketplace and installed plugin", async () => {
     fetchImpl: manifestFetch("0.3.1"),
   });
   const result = await checker.check();
-  assert.deepEqual(result.execution.commands, [
-    "codebuddy plugin marketplace update mediaclaw-agent",
-    "codebuddy plugin update mediaclaw@mediaclaw-agent",
-  ]);
-  assert.equal(result.execution.verifyCommand, "codebuddy plugin list --json");
+  assert.equal(result.execution.host, "workbuddy");
+  assert.equal(result.execution.userRunsCommands, false);
 });
 
 test("up-to-date and failed checks never block current use", async () => {
@@ -93,18 +108,42 @@ test("installed version parser accepts Codex tables and WorkBuddy JSON only for 
   );
 });
 
-function updateOrchestrator({commandRunner, hostKey = "codex"} = {}) {
+function memoryStateStore(initialValue = null) {
+  let value = initialValue;
+  return {
+    async read() {
+      return value;
+    },
+    async write(next) {
+      value = {...next, schemaVersion: 1};
+    },
+    async clear() {
+      value = null;
+    },
+    current() {
+      return value;
+    },
+  };
+}
+
+function updateOrchestrator({
+  commandRunner,
+  hostKey = "codex",
+  currentVersion = "0.3.0-rc.1",
+  stateStore = memoryStateStore(),
+} = {}) {
   const checker = createAgentUpdateChecker({
-    currentVersion: "0.3.0-rc.1",
+    currentVersion,
     hostKey,
     fetchImpl: manifestFetch("0.3.1"),
   });
   return createAgentUpdateOrchestrator({
     checker,
-    currentVersion: "0.3.0-rc.1",
+    currentVersion,
     hostKey,
     commandRunner,
     approvalIdFactory: () => "approval-test",
+    stateStore,
   });
 }
 
@@ -132,7 +171,9 @@ test("rejecting an update changes no installation and suppresses this session", 
 
 test("approved update runs fixed commands, verifies the version, and fences the old session", async () => {
   const commands = [];
+  const stateStore = memoryStateStore();
   const orchestrator = updateOrchestrator({
+    stateStore,
     commandRunner: async (command) => {
       commands.push([command.file, ...command.args]);
       if (command.args.at(-1) === "list") {
@@ -160,6 +201,9 @@ test("approved update runs fixed commands, verifies the version, and fences the 
   assert.equal(approved.agentUpdate.installedVersion, "0.3.1");
   assert.equal(approved.agentUpdate.currentVersion, "0.3.0-rc.1");
   assert.equal(approved.agentUpdate.oldSessionFenced, true);
+  assert.equal(approved.agentUpdate.restartHostRequired, true);
+  assert.equal(approved.continuation.createNewTask, false);
+  assert.equal(approved.continuation.hostAction, "restart_host");
   assert.equal(approved.continuation.projectless, true);
   assert.equal(
     approved.continuation.originalGoal,
@@ -167,6 +211,7 @@ test("approved update runs fixed commands, verifies the version, and fences the 
   );
   assert.equal(orchestrator.isSessionFenced(), true);
   assert.equal((await orchestrator.status()).status, "installed_restart_required");
+  assert.equal(stateStore.current().targetVersion, "0.3.1");
 
   await orchestrator.decide({
     decision: "approve",
@@ -174,6 +219,54 @@ test("approved update runs fixed commands, verifies the version, and fences the 
     originalGoal: "继续完成账号分析并生成选题",
   });
   assert.equal(commands.length, 2);
+});
+
+test("a restarted target-version Adapter activates the durable upgrade and resumes the goal", async () => {
+  const stateStore = memoryStateStore({
+    schemaVersion: 1,
+    hostKey: "codex",
+    status: "installed_restart_required",
+    fromVersion: "0.3.0",
+    targetVersion: "0.3.1",
+    installedVersion: "0.3.1",
+    originalGoal: "继续完成账号分析",
+  });
+  const orchestrator = updateOrchestrator({
+    currentVersion: "0.3.1",
+    stateStore,
+    commandRunner: async () => ({code: 0}),
+  });
+
+  const status = await orchestrator.status();
+  assert.equal(status.status, "activated");
+  assert.equal(status.activeVersion, "0.3.1");
+  assert.equal(status.blocking, false);
+  assert.equal(status.continuation.resumeAutomatically, true);
+  assert.equal(status.continuation.originalGoal, "继续完成账号分析");
+  assert.equal(stateStore.current(), null);
+});
+
+test("an old Adapter keeps reporting restart required from durable state", async () => {
+  const stateStore = memoryStateStore({
+    schemaVersion: 1,
+    hostKey: "codex",
+    status: "installed_restart_required",
+    fromVersion: "0.3.0",
+    targetVersion: "0.3.1",
+    installedVersion: "0.3.1",
+    originalGoal: "继续原任务",
+  });
+  const orchestrator = updateOrchestrator({
+    currentVersion: "0.3.0",
+    stateStore,
+    commandRunner: async () => ({code: 0}),
+  });
+
+  const status = await orchestrator.status();
+  assert.equal(status.status, "installed_restart_required");
+  assert.equal(status.restartHostRequired, true);
+  assert.equal(status.continuation.createNewTask, false);
+  assert.equal(status.continuation.originalGoal, "继续原任务");
 });
 
 test("WorkBuddy approval refreshes marketplace, updates plugin, then verifies JSON", async () => {

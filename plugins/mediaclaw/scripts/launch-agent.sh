@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-RELEASE_VERSION="v0.3.0-rc.2"
+RELEASE_VERSION="v0.3.0"
 REPOSITORY="IvyXue18/MediaClaw-Agent"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 

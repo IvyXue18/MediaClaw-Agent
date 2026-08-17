@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "mediaclaw": {
-      "command": "node",
-      "args": ["./scripts/mcp-server.mjs"],
+      "command": "/bin/bash",
+      "args": ["./scripts/launch-agent.sh"],
       "cwd": ".",
       "env": {
         "MEDIACLAW_AGENT_HOST": "codex",

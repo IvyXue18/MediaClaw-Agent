@@ -35,14 +35,14 @@ Agent 的分析、生成和报告输出不消耗 MediaClaw 积分。会员只控
 每个新会话第一次进入 MediaClaw 工作流时，先执行 `mediaclaw_connection_status`，并先处理返回的 `agentUpdate`：
 
 1. `status=up_to_date`、`ahead`、`unavailable` 或 `disabled`：不要打扰用户，继续当前请求。更新检查失败不是采集失败。
-2. `status=update_available`：在执行任何采集或分析前，用一句话告诉用户当前版本、最新版本、升级后会自动创建新任务继续，并取得明确授权。不得把执行命令、创建任务或重复需求转交给用户。
-3. 用户明确同意后，只调用一次 `mediaclaw_manage_agent_update`，传入 `decision=approve`、本次 `approvalId` 和用户尚未完成的原始目标。不得自行调用终端或拼接升级命令；Adapter 会执行内置固定命令并解析验版输出。工具返回失败时停在当前任务，准确报告 `failedStage`，不得声称升级成功。
-4. 工具返回 `oldSessionFenced=true` 后，当前旧任务已被运行时锁定，不能再调用其他 MediaClaw 工具。立即使用宿主的任务／会话管理能力创建 projectless 新任务，把返回的 `continuation.originalGoal` 和 `continuation.prompt` 一起传入；宿主支持时直接打开新任务。不要要求用户重新描述需求、复制提示词或手动新建任务。
-5. 如果宿主只能生成“打开聊天”入口而不能自动切换，明确说明新版已安装、当前任务不能热加载，并让用户只点击该入口。没有真实完成切换时，不得声称已经进入新版任务。
-6. 新任务必须再次调用 `mediaclaw_connection_status`，确认 `agentUpdate.currentVersion=latestVersion` 且不再返回同一更新，再继续原请求。配对按宿主安装实例保存；协议兼容时不得要求用户重新配对。
-7. 用户拒绝或暂不升级时，调用 `mediaclaw_manage_agent_update`，传入 `decision=reject` 和本次 `approvalId`。它不得执行任何安装命令，并会把本会话状态改为 `dismissed`；随后继续当前版本且不重复催促。只有用户主动询问更新时才再次说明。
+2. `status=update_available`：在执行任何采集或分析前，用一句话告诉用户当前版本、最新版本和“安装完成后需要重新打开当前宿主才能激活”，并取得明确授权。用户当前消息已经明确说“升级社媒虾／升级到最新版”等同义表达时，该消息本身就是授权，不得重复询问。不得向用户展示或要求用户执行任何终端、CLI、斜杠命令、安装路径或缓存操作。
+3. 获得授权后，只调用一次 `mediaclaw_manage_agent_update`，传入 `decision=approve`、本次 `approvalId` 和用户尚未完成的原始目标。Adapter 会自行执行固定安装动作并解析验版输出。工具返回失败时停在当前任务，准确报告 `failedStage`，不得声称升级成功。
+4. 工具返回 `oldSessionFenced=true` 或 `status=installed_restart_required` 后，只能说明“新版已经安装，完全重新打开当前宿主后会激活并继续原任务”。不得在同一宿主进程里创建新任务、调用其他 MediaClaw 工具或把安装动作转交给用户；同一进程中的新任务仍可能引用被替换的旧缓存。
+5. “已安装”不等于“已激活”。只有宿主重新打开后，新会话调用 `mediaclaw_connection_status` 返回 `agentUpdate.status=activated` 且 `activeVersion=latestVersion`，才可以宣布升级完成；随后直接续接 `continuation.originalGoal`，不要要求用户重复描述需求。
+6. 如果重新打开后没有返回 `activated`，准确报告当前 `currentVersion`、`installedVersion`、`activeVersion` 和失败阶段；不得降级为网页搜索、通用浏览器或其他工具冒充 MediaClaw，也不得建议用户使用终端。配对按宿主安装实例保存；协议兼容时不得要求用户重新配对。
+7. 用户拒绝或暂不升级时，调用 `mediaclaw_manage_agent_update`，传入 `decision=reject` 和本次 `approvalId`。它不得执行任何安装动作，并会把本会话状态改为 `dismissed`；随后继续当前版本且不重复催促。只有用户主动询问更新时才再次说明。
 
-更新授权只覆盖 Agent 接入包刷新和创建续接任务，不扩大到浏览器插件发版、后端部署、付费动作或其他外部变更。
+更新授权只覆盖 Agent 接入包刷新、保存原任务和激活续接，不扩大到浏览器插件发版、后端部署、付费动作或其他外部变更。
 
 用户提到“刚安装”“检查连接”“完成配对”“第一次使用”或询问社媒虾能做什么时，先执行 `mediaclaw_connection_status`。首次接入必须是一条连续工作流：除浏览器中的设备批准必须由用户点击外，Agent 要自行完成状态检查、必要的任务续接、等待和复查；不得让用户复制第二段提示词、手动新建任务或为了继续流程回复“已批准”。内部仍按 3 个状态处理，但不要把它们变成 3 个需要用户逐步理解和推动的任务：
 
