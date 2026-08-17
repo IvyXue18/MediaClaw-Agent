@@ -39,12 +39,39 @@ test("WorkBuddy plugin launches the shared adapter with an independent host", ()
   );
   const server = mcpConfig.mcpServers.mediaclaw;
   assert.equal(server.command, "/bin/bash");
-  assert.deepEqual(server.args, ["./scripts/launch-agent.sh"]);
-  assert.equal(server.cwd, ".");
+  assert.deepEqual(server.args, [
+    "-lc",
+    'exec "${CODEBUDDY_PLUGIN_ROOT}/scripts/launch-agent.sh"',
+  ]);
+  assert.equal(
+    Object.hasOwn(server, "cwd"),
+    false,
+    "WorkBuddy must not resolve the launcher relative to the conversation cwd",
+  );
   assert.equal(server.env.MEDIACLAW_AGENT_HOST, "workbuddy");
   assert.equal(
     server.env.MEDIACLAW_AGENT_DEVICE_NAME,
     "MediaClaw Agent (WorkBuddy)",
   );
   assert.equal(plugin.skills, "./skills/");
+});
+
+test("WorkBuddy inline discovery keeps the shared MCP definition host-neutral", () => {
+  const mcpConfig = JSON.parse(
+    fs.readFileSync(
+      path.join(projectRoot, "plugins", "mediaclaw", ".mcp.json"),
+      "utf8",
+    ),
+  );
+  const server = mcpConfig.mcpServers.mediaclaw;
+  assert.equal(server.command, "/bin/bash");
+  assert.equal(server.args[0], "-lc");
+  assert.match(server.args[1], /CODEBUDDY_PLUGIN_ROOT/);
+  assert.match(server.args[1], /CODEX_PLUGIN_ROOT/);
+  assert.match(server.args[1], /scripts\/launch-agent\.sh/);
+  assert.equal(
+    Object.hasOwn(server, "env"),
+    false,
+    "the inline definition must detect WorkBuddy instead of forcing Codex",
+  );
 });
