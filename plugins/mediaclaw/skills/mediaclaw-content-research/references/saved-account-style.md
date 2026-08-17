@@ -7,10 +7,11 @@
 
 ## 读取条件
 
-- 先查 `local.studio` 的 `style_profile` / `account_analysis`；用户需要云端历史时再查 `remote.workbench`。
+- 用户说“模仿”“仿写”“像某人一样写”或“按某人／某账号风格”时立即进入本方法；无需用户额外说明工作台已有保存或点名 MediaClaw。
+- 先用 `mediaclaw_list_assets` 查 `local.studio` 的 `style_profile`，需要时再查 `account_analysis`；本地没有匹配项后，才以相同顺序查 `remote.workbench`。不要先反问用户是否保存过，也不要直接从远端开始。
 - 必须使用列表返回的稳定 `assetId` 调用 `mediaclaw_get_asset` 后，才能使用风格。
 - 多个候选时根据账号名、平台、主页链接、样本量和更新时间消除歧义；仍不确定时请用户确认。
-- 没有真实资产时明确说明，不根据账号名或印象猜测。
+- 本地和远端都没有真实资产时明确说明，并请用户提供账号主页或先完成账号分析；不根据账号名或印象猜测。
 - `effectiveAnalysisSource` 为 `editableJson` 时，优先使用用户编辑后的分析；否则使用 `profileJson`。
 
 ## 风格解码

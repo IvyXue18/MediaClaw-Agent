@@ -1,9 +1,10 @@
 {
   "contractVersion": "2.0.0",
-  "serverVersion": "0.3.0-rc.2",
+  "serverVersion": "0.3.0",
   "transport": "stdio+loopback_websocket",
   "protocolVersion": "3",
   "principles": {
+    "agentUpdateRequiresUserApproval": true,
     "extensionOwnsAuthorizationAndExecution": true,
     "agentNeverParsesPlatformPages": true,
     "authorizedCapabilitiesReturnCompleteStoredRecords": true,
@@ -11,22 +12,21 @@
     "largeResultsUseChunkedExtensionTransport": true,
     "videoTranscriptRequiresOneTimeQuote": true,
     "destructiveDataClearRequiresPreviewToken": true,
-    "agentUpdateRequiresUserApproval": true,
     "videoTranscriptSupportsLocalExecution": false,
     "byokSupported": false
   },
   "responseConventions": {
+    "agentUpdateField": "agentUpdate",
     "synchronous": "MCP tool result contains task plus result",
     "asynchronous": "async=true returns a task handle",
     "persistentRecordKey": "assetId or recordId",
     "limitationsField": "limitations",
     "paywallField": "paywall",
-    "transcriptConfirmationField": "quoteId",
-    "agentUpdateField": "agentUpdate"
+    "transcriptConfirmationField": "quoteId"
   },
   "tools": [
     {"name": "mediaclaw_connection_status", "kind": "control", "stability": "stable"},
-    {"name": "mediaclaw_manage_agent_update", "kind": "control", "stability": "stable", "confirmationArgument": "approvalId"},
+    {"name": "mediaclaw_manage_agent_update", "kind": "control", "stability": "stable", "requiresUserApproval": true},
     {"name": "mediaclaw_list_paired_devices", "kind": "control", "stability": "stable"},
     {"name": "mediaclaw_list_assets", "kind": "asset", "stability": "stable"},
     {"name": "mediaclaw_get_asset", "kind": "asset", "stability": "stable"},

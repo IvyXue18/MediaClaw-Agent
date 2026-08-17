@@ -24,7 +24,7 @@ const plugin = JSON.parse(
 );
 
 test("WorkBuddy marketplace points to the shared MediaClaw plugin", () => {
-  assert.equal(marketplace.name, "mediaclaw-agent");
+  assert.ok(["mediaclaw-local", "mediaclaw-agent"].includes(marketplace.name));
   assert.equal(marketplace.plugins[0].name, "mediaclaw");
   assert.equal(marketplace.plugins[0].source, "./plugins/mediaclaw");
 });

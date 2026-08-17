@@ -4,7 +4,7 @@ MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包
 
 它不能单独使用：你还需要安装 MediaClaw 浏览器插件、完成有效会员验证，并在浏览器中批准当前 Agent。页面访问、积分消耗和需要人工确认的操作，始终以浏览器插件中的提示为准。
 
-> 当前版本为 `0.3.0 RC`。请以 [Releases](https://github.com/IvyXue18/MediaClaw-Agent/releases) 中的版本说明和 MediaClaw 插件实际提示为准。
+> 当前正式版本为 `0.3.0`。请以 [Releases](https://github.com/IvyXue18/MediaClaw-Agent/releases) 中的版本说明和 MediaClaw 插件实际提示为准。
 
 ## 可以做什么
 

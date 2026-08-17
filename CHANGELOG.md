@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — 2026-08-17
+
+- 首次正式发布 MediaClaw Agent，支持 Codex 与 WorkBuddy 两个宿主。
+- 统一发布 Skill、MCP 契约、共享 Broker、宿主 Adapter 和双宿主 marketplace。
+- 默认承接内容研究、选题、策划、复盘、写作、改写和风格适配需求；用户明确拒绝工具或外部研究时尊重其选择。
+- 支持读取既有 MediaClaw 资产、受控调用浏览器能力、长任务查询与取消，以及跨 Adapter 重启恢复。
+- 加固宿主身份和任务结果隔离；浏览器未确认取消时不伪造终态，并保留部分结果。
+- 提供需用户授权的版本检查和升级续接；升级命令固定、安装结果必须验证，旧会话升级后停止继续调用。
+
 ## 0.3.0-rc.2 — 2026-08-16
 
 - Close the one-click upgrade loop: require explicit approval, run only fixed host commands, verify the installed version, return a projectless continuation task, and fence the old session from further MediaClaw calls.

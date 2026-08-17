@@ -50,7 +50,7 @@ try {
   }
 
   assert.ok(response, `standalone runtime did not initialize: ${stderr}`);
-  assert.equal(response.result?.serverInfo?.version, "0.3.0-rc.2");
+  assert.equal(response.result?.serverInfo?.version, "0.3.0");
   assert.match(response.result?.serverInfo?.icons?.[0]?.src || "", /^data:image\/png;base64,/);
   console.log("Standalone runtime smoke test passed.");
 } finally {

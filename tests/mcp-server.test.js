@@ -257,7 +257,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.currentVersion,
-    "0.3.0-rc.2",
+    "0.3.0",
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.latestVersion,
@@ -860,6 +860,16 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       );
       return;
     }
+    if (message.task.keyword === "露营") {
+      assert.equal(message.task.options.prepareKeywordStrategy, true);
+      assert.equal(message.task.options.strictFilters, true);
+      assert.equal(message.task.options.timeRange, "any");
+      assert.equal(message.task.options.sortBy, "default");
+      assert.equal(message.task.options.contentType, "all");
+      assert.equal(message.task.options.videoDuration, "all");
+      assert.equal(message.task.options.searchScope, "all");
+      assert.equal(message.task.options.locationScope, "all");
+    }
     socket.send(
       JSON.stringify({
         type: "task.progress",
@@ -939,6 +949,48 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     },
   );
   assert.match(JSON.stringify(response.result), /不应进入快速扫描结果的长正文/);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 204,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_capture_search_basic",
+        arguments: {
+          keyword: "平台校验",
+          platform: "douyin",
+          sortBy: "comments",
+        },
+      },
+    })}\n`,
+  );
+  const unsupportedPlatformFilter = await reader.waitFor(
+    (message) => message.id === 204,
+  );
+  assert.match(
+    JSON.stringify(unsupportedPlatformFilter),
+    /douyin 不支持筛选参数 sortBy=comments/,
+  );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 205,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_capture_search_basic",
+        arguments: {keyword: "时间校验", timeRange: "30d"},
+      },
+    })}\n`,
+  );
+  const unsupportedTimeFilter = await reader.waitFor(
+    (message) => message.id === 205,
+  );
+  assert.match(
+    JSON.stringify(unsupportedTimeFilter),
+    /不支持的筛选参数 timeRange=30d/,
+  );
 
   child.stdin.write(
     `${JSON.stringify({
@@ -1050,6 +1102,26 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     (tool) => tool.name === "mediaclaw_capture_search_basic",
   );
   assert.equal(basicSearchTool.inputSchema.properties.limit.maximum, 300);
+  assert.deepEqual(
+    basicSearchTool.inputSchema.properties.timeRange.enum,
+    ["any", "1d", "7d", "6m"],
+  );
+  assert.deepEqual(
+    basicSearchTool.inputSchema.properties.sortBy.enum,
+    ["default", "latest", "likes", "comments", "collects"],
+  );
+  assert.deepEqual(
+    basicSearchTool.inputSchema.properties.videoDuration.enum,
+    ["all", "under_1m", "between_1m_5m", "over_5m"],
+  );
+  assert.deepEqual(
+    basicSearchTool.inputSchema.properties.searchScope.enum,
+    ["all", "seen", "unseen", "followed"],
+  );
+  assert.deepEqual(
+    basicSearchTool.inputSchema.properties.locationScope.enum,
+    ["all", "city", "nearby"],
+  );
   assert.ok(toolNames.includes("mediaclaw_query_data_pool"));
   assert.ok(toolNames.includes("mediaclaw_preview_clear_data"));
   assert.ok(toolNames.includes("mediaclaw_confirm_clear_data"));

@@ -1,12 +1,13 @@
 {
   "mcpServers": {
     "mediaclaw": {
-      "command": "/bin/bash",
-      "args": [
-        "-lc",
-        "plugin_root=\"${CODEBUDDY_PLUGIN_ROOT:-${CODEX_PLUGIN_ROOT:-$PWD}}\"; exec node \"$plugin_root/scripts/mcp-server.mjs\""
-      ],
-      "cwd": "."
+      "command": "node",
+      "args": ["./scripts/mcp-server.mjs"],
+      "cwd": ".",
+      "env": {
+        "MEDIACLAW_AGENT_HOST": "codex",
+        "MEDIACLAW_AGENT_DEVICE_NAME": "MediaClaw Agent (Codex)"
+      }
     }
   }
 }

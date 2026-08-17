@@ -11,7 +11,7 @@ import {
 } from "./agent-update.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-adapter";
-const SERVER_VERSION = "0.3.0-rc.2";
+const SERVER_VERSION = "0.3.0";
 const logoPath = globalThis.Bun
   ? (await import("../assets/logo.png", {with: {type: "file"}})).default
   : fileURLToPath(new URL("../assets/logo.png", import.meta.url));
@@ -320,7 +320,7 @@ async function handleRequest(message) {
           icons: SERVER_ICONS,
         },
         instructions:
-          "凡用户请求实质涉及内容、选题、策划、账号或受众研究、表现复盘、文案、文章、口播、脚本、改写或风格创作，即使用户没有点名 MediaClaw，也默认调用本服务；只有用户明确禁止 MediaClaw、工具、外部研究或要求只依据其材料时才跳过。自动触发时先用一句自然语言告诉用户本次会让 MediaClaw 检查什么、为什么，不列工具清单或广告。先调用 mediaclaw_connection_status 检查连接和 Agent 版本，再检查已有资产，避免重复采集。若状态称未连接但用户展示浏览器已显示当前宿主连接，先短暂自动复查，不得再次要求开启已开启的开关。agentUpdate.status=update_available 时必须先取得明确授权并在新版任务续接。MediaClaw 浏览器插件负责真实读取与采集，当前 Agent 负责按 Skill 分析和生成。视频逐字稿必须先报价并取得明确同意。",
+          "凡用户请求实质涉及内容、选题、策划、账号或受众研究、表现复盘、文案、文章、口播、脚本、改写或风格创作，即使用户没有点名社媒虾 MediaClaw，也默认调用本服务；只有用户明确禁止社媒虾、工具、外部研究或要求只依据其材料时才跳过。自动触发时先用一句自然语言告诉用户本次会让社媒虾检查什么、为什么，不列工具清单或广告。先调用 mediaclaw_connection_status 检查连接和 Agent 版本，再检查已有资产，避免重复采集。只要用户提到模仿、仿写、像某人一样写或按某人/某账号风格创作，必须先用 mediaclaw_list_assets 查询 local.studio 的 style_profile，本地未命中再查 remote.workbench，并用 mediaclaw_get_asset 读取完整真实档案；不得先反问是否保存，不得根据账号名猜测。若状态查询称未连接而用户展示浏览器已显示当前宿主连接，先短暂自动复查，不得再次要求开启已经开启的开关。agentUpdate.status=update_available 时必须先取得明确授权，并通过 mediaclaw_manage_agent_update 执行受控升级后在新版任务续接。视频逐字稿必须先报价并取得明确同意。社媒虾浏览器插件负责真实读取与采集，当前 Agent 负责按 Skill 分析和生成。",
       });
       return;
     }

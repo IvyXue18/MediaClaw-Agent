@@ -14,7 +14,7 @@ import {
 } from "./device-identity.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-broker";
-const SERVER_VERSION = "0.3.0-rc.2";
+const SERVER_VERSION = "0.3.0";
 const PROTOCOL_VERSION = "3";
 const DEFAULT_PORT = Number(process.env.MEDIACLAW_AGENT_PORT || 17373);
 const DEFAULT_SCAN_LIMIT = 80;
@@ -40,6 +40,73 @@ const TASK_CANCEL_TIMEOUT_MS = Math.max(
 );
 const AGENT_PRICING_URL =
   "https://mediaclaw.app/pricing?source=agent";
+const BROWSER_EXTENSION_DOWNLOAD_URL = "https://mediaclaw.app/download";
+const AGENT_FIRST_USE_VALUE_PROMISE =
+  "你不需要研究该采什么数据，也不用记任何命令。只要告诉我你在做什么、现在卡在哪里，我会自己判断应该研究关键词、账号、爆款还是评论，再把真实数据整理成你能直接使用的结论、选题或初稿。";
+const AGENT_FIRST_USE_FIXED_COPY = [
+  "社媒虾 MediaClaw 已连接好了。",
+  "",
+  AGENT_FIRST_USE_VALUE_PROMISE,
+  "",
+  "下面这些情况，都可以直接交给我：",
+  "",
+  "1. 想做一个方向，但不知道从哪里切入",
+  "   你可以说：‘我想做小红书家居收纳账号，但现在完全没有方向。先帮我看清这个赛道，找出新号更容易切入的机会，再给我两周选题。’",
+  "   我会帮你看清竞争格局、用户需求、低粉爆款和可切入方向，最后落到一份能执行的选题安排。",
+  "",
+  "2. 每天都在发，但下一篇不知道写什么",
+  "   你可以说：‘我是营养师，这周不知道发什么。帮我看看用户最近在搜什么、评论区反复问什么，给我 10 个真正有人需要的选题。’",
+  "   我会从真实搜索需求和评论问题里找选题，不让你继续靠感觉硬想。",
+  "",
+  "3. 刷到一篇爆款，想借鉴但不想照抄",
+  "   你可以说：‘这篇内容很火：〈内容链接〉。帮我拆清楚它为什么有效、评论区还在追问什么，再给我 5 个适合我账号的新角度。选出最值得做的一个，写成初稿。’",
+  "   我会把可借鉴的选题、结构和表达机制，与原作者不可复制的身份、经历和素材分开，再生成属于你的新内容。",
+  "",
+  "4. 找到一个对标账号，但看不懂究竟该学什么",
+  "   你可以说：‘这是我想研究的账号：〈主页链接〉。不要只总结它发了什么，帮我找出它最近真正稳定有效的选题、标题和内容结构，再告诉我哪些适合我、哪些我学不了。’",
+  "   我会区分偶然爆款和稳定规律，给你可以学习的做法、适用条件和不能照搬的部分。",
+  "",
+  "5. 刚起号，想找普通账号也能复制的机会",
+  "   你可以说：‘我刚起号，不想只研究几十万粉的大博主。帮我找这个赛道里的低粉高赞内容，分析它们靠什么跑出来，再给我一套适合小账号执行的选题方案。’",
+  "   我会优先找账号体量与你更接近、但单篇表现突出的样本，避免用大号流量误导你的判断。",
+  "",
+  "6. 发过一批内容或做完投放，想知道用户真实怎么想",
+  "   你可以说：‘这些是我们最近发布或投放的内容：〈多个链接〉。帮我汇总评论里的共性反馈、购买顾虑和反复追问，再告诉我下一轮内容应该补什么。’",
+  "   我会把评论从热闹的互动区变成需求、异议、选题和潜在线索，给出下一步行动。",
+  "",
+  "7. 看到一条不错的视频，想研究口播和节奏",
+  "   你可以说：‘帮我研究这条视频：〈视频链接〉。我想知道它的开头为什么能留人、内容怎么推进、哪些方法可以改成适合我的脚本。’",
+  "   我会把视频里的开头、推进、表达和节奏拆开，告诉你哪些方法值得借鉴，并把可迁移的方法变成适合你的脚本方向。",
+  "",
+  "如果你不想挑场景，也可以只告诉我三件事：你是谁、主要做什么、现在最头疼什么。比如：‘我是做本地餐饮的，想做小红书，但不知道顾客会搜什么。’剩下该看哪些词、采哪些内容、研究哪些账号，我来判断。",
+  "",
+  "你现在最想解决哪件事？",
+].join("\n");
+const AGENT_FIRST_USE_GUIDE = Object.freeze({
+  title: "社媒虾 MediaClaw 已连接好了",
+  structure: "fixed_two_layer_scenario_onboarding",
+  firstLayer: AGENT_FIRST_USE_VALUE_PROMISE,
+  scenarios: Object.freeze([
+    Object.freeze({id: "new_direction", title: "想做一个方向，但不知道从哪里切入"}),
+    Object.freeze({id: "content_drought", title: "每天都在发，但下一篇不知道写什么"}),
+    Object.freeze({id: "viral_to_draft", title: "刷到一篇爆款，想借鉴但不想照抄"}),
+    Object.freeze({id: "account_strategy", title: "找到对标账号，但看不懂究竟该学什么"}),
+    Object.freeze({id: "small_account_opportunity", title: "刚起号，想找普通账号也能复制的机会"}),
+    Object.freeze({id: "comment_feedback", title: "发过一批内容或做完投放，想知道用户真实怎么想"}),
+    Object.freeze({id: "video_script", title: "看到一条不错的视频，想研究口播和节奏"}),
+  ]),
+  fixedCopy: AGENT_FIRST_USE_FIXED_COPY,
+  presentationPolicy: Object.freeze({
+    default: "原样展示 fixedCopy，不把它改写成功能列表。",
+    allowedAdaptation:
+      "已经明确知道用户的角色、平台或赛道时，可以在 fixedCopy 前补充一句个性化承接；不得删除、缩写或改写 fixedCopy。",
+    forbidden:
+      "不得罗列工具名、MCP 名、Studio、OCR、批量增强等内部能力替代用户场景；不得只给一个示例；不得要求用户先决定采什么数据，也不得把第一层改写成‘你在做小红书还是抖音？’或其他平台选择题。",
+  }),
+  openEndedStart:
+    "如果不想挑场景，只需告诉我：你是谁、主要做什么、现在最头疼什么，剩下的由我判断。",
+  membershipPolicy: "Agent 接管需要插件内已验证且有效的会员激活码。",
+});
 const KEYWORD_TOPIC_METHOD_ID = "keyword-topic-trends-v1";
 const KEYWORD_LONGTAIL_METHOD_ID = "keyword-longtail-demand-v1";
 const ACCOUNT_HITS_METHOD_ID = "account-recent-hits-v1";
@@ -92,6 +159,54 @@ let bridgeStatus = {
   error: null,
 };
 let brokerUpgradeScheduled = false;
+
+function buildConnectionOnboarding({connected = false, awaitingPairing = false} = {}) {
+  if (connected) {
+    return {
+      stage: "ready",
+      step: 3,
+      stepCount: 3,
+      statusLabel: "连接与配对已完成",
+      nextAction: {
+        type: "start_first_task",
+        label: "直接告诉我你在做什么、现在最头疼什么",
+      },
+      welcome: AGENT_FIRST_USE_GUIDE,
+    };
+  }
+  if (awaitingPairing) {
+    return {
+      stage: "awaiting_approval",
+      step: 2,
+      stepCount: 3,
+      statusLabel: "接入包已安装，等待批准配对",
+      nextAction: {
+        type: "approve_in_extension",
+        label: "到安装了社媒虾的浏览器 → 社媒虾 → 设置 → Agent 接管中批准当前设备",
+      },
+      welcome: null,
+    };
+  }
+  return {
+    stage: "waiting_for_extension",
+    step: 1,
+    stepCount: 3,
+    statusLabel: "接入包已启动，等待浏览器插件连接",
+    nextAction: {
+      type: "enable_extension",
+      label: "在安装了社媒虾的浏览器中打开扩展设置并开启 Agent 接管；尚未安装浏览器扩展时前往官方下载页",
+    },
+    browserExtension: {
+      status: "not_detected",
+      productName: "社媒虾 MediaClaw 浏览器扩展",
+      supportedBrowserFamily: "Chromium",
+      downloadUrl: BROWSER_EXTENSION_DOWNLOAD_URL,
+      installedHelp:
+        "如果已经安装，请在准备使用的浏览器中确认扩展已启用，再打开设置 → Agent 接管。",
+    },
+    welcome: null,
+  };
+}
 
 function normalizeHostKey(value) {
   const normalized = String(value || "")
@@ -219,20 +334,119 @@ function normalizeEnum(value, allowed, fallback) {
   return allowed.includes(normalized) ? normalized : fallback;
 }
 
+function normalizeKeywordFilterEnum(value, allowed, fallback, dimension) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (!allowed.includes(normalized)) {
+    throw new Error(
+      `不支持的筛选参数 ${dimension}=${normalized}；可选值：${allowed.join(", ")}`,
+    );
+  }
+  return normalized;
+}
+
 function normalizeKeywordTimeRange(value) {
-  return normalizeEnum(value, ["any", "7d", "30d", "6m", "1y"], "any");
+  return normalizeKeywordFilterEnum(
+    value,
+    ["any", "1d", "7d", "6m"],
+    "any",
+    "timeRange",
+  );
 }
 
 function normalizeKeywordSortBy(value) {
-  return normalizeEnum(
+  return normalizeKeywordFilterEnum(
     value,
-    ["default", "likes", "collects", "comments"],
+    ["default", "latest", "likes", "collects", "comments"],
     "default",
+    "sortBy",
   );
 }
 
 function normalizeKeywordContentType(value) {
-  return normalizeEnum(value, ["all", "image", "video"], "all");
+  return normalizeKeywordFilterEnum(
+    value,
+    ["all", "image", "video"],
+    "all",
+    "contentType",
+  );
+}
+
+function normalizeKeywordVideoDuration(value) {
+  return normalizeKeywordFilterEnum(
+    value,
+    ["all", "under_1m", "between_1m_5m", "over_5m"],
+    "all",
+    "videoDuration",
+  );
+}
+
+function normalizeKeywordSearchScope(value) {
+  return normalizeKeywordFilterEnum(
+    value,
+    ["all", "seen", "unseen", "followed"],
+    "all",
+    "searchScope",
+  );
+}
+
+function normalizeKeywordLocationScope(value) {
+  return normalizeKeywordFilterEnum(
+    value,
+    ["all", "city", "nearby"],
+    "all",
+    "locationScope",
+  );
+}
+
+const SEARCH_FILTER_CAPABILITIES = Object.freeze({
+  xiaohongshu: Object.freeze({
+    timeRange: Object.freeze(["any", "1d", "7d", "6m"]),
+    sortBy: Object.freeze(["default", "latest", "likes", "comments", "collects"]),
+    contentType: Object.freeze(["all", "video", "image"]),
+    searchScope: Object.freeze(["all", "seen", "unseen", "followed"]),
+    locationScope: Object.freeze(["all", "city", "nearby"]),
+  }),
+  douyin: Object.freeze({
+    timeRange: Object.freeze(["any", "1d", "7d", "6m"]),
+    sortBy: Object.freeze(["default", "latest", "likes"]),
+    videoDuration: Object.freeze([
+      "all",
+      "under_1m",
+      "between_1m_5m",
+      "over_5m",
+    ]),
+    searchScope: Object.freeze(["all", "seen", "unseen", "followed"]),
+  }),
+});
+
+const SEARCH_FILTER_NEUTRAL_VALUES = Object.freeze({
+  timeRange: "any",
+  sortBy: "default",
+  contentType: "all",
+  videoDuration: "all",
+  searchScope: "all",
+  locationScope: "all",
+});
+
+function assertPlatformSearchFilterSupported(platform, dimension, value) {
+  const capabilities = SEARCH_FILTER_CAPABILITIES[platform];
+  const supported = capabilities?.[dimension];
+  const neutral = SEARCH_FILTER_NEUTRAL_VALUES[dimension];
+  if (!supported) {
+    if (value !== neutral) {
+      throw new Error(
+        `${platform} 不支持筛选参数 ${dimension}=${value}`,
+      );
+    }
+    return null;
+  }
+  if (!supported.includes(value)) {
+    throw new Error(
+      `${platform} 不支持筛选参数 ${dimension}=${value}；可选值：${supported.join(", ")}`,
+    );
+  }
+  return value;
 }
 
 function keywordSortDimension(sortBy) {
@@ -1804,6 +2018,7 @@ function findStrategyPreparation(value, depth = 0) {
 }
 
 function buildKeywordCaptureOptions(input = {}, defaults = {}) {
+  const platform = normalizePlatform(input.platform ?? defaults.platform);
   const timeRange = normalizeKeywordTimeRange(
     input.timeRange ?? defaults.timeRange ?? "any",
   );
@@ -1813,16 +2028,39 @@ function buildKeywordCaptureOptions(input = {}, defaults = {}) {
   const contentType = normalizeKeywordContentType(
     input.contentType ?? defaults.contentType ?? "all",
   );
-  return {
+  const videoDuration = normalizeKeywordVideoDuration(
+    input.videoDuration ?? defaults.videoDuration ?? "all",
+  );
+  const searchScope = normalizeKeywordSearchScope(
+    input.searchScope ?? defaults.searchScope ?? "all",
+  );
+  const locationScope = normalizeKeywordLocationScope(
+    input.locationScope ?? defaults.locationScope ?? "all",
+  );
+  const requestedFilters = {
     timeRange,
     sortBy,
     contentType,
+    videoDuration,
+    searchScope,
+    locationScope,
+  };
+  for (const [dimension, value] of Object.entries(requestedFilters)) {
+    assertPlatformSearchFilterSupported(platform, dimension, value);
+  }
+  return {
+    platform,
+    timeRange,
+    sortBy,
+    contentType,
+    videoDuration,
+    searchScope,
+    locationScope,
     prepareKeywordStrategy:
-      input.prepareKeywordStrategy === true ||
-      defaults.prepareKeywordStrategy === true ||
-      timeRange !== "any" ||
-      sortBy !== "default" ||
-      contentType !== "all",
+      input.prepareKeywordStrategy !== false &&
+      defaults.prepareKeywordStrategy !== false,
+    strictFilters: true,
+    filterCapabilities: SEARCH_FILTER_CAPABILITIES[platform],
     sortDimension: keywordSortDimension(sortBy),
   };
 }
@@ -2243,7 +2481,7 @@ async function runBenchmarkAccountResearch(parent, input = {}) {
       platform,
       limit: scanLimit,
       options: buildKeywordCaptureOptions(input, {
-        timeRange: "6m",
+        timeRange: "any",
         sortBy: "likes",
         contentType: "all",
         prepareKeywordStrategy: true,
@@ -2333,9 +2571,16 @@ async function runBenchmarkAccountResearch(parent, input = {}) {
         actualCandidateCount: candidates.length,
         enrichedProfileCount: candidates.filter((item) => item.profile).length,
         requestedFilters: {
-          timeRange: normalizeKeywordTimeRange(input.timeRange || "6m"),
+          timeRange: normalizeKeywordTimeRange(input.timeRange || "any"),
           sortBy: normalizeKeywordSortBy(input.sortBy || "likes"),
           contentType: normalizeKeywordContentType(input.contentType || "all"),
+          videoDuration: normalizeKeywordVideoDuration(
+            input.videoDuration || "all",
+          ),
+          searchScope: normalizeKeywordSearchScope(input.searchScope || "all"),
+          locationScope: normalizeKeywordLocationScope(
+            input.locationScope || "all",
+          ),
         },
         appliedFilters: preparation,
       },
@@ -2695,6 +2940,47 @@ async function cancelTask(taskId) {
 // Some MCP clients still reject native task responses even when they request
 // them, so exposing execution.taskSupport currently makes otherwise valid
 // tool calls fail before the task handle reaches the Agent.
+const SEARCH_FILTER_SCHEMA_PROPERTIES = Object.freeze({
+  timeRange: Object.freeze({
+    type: "string",
+    enum: ["any", "1d", "7d", "6m"],
+    default: "any",
+    description:
+      "发布时间：不限/一天内/一周内/半年内。两平台均支持；不存在 30d 或 1y。",
+  }),
+  sortBy: Object.freeze({
+    type: "string",
+    enum: ["default", "latest", "likes", "comments", "collects"],
+    default: "default",
+    description:
+      "排序。小红书支持全部值；抖音仅支持 default/latest/likes，其他值会被拒绝。",
+  }),
+  contentType: Object.freeze({
+    type: "string",
+    enum: ["all", "video", "image"],
+    default: "all",
+    description: "小红书笔记类型；抖音仅允许中性值 all。",
+  }),
+  videoDuration: Object.freeze({
+    type: "string",
+    enum: ["all", "under_1m", "between_1m_5m", "over_5m"],
+    default: "all",
+    description: "抖音视频时长；小红书仅允许中性值 all。",
+  }),
+  searchScope: Object.freeze({
+    type: "string",
+    enum: ["all", "seen", "unseen", "followed"],
+    default: "all",
+    description: "搜索范围：不限/看过/未看过/已关注。",
+  }),
+  locationScope: Object.freeze({
+    type: "string",
+    enum: ["all", "city", "nearby"],
+    default: "all",
+    description: "小红书位置距离；抖音仅允许中性值 all。",
+  }),
+});
+
 const captureExecution = undefined;
 const tools = [
   {
@@ -2716,7 +3002,7 @@ const tools = [
   {
     name: "mediaclaw_list_assets",
     description:
-      "统一列出 MediaClaw 资产。浏览器本地数据池和本地 Studio 数据无限读取；remote.workbench 需要有效会员。返回稳定 assetId，随后可读取完整对象。",
+      "统一列出 MediaClaw 资产。用户要求模仿、仿写或按某人/某账号风格创作时，无需用户声明已保存：先查询 local.studio 的 style_profile，本地未命中再查询 remote.workbench。返回稳定 assetId，随后必须读取完整对象。浏览器本地数据池和本地 Studio 数据无限读取；remote.workbench 需要有效会员。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -2782,7 +3068,7 @@ const tools = [
   {
     name: "mediaclaw_capture_search_basic",
     description:
-      "调用插件的搜索页基础列表采集，明确禁止隐式打开详情页。返回插件实际保存的完整记录引用。",
+      "调用插件的搜索页基础列表采集，明确禁止隐式打开详情页。Agent 应把自然语言意图转成标准筛选参数：‘最近’通常为 7d，‘最新’使用 latest 排序，‘趋势’通常为 6m；用户明确范围时严格照办。插件会按平台校验并真实点击全部筛选维度，包括中性值，以清除页面遗留筛选；任何请求条件未确认应用时停止采集。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -2790,9 +3076,7 @@ const tools = [
         keyword: {type: "string"},
         platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
         limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
-        timeRange: {type: "string", enum: ["any", "7d", "30d", "6m", "1y"]},
-        sortBy: {type: "string", enum: ["default", "likes", "collects", "comments"]},
-        contentType: {type: "string", enum: ["all", "image", "video"]},
+        ...SEARCH_FILTER_SCHEMA_PROPERTIES,
         idempotencyKey: {type: "string"},
         async: {type: "boolean", default: false},
       },
@@ -2860,22 +3144,7 @@ const tools = [
           default: "xiaohongshu",
         },
         limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
-        timeRange: {
-          type: "string",
-          enum: ["any", "7d", "30d", "6m", "1y"],
-          default: "any",
-          description: "发布时间筛选；页面不支持时会在结果 limitations 中说明",
-        },
-        sortBy: {
-          type: "string",
-          enum: ["default", "likes", "collects", "comments"],
-          default: "default",
-        },
-        contentType: {
-          type: "string",
-          enum: ["all", "image", "video"],
-          default: "all",
-        },
+        ...SEARCH_FILTER_SCHEMA_PROPERTIES,
         async: {
           type: "boolean",
           default: false,
@@ -2921,20 +3190,14 @@ const tools = [
           default: "xiaohongshu",
         },
         limit: {type: "integer", minimum: 10, maximum: 300, default: 80},
+        ...SEARCH_FILTER_SCHEMA_PROPERTIES,
         timeRange: {
-          type: "string",
-          enum: ["any", "7d", "30d", "6m", "1y"],
+          ...SEARCH_FILTER_SCHEMA_PROPERTIES.timeRange,
           default: "6m",
         },
         sortBy: {
-          type: "string",
-          enum: ["default", "likes", "collects", "comments"],
+          ...SEARCH_FILTER_SCHEMA_PROPERTIES.sortBy,
           default: "likes",
-        },
-        contentType: {
-          type: "string",
-          enum: ["all", "image", "video"],
-          default: "all",
         },
         async: {type: "boolean", default: false},
       },
@@ -3069,20 +3332,10 @@ const tools = [
           maximum: 20,
           default: 8,
         },
-        timeRange: {
-          type: "string",
-          enum: ["any", "7d", "30d", "6m", "1y"],
-          default: "6m",
-        },
+        ...SEARCH_FILTER_SCHEMA_PROPERTIES,
         sortBy: {
-          type: "string",
-          enum: ["default", "likes", "collects", "comments"],
+          ...SEARCH_FILTER_SCHEMA_PROPERTIES.sortBy,
           default: "likes",
-        },
-        contentType: {
-          type: "string",
-          enum: ["all", "image", "video"],
-          default: "all",
         },
         async: {type: "boolean", default: false},
       },
@@ -3111,7 +3364,7 @@ const tools = [
   {
     name: "mediaclaw_get_style_profile",
     description:
-      "从 MediaClaw 工作台精确读取一个已保存账号的完整风格分析。用于“按 XX 的风格改写/创作”；找不到或重名时返回候选，禁止猜测风格。",
+      "兼容旧流程：按账号标识读取已保存的完整风格分析。新流程遇到“模仿/仿写/按某人风格”时，应先用 mediaclaw_list_assets 查询 local.studio，未命中再查 remote.workbench，并用 mediaclaw_get_asset 读取完整档案。找不到或重名时禁止猜测风格。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -3732,6 +3985,7 @@ async function handleToolCall(params = {}) {
       awaitingPairing,
       device: adapter ? publicDevice(adapter) : null,
       extension: session,
+      onboarding: buildConnectionOnboarding({connected, awaitingPairing}),
       bridge: {...bridgeStatus},
       recoveredTaskIds: [...recoveredTaskIds],
       waitingTaskCount: [...tasks.values()].filter((task) =>
@@ -3983,10 +4237,20 @@ async function handleBridgeHttpRequest(request, response) {
     return true;
   }
   if (request.url === "/v1/mcp") {
-    const result = await requestContext.run(
-      {adapter},
-      () => handleBrokerMcp(adapter, payload),
-    );
+    let result;
+    try {
+      result = await requestContext.run(
+        {adapter},
+        () => handleBrokerMcp(adapter, payload),
+      );
+    } catch (error) {
+      result = {
+        error: {
+          code: -32000,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
     await scheduleTaskStatePersist();
     sendJson(response, 200, result);
     return true;
