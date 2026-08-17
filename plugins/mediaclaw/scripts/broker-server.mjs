@@ -19,6 +19,7 @@ const PROTOCOL_VERSION = "3";
 const DEFAULT_PORT = Number(process.env.MEDIACLAW_AGENT_PORT || 17373);
 const DEFAULT_SCAN_LIMIT = 80;
 const MAX_SCAN_LIMIT = 300;
+const DEFAULT_KEYWORD_EXPANSION_QUERY_LIMIT = 27;
 const TASK_TTL_MS = 24 * 60 * 60 * 1000;
 const LEGACY_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const BRIDGE_HTTP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORT}`;
@@ -322,6 +323,18 @@ function normalizeLimit(value, fallback = DEFAULT_SCAN_LIMIT) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return fallback;
   return Math.min(MAX_SCAN_LIMIT, Math.max(1, Math.floor(number)));
+}
+
+function keywordExpansionQueryLimit(suffixLetters) {
+  if (!Array.isArray(suffixLetters)) {
+    return DEFAULT_KEYWORD_EXPANSION_QUERY_LIMIT;
+  }
+  const normalizedSuffixes = new Set(
+    suffixLetters
+      .map((item) => String(item || "").trim().toLowerCase())
+      .filter((item) => /^[a-z]$/.test(item)),
+  );
+  return 1 + normalizedSuffixes.size;
 }
 
 function normalizePlatform(value) {
@@ -1024,6 +1037,7 @@ function compactKeywordExpansionResponse(response = {}, captureTask = {}) {
     ),
   ];
   const stats = findObjectByKey(response, "stats") || {};
+  const captureRisk = findObjectByKey(response, "captureRisk");
   return {
     ok: response?.ok !== false,
     taskId: captureTask.taskId || "",
@@ -1040,7 +1054,14 @@ function compactKeywordExpansionResponse(response = {}, captureTask = {}) {
       duplicatesRemoved:
         Number(stats.duplicatesRemoved ?? stats.duplicateCount) || 0,
       uniqueCount: expandedKeywords.length,
+      queryCount:
+        Number(
+          stats.queryCount ??
+            stats.queriesAttempted ??
+            findValueByKey(response, "queryCount"),
+        ) || 0,
     },
+    ...(captureRisk ? {captureRisk} : {}),
     error: response?.error || null,
   };
 }
@@ -1218,12 +1239,19 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
   if (captureTask.mode === "enhance_records") {
     const rawCaptureResult = findObjectByKey(response, "rawCaptureResult") || {};
     const payload = rawCaptureResult?.data || {};
+    const captureRisk = findObjectByKey(response, "captureRisk");
     return {
       ...payload,
       ok: response?.ok !== false && rawCaptureResult?.ok !== false,
       taskId: captureTask.taskId || "",
       mode: captureTask.mode,
-      recordIds: captureTask?.options?.recordIds || [],
+      recordIds: Array.isArray(payload.recordIds)
+        ? payload.recordIds
+        : (captureTask?.options?.recordIds || []).slice(
+            0,
+            Number(captureRisk?.allowedCount) || undefined,
+          ),
+      ...(captureRisk ? {captureRisk} : {}),
       error: response?.error || rawCaptureResult?.error || payload?.error || null,
     };
   }
@@ -1366,6 +1394,7 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
   const isDetail = captureTask.mode === "current_note";
   const isProfile = captureTask.mode === "profile_info";
   const captureResult = data?.captureResult || {};
+  const captureRisk = findObjectByKey(response, "captureRisk");
   const commentItems = isComments ? collectCommentRecords(response) : [];
   const storedRecords = Array.isArray(captureResult.records)
     ? captureResult.records
@@ -1412,6 +1441,7 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
     recordIds,
     ...(isProfile ? {profile: collectAccountProfile(response)} : {}),
     ...(isComments ? {comments: commentItems} : {}),
+    ...(captureRisk ? {captureRisk} : {}),
     error: response?.error || data?.error || captureResult.error || null,
   };
 }
@@ -2206,7 +2236,7 @@ async function runLongtailResearch(parent, input = {}) {
     startSingleCapture("search_results", {
       keyword: seedKeyword,
       platform,
-      limit: MAX_SCAN_LIMIT,
+      limit: keywordExpansionQueryLimit(input.suffixLetters),
       options: {
         operation: "expand_keywords",
         delayBetweenMs: input.delayBetweenMs,
@@ -3794,7 +3824,7 @@ async function executeCaptureTool(name, args) {
     return startSingleCapture("search_results", {
       keyword: args.seedKeyword,
       platform: args.platform,
-      limit: MAX_SCAN_LIMIT,
+      limit: DEFAULT_KEYWORD_EXPANSION_QUERY_LIMIT,
       options: {operation: "expand_keywords"},
     });
   }

@@ -640,6 +640,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       message.task.mode === "search_results" &&
       message.task.options?.operation === "expand_keywords"
     ) {
+      assert.equal(message.task.limit, 27);
       socket.send(
         JSON.stringify({
           type: "task.result",
