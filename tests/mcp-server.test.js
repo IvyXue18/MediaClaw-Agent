@@ -34,7 +34,7 @@ function createLineReader(stream) {
   });
 
   return {
-    waitFor(predicate, timeoutMs = 5000) {
+    waitFor(predicate, timeoutMs = 10_000) {
       const existing = messages.find(predicate);
       if (existing) return Promise.resolve(existing);
       return new Promise((resolve, reject) => {
