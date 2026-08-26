@@ -361,7 +361,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   const handshakeCompleted = new Promise((resolve) => {
     resolveHandshake = resolve;
   });
-  socket.addEventListener("message", (event) => {
+  socket.addEventListener("message", async (event) => {
     const message = JSON.parse(String(event.data));
     if (
       message.type === "task.result.ack" &&
@@ -403,6 +403,9 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       return;
     }
     if (message.type !== "task.start") return;
+    // Real extension work is asynchronous. Yield once so the Broker can finish
+    // registering the task before the simulated extension returns its result.
+    await new Promise((resolve) => setTimeout(resolve, 10));
     if (message.task.mode === "data_pool_assets") {
       assetReadTaskStarts += 1;
       assert.equal(message.task.options.operation, "get");
