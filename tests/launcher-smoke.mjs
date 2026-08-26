@@ -117,5 +117,10 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
-  if (cleanupError) throw cleanupError;
+  if (
+    cleanupError &&
+    !(process.platform === "win32" && cleanupError.code === "EPERM")
+  ) {
+    throw cleanupError;
+  }
 }
