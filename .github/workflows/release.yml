@@ -72,7 +72,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          bun build --compile --target=${{ matrix.target }} plugins/mediaclaw/scripts/runtime-entry.mjs --outfile dist/${{ matrix.asset }}
+          for attempt in 1 2 3; do
+            if bun build --compile --target=${{ matrix.target }} plugins/mediaclaw/scripts/runtime-entry.mjs --outfile dist/${{ matrix.asset }}; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Standalone runtime build failed after $attempt attempts." >&2
+              exit 1
+            fi
+            echo "Standalone runtime build attempt $attempt failed; retrying transient target download." >&2
+            sleep $((attempt * 5))
+          done
 
       - name: Smoke test MCP and browser WebSocket transport
         if: ${{ !contains(matrix.asset, 'musl') }}

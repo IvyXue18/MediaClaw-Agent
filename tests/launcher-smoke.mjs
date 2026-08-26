@@ -42,7 +42,7 @@ const launcherCommand = process.platform === "win32"
   ? process.env.ComSpec || "cmd.exe"
   : launcher;
 const launcherArgs = process.platform === "win32"
-  ? ["/d", "/s", "/c", `"${launcher}"`]
+  ? ["/d", "/s", "/c", launcher]
   : [];
 const child = spawn(launcherCommand, launcherArgs, {
   cwd: pluginRoot,
