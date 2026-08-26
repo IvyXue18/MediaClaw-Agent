@@ -98,5 +98,16 @@ try {
     ]);
   }
   if (child.exitCode === null) child.kill("SIGTERM");
-  await rm(temporaryRoot, {recursive: true, force: true});
+  let cleanupError = null;
+  for (let attempt = 1; attempt <= 20; attempt += 1) {
+    try {
+      await rm(temporaryRoot, {recursive: true, force: true});
+      cleanupError = null;
+      break;
+    } catch (error) {
+      cleanupError = error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  if (cleanupError) throw cleanupError;
 }

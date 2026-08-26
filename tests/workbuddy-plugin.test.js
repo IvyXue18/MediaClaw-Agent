@@ -87,7 +87,7 @@ test("the marketplace ships native launchers for POSIX and Windows hosts", () =>
   assert.match(fs.readFileSync(windowsLauncher, "utf8"), /Get-FileHash/);
   assert.match(
     fs.readFileSync(windowsLauncher, "utf8"),
-    /^:; .*exec .*launch-agent/,
-    "the shared .cmd launcher must begin with a line that POSIX executes and cmd.exe treats as a label",
+    /^#!\/bin\/sh\n@goto windows 2>NUL\n/,
+    "the shared .cmd launcher must remain directly executable on POSIX and jump over POSIX lines on Windows",
   );
 });
