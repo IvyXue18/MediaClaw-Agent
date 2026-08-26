@@ -91,6 +91,14 @@ try {
   console.log(`Platform launcher smoke passed for ${targetKey}.`);
 } finally {
   child.stdin.end();
+  if (process.platform === "win32" && child.pid) {
+    const treeKill = spawn(
+      "taskkill.exe",
+      ["/pid", String(child.pid), "/t", "/f"],
+      {stdio: "ignore"},
+    );
+    await once(treeKill, "exit").catch(() => null);
+  }
   if (child.exitCode === null) {
     await Promise.race([
       once(child, "exit"),
