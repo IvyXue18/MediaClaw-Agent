@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {spawn} from "node:child_process";
-import {mkdtemp, rm} from "node:fs/promises";
+import {mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -126,6 +126,76 @@ test("an unacknowledged extension task expires and releases the next task", asyn
   }));
 });
 
+test("a restored workflow and its unfinished child terminate instead of blocking the queue", async (t) => {
+  const port = 20900 + Math.floor(Math.random() * 80);
+  const stateDirectory = await mkdtemp(path.join(tmpdir(), "mediaclaw-workflow-restart-"));
+  const statePath = path.join(stateDirectory, "tasks-v1.json");
+  const now = new Date().toISOString();
+  await writeFile(statePath, JSON.stringify({
+    version: 1,
+    tasks: [
+      {
+        taskId: "research-stale-workflow",
+        kind: "workflow",
+        status: "running",
+        message: "正在补采作品详情",
+        input: {},
+        captureTask: null,
+        owner: null,
+        progress: {stage: "detail_enhancement", processedCount: 0, totalCount: 56},
+        result: null,
+        error: null,
+        childTaskIds: ["capture-stale-workflow-child"],
+        currentChildTaskId: "capture-stale-workflow-child",
+        createdAt: now,
+        queuedAt: now,
+        startedAt: "",
+        updatedAt: now,
+        ttlMs: 24 * 60 * 60 * 1000,
+      },
+      {
+        taskId: "capture-stale-workflow-child",
+        kind: "capture",
+        status: "running",
+        message: "浏览器正在执行采集",
+        input: {},
+        captureTask: {mode: "enhance_records", options: {recordIds: ["record-1"]}},
+        owner: null,
+        progress: null,
+        result: null,
+        error: null,
+        childTaskIds: [],
+        currentChildTaskId: "",
+        createdAt: now,
+        queuedAt: now,
+        startedAt: now,
+        updatedAt: now,
+        ttlMs: 24 * 60 * 60 * 1000,
+      },
+    ],
+  }), "utf8");
+  const broker = await startBroker({port, stateDirectory});
+  t.after(async () => {
+    await stopChild(broker);
+    await rm(stateDirectory, {recursive: true, force: true});
+  });
+
+  const deadline = Date.now() + 3_000;
+  let state;
+  do {
+    state = JSON.parse(await readFile(statePath, "utf8"));
+    if (state.tasks?.every((task) => task.status === "failed")) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } while (Date.now() < deadline);
+
+  const workflow = state.tasks.find((task) => task.taskId === "research-stale-workflow");
+  const child = state.tasks.find((task) => task.taskId === "capture-stale-workflow-child");
+  assert.equal(workflow.status, "failed");
+  assert.equal(workflow.error.code, "ORCHESTRATION_RESTARTED");
+  assert.equal(child.status, "failed");
+  assert.equal(child.error.code, "ORCHESTRATION_CHILD_RELEASED");
+});
+
 async function stopChild(child) {
   if (!child || child.exitCode !== null) return;
   const exited = new Promise((resolve) => child.once("exit", resolve));
@@ -142,11 +212,12 @@ async function post(port, pathName, payload) {
   return await response.json();
 }
 
-async function registerAdapter(port) {
+async function registerAdapter(port, {agentChannel = "release"} = {}) {
   const registration = await post(port, "/v1/adapters/register", {
     hostKey: "codex",
     displayName: "Lifecycle Test Agent",
     adapterVersion: "0.3.0-rc.2",
+    agentChannel,
     instanceId: `adapter-${Date.now()}-${Math.random()}`,
   });
   assert.equal(registration.ok, true);
@@ -161,7 +232,11 @@ async function callTool(port, token, name, args = {}) {
   });
 }
 
-async function connectExtension(port, deviceId) {
+async function connectExtension(
+  port,
+  deviceId,
+  {extensionId = "test-extension", extensionVersion = "0.3.0"} = {},
+) {
   const socket = new WebSocket(`ws://127.0.0.1:${port}/extension`);
   const messages = [];
   const waiters = [];
@@ -200,11 +275,150 @@ async function connectExtension(port, deviceId) {
     protocolVersion: "3",
     deviceId,
     sessionId: `session-${deviceId}`,
-    extensionId: "test-extension",
-    extensionVersion: "0.3.0",
+    extensionId,
+    extensionVersion,
   }));
   return inbox;
 }
+
+test("a competing extension cannot replace the authenticated extension", async (t) => {
+  const port = 20980 + Math.floor(Math.random() * 80);
+  const stateDirectory = await mkdtemp(
+    path.join(tmpdir(), "mediaclaw-extension-selection-"),
+  );
+  const broker = await startBroker({port, stateDirectory});
+  t.after(async () => {
+    await stopChild(broker);
+    await rm(stateDirectory, {recursive: true, force: true});
+  });
+  const registration = await registerAdapter(port, {agentChannel: "local"});
+  const selected = await connectExtension(port, registration.device.deviceId, {
+    extensionId: "local-extension",
+  });
+  t.after(() => selected.socket.close());
+
+  const connected = await callTool(
+    port,
+    registration.token,
+    "mediaclaw_connection_status",
+  );
+  assert.equal(connected.structuredContent.connected, true);
+  assert.equal(
+    connected.structuredContent.extension.extensionId,
+    "local-extension",
+  );
+
+  const competing = await connectExtension(port, registration.device.deviceId, {
+    extensionId: "ihclbgfnkclacfkbedkdnbpmkcdaccje",
+  });
+  t.after(() => competing.socket.close());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const stable = await callTool(
+    port,
+    registration.token,
+    "mediaclaw_connection_status",
+  );
+  assert.equal(stable.structuredContent.connected, true);
+  assert.equal(stable.structuredContent.awaitingPairing, false);
+  assert.equal(
+    stable.structuredContent.extension.extensionId,
+    "local-extension",
+  );
+});
+
+test("a local Agent candidate never reports the official store extension as connected", async (t) => {
+  const port = 20900 + Math.floor(Math.random() * 80);
+  const stateDirectory = await mkdtemp(
+    path.join(tmpdir(), "mediaclaw-local-extension-selection-"),
+  );
+  const broker = await startBroker({port, stateDirectory});
+  t.after(async () => {
+    await stopChild(broker);
+    await rm(stateDirectory, {recursive: true, force: true});
+  });
+  const registration = await registerAdapter(port, {agentChannel: "local"});
+  const official = await connectExtension(port, registration.device.deviceId, {
+    extensionId: "ihclbgfnkclacfkbedkdnbpmkcdaccje",
+  });
+  t.after(() => official.socket.close());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const beforeLocal = await callTool(
+    port,
+    registration.token,
+    "mediaclaw_connection_status",
+  );
+  assert.equal(beforeLocal.structuredContent.connected, false);
+  assert.equal(beforeLocal.structuredContent.extension, null);
+
+  const local = await connectExtension(port, registration.device.deviceId, {
+    extensionId: "local-extension",
+  });
+  t.after(() => local.socket.close());
+  const afterLocal = await callTool(
+    port,
+    registration.token,
+    "mediaclaw_connection_status",
+  );
+  assert.equal(afterLocal.structuredContent.connected, true);
+  assert.equal(
+    afterLocal.structuredContent.extension.extensionId,
+    "local-extension",
+  );
+});
+
+test("switching an Adapter to the local channel evicts an active store extension", async (t) => {
+  const port = 20820 + Math.floor(Math.random() * 80);
+  const stateDirectory = await mkdtemp(
+    path.join(tmpdir(), "mediaclaw-local-channel-transition-"),
+  );
+  const broker = await startBroker({port, stateDirectory});
+  t.after(async () => {
+    await stopChild(broker);
+    await rm(stateDirectory, {recursive: true, force: true});
+  });
+  const releaseRegistration = await registerAdapter(port);
+  const official = await connectExtension(
+    port,
+    releaseRegistration.device.deviceId,
+    {extensionId: "ihclbgfnkclacfkbedkdnbpmkcdaccje"},
+  );
+  t.after(() => official.socket.close());
+  const releaseStatus = await callTool(
+    port,
+    releaseRegistration.token,
+    "mediaclaw_connection_status",
+  );
+  assert.equal(releaseStatus.structuredContent.connected, true);
+
+  const localRegistration = await registerAdapter(port, {
+    agentChannel: "local",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const transitioned = await callTool(
+    port,
+    localRegistration.token,
+    "mediaclaw_connection_status",
+  );
+  assert.equal(transitioned.structuredContent.connected, false);
+  assert.equal(transitioned.structuredContent.extension, null);
+
+  const local = await connectExtension(port, localRegistration.device.deviceId, {
+    extensionId: "local-extension",
+  });
+  t.after(() => local.socket.close());
+  const localStatus = await callTool(
+    port,
+    localRegistration.token,
+    "mediaclaw_connection_status",
+  );
+  assert.equal(localStatus.structuredContent.connected, true);
+  assert.equal(
+    localStatus.structuredContent.extension.extensionId,
+    "local-extension",
+  );
+});
 
 test("running cancellation stays working until the browser confirms success", async (t) => {
   const port = 21000 + Math.floor(Math.random() * 1000);

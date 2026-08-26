@@ -27,7 +27,7 @@
     },
     {
       "id": "account-content-strategy-v1",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "kind": "analysis",
       "tool": "mediaclaw_scan_account",
       "reference": "references/account-content-strategy.md"
@@ -48,7 +48,7 @@
     },
     {
       "id": "single-note-breakdown-v1",
-      "version": "2.0.0",
+      "version": "3.0.0",
       "kind": "analysis",
       "tool": "mediaclaw_research_single_note",
       "reference": "references/single-note-breakdown.md"

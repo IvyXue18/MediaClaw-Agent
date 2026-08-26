@@ -843,6 +843,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       assert.deepEqual(message.task.resultSinks, ["local_agent"]);
       assert.equal(message.task.featureKey, "asset.data_pool");
       const isGet = message.task.options.operation === "get";
+      const isTranscript = message.task.options.operation === "transcript";
       socket.send(
         JSON.stringify({
           type: "task.result",
@@ -852,7 +853,11 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
             data: {
               rawCaptureResult: {
                 ok: true,
-                type: isGet ? "data_pool_record" : "data_pool_query",
+                type: isGet
+                  ? "data_pool_record"
+                  : isTranscript
+                    ? "video_transcript"
+                    : "data_pool_query",
                 data: isGet
                   ? {
                       operation: "get",
@@ -863,6 +868,13 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
                         normalizedPayload: {title: "数据池详情"},
                       },
                     }
+                  : isTranscript
+                    ? {
+                        status: "done",
+                        recordId: message.task.options.recordId,
+                        text: "已有视频逐字稿",
+                        hasMore: false,
+                      }
                   : {
                       operation: "query",
                       totalCount: 1,
@@ -1026,6 +1038,12 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       assert.deepEqual(message.task.resultSinks, ["local_agent"]);
       const isVideo = message.task.mode === "extract_video_transcript";
       const isQuote = isVideo && message.task.options.meteredAction === "quote";
+      const quoteRecordIds = Array.isArray(message.task.options.recordIds)
+        ? message.task.options.recordIds
+        : [];
+      const quoteIsAlreadyExtracted = quoteRecordIds.includes(
+        "rec-note-single-video-existing",
+      );
       socket.send(
         JSON.stringify({
           type: "task.result",
@@ -1042,9 +1060,20 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
                   ? {
                       status: "quoted",
                       quoteId: "quote-test-1",
-                      recordIds: message.task.options.recordIds,
+                      recordIds: quoteRecordIds,
+                      ...(quoteIsAlreadyExtracted
+                        ? {
+                            items: quoteRecordIds.map((recordId) => ({
+                              recordId,
+                              alreadyExtracted: true,
+                              estimatedCredits: 0,
+                            })),
+                            totalEstimatedCredits: 0,
+                            remainingCredits: 100,
+                          }
+                        : {}),
                       totalDurationMs: 60_000,
-                      estimatedCredits: 2,
+                      estimatedCredits: quoteIsAlreadyExtracted ? 0 : 2,
                       balance: 100,
                       expiresAt: Date.now() + 60_000,
                     }
@@ -1096,6 +1125,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     }
     if (message.task.mode === "current_note") {
       const id = message.task.targetUrl.split("/").pop();
+      const isVideoNote = id.includes("video");
       if (id.startsWith("deep-")) {
         assert.equal(message.task.featureKey, "capture.detail_batch");
         assert.deepEqual(message.task.options.confirmation, {
@@ -1126,11 +1156,19 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
                       collects: 200,
                       comments: 30,
                       lastEditedAt: "2026-07-20",
-                      noteType: "image",
-                      imageUrls: [
-                        "https://example.com/1.jpg",
-                        "https://example.com/2.jpg",
-                      ],
+                      noteType: isVideoNote ? "video" : "image",
+                      imageUrls: isVideoNote
+                        ? []
+                        : [
+                            "https://example.com/1.jpg",
+                            "https://example.com/2.jpg",
+                          ],
+                      ...(isVideoNote
+                        ? {
+                            videoUrl: "https://example.com/video.mp4",
+                            durationMs: 60_000,
+                          }
+                        : {}),
                     },
                   },
                 ],
@@ -1536,11 +1574,13 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     (tool) => tool.name === "mediaclaw_confirm_profile_collection",
   );
   assert.match(prepareProfileCollectionTool.description, /不启动浏览器/);
-  assert.ok(
+  assert.equal(
     prepareProfileCollectionTool.inputSchema.required.includes(
       "requestedFields",
     ),
+    false,
   );
+  assert.match(prepareProfileCollectionTool.description, /默认优先 not_needed/);
   assert.deepEqual(confirmProfileCollectionTool.inputSchema.required, [
     "planId",
   ]);
@@ -1598,8 +1638,28 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     ),
   );
   assert.ok(
+    getAssetTool.inputSchema.properties.sections.items.enum.includes(
+      "reportFrameworks",
+    ),
+  );
+  assert.ok(
+    getAssetTool.inputSchema.properties.sections.items.enum.includes(
+      "samples",
+    ),
+  );
+  assert.ok(
     getAssetTool.inputSchema.properties.page.properties.path.enum.includes(
       "extractedContent.transcript.text",
+    ),
+  );
+  assert.ok(
+    getAssetTool.inputSchema.properties.page.properties.path.enum.includes(
+      "report.ideaBank",
+    ),
+  );
+  assert.ok(
+    getAssetTool.inputSchema.properties.page.properties.path.enum.includes(
+      "samples",
     ),
   );
   assert.match(getAssetTool.description, /不会重新采集/);
@@ -2012,6 +2072,8 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
           profileUrl:
             "https://www.xiaohongshu.com/user/profile/collection-plan-test",
           purpose: "account_analysis",
+          analysisTranscriptDecision: "recommend",
+          analysisTranscriptReason: "需要比较代表视频的口播结构和语言表达",
           contentType: "all",
           coverage: "all_available",
           maxItems: 372,
@@ -2033,6 +2095,156 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.match(
     analysisCollectionPlan.confirmation.prompt,
     /建议先采 50 条.*仍按 372 条执行/,
+  );
+  assert.equal(analysisCollectionPlan.collectionScope.detailTargetLimit, 15);
+  assert.equal(
+    analysisCollectionPlan.analysisContract.evidenceBaseline.transcripts,
+    8,
+  );
+  assert.ok(analysisCollectionPlan.requestedFields.includes("content_text"));
+  assert.ok(analysisCollectionPlan.requestedFields.includes("video_transcript"));
+  assert.ok(
+    analysisCollectionPlan.analysisContract.fieldPolicy.autoAddedFields.includes(
+      "video_transcript",
+    ),
+  );
+  assert.equal(collectionPlanTaskStarts, 0);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 15131,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "帮我分析这个账号",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/account-analysis-contract-test",
+          purpose: "account_analysis",
+          analysisTranscriptDecision: "recommend",
+          analysisTranscriptReason: "需要完成工作台同构的视频内容机制分析",
+          contentType: "all",
+          coverage: "all_available",
+          requestedFields: [
+            "account_profile",
+            "title",
+            "post_page_url",
+            "cover",
+            "publish_time",
+            "engagement_metrics",
+            "content_text",
+            "media_urls",
+            "comments",
+            "video_transcript",
+          ],
+        },
+      },
+    })}\n`,
+  );
+  const preparedWorkbenchParityAnalysis = await reader.waitFor(
+    (message) => message.id === 15131,
+  );
+  const workbenchParityPlan =
+    preparedWorkbenchParityAnalysis.result.structuredContent.plan;
+  assert.equal(workbenchParityPlan.collectionScope.detailTargetLimit, 15);
+  assert.equal(workbenchParityPlan.riskNotice.estimates.listItems, 50);
+  assert.equal(workbenchParityPlan.riskNotice.estimates.detailPageVisits, 15);
+  assert.equal(workbenchParityPlan.riskNotice.estimates.comments, 450);
+  assert.equal(workbenchParityPlan.riskNotice.level, "normal");
+  assert.equal(
+    workbenchParityPlan.analysisContract.evidenceBaseline.transcripts,
+    8,
+  );
+  assert.equal(
+    workbenchParityPlan.analysisContract.evidenceBaseline.covers,
+    12,
+  );
+  assert.equal(
+    workbenchParityPlan.analysisContract.representativeSelection,
+    "workbench_high5_typical6_low4",
+  );
+  assert.match(workbenchParityPlan.confirmation.prompt, /最多 15 个详情页/);
+  assert.doesNotMatch(workbenchParityPlan.confirmation.prompt, /50 个详情页/);
+  assert.equal(collectionPlanTaskStarts, 0);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 15132,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "帮我分析这个账号",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/account-analysis-auto-fields",
+          purpose: "account_analysis",
+          analysisTranscriptDecision: "recommend",
+          analysisTranscriptReason: "需要分析代表视频的口播、叙事和节奏机制",
+          contentType: "all",
+          coverage: "all_available",
+        },
+      },
+    })}\n`,
+  );
+  const preparedAutomaticAnalysis = await reader.waitFor(
+    (message) => message.id === 15132,
+  );
+  const automaticAnalysisPlan =
+    preparedAutomaticAnalysis.result.structuredContent.plan;
+  assert.equal(automaticAnalysisPlan.recommendation.requestedCount, 50);
+  assert.equal(automaticAnalysisPlan.collectionScope.detailTargetLimit, 15);
+  assert.equal(
+    automaticAnalysisPlan.analysisContract.evidenceBaseline.transcripts,
+    8,
+  );
+  assert.deepEqual(
+    automaticAnalysisPlan.analysisContract.fieldPolicy.userRequestedFields,
+    [],
+  );
+  assert.ok(automaticAnalysisPlan.requestedFields.includes("cover"));
+  assert.ok(automaticAnalysisPlan.requestedFields.includes("content_text"));
+  assert.ok(automaticAnalysisPlan.requestedFields.includes("video_transcript"));
+  assert.equal(collectionPlanTaskStarts, 0);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 15133,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "只看这个账号的选题和标题表现",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/account-analysis-no-transcript",
+          purpose: "account_analysis",
+          contentType: "all",
+          coverage: "all_available",
+          analysisTranscriptDecision: "not_needed",
+          analysisTranscriptReason:
+            "当前问题只比较标题、选题和互动分布，逐字稿不会改变结论",
+        },
+      },
+    })}\n`,
+  );
+  const preparedNoTranscriptAnalysis = await reader.waitFor(
+    (message) => message.id === 15133,
+  );
+  const noTranscriptAnalysisPlan =
+    preparedNoTranscriptAnalysis.result.structuredContent.plan;
+  assert.equal(
+    noTranscriptAnalysisPlan.analysisContract.evidenceBaseline.transcripts,
+    0,
+  );
+  assert.equal(
+    noTranscriptAnalysisPlan.requestedFields.includes("video_transcript"),
+    false,
+  );
+  assert.equal(
+    noTranscriptAnalysisPlan.analysisContract.fieldPolicy.transcriptTrigger,
+    "not_needed",
   );
   assert.equal(collectionPlanTaskStarts, 0);
 
@@ -2127,6 +2339,14 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(profileCollectionResult.coverage.detailRequestedCount, 2);
   assert.equal(profileCollectionResult.coverage.detailSuccessCount, 2);
   assert.equal(profileCollectionResult.records.length, 2);
+  assert.equal(profileCollectionResult.records[0].previewOnly, true);
+  assert.match(
+    profileCollectionResult.records[0].assetId,
+    /^local\.data_pool\|capture_record\|/,
+  );
+  assert.equal("normalizedPayload" in profileCollectionResult.records[0], false);
+  assert.equal("rawPayload" in profileCollectionResult.records[0], false);
+  assert.ok(JSON.stringify(profileCollectionResult.records).length < 10_000);
   assert.match(profileCollectionResult.archiveJobId, /^archive_/);
   assert.equal(
     profileCollectionResult.archive.archiveJobId,
@@ -2793,6 +3013,8 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
           url: "https://www.xiaohongshu.com/explore/single-research",
           includeComments: true,
           includeMediaText: true,
+          analysisTranscriptDecision: "not_needed",
+          analysisTranscriptReason: "图文作品使用 OCR，不需要视频逐字稿",
         },
       },
     })}\n`,
@@ -2802,10 +3024,92 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   const singleNote = singleNoteResponse.result.structuredContent.result;
   assert.equal(singleNote.recommendedMethodId, "single-note-breakdown-v1");
-  assert.equal(singleNote.recommendedMethodVersion, "2.0.0");
+  assert.equal(singleNote.recommendedMethodVersion, "3.0.0");
   assert.equal(singleNote.coverage.commentCount, 30);
   assert.equal(singleNote.mediaText.text, "图片中的文案");
   assert.equal(singleNote.coverage.recordId, "rec-note-single-research");
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 211,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_research_single_note",
+        arguments: {
+          url: "https://www.douyin.com/video/single-video-research",
+          platform: "douyin",
+          includeComments: false,
+          includeMediaText: true,
+          analysisTranscriptDecision: "recommend",
+          analysisTranscriptReason: "需要分析视频实际口播结构",
+        },
+      },
+    })}\n`,
+  );
+  const singleVideoResponse = await reader.waitFor(
+    (message) => message.id === 211,
+  );
+  const singleVideo = singleVideoResponse.result.structuredContent.result;
+  assert.equal(singleVideo.mediaText.status, "quoted");
+  assert.equal(singleVideo.mediaText.quoteId, "quote-test-1");
+  assert.equal(singleVideo.mediaText.nextConfirmation.required, true);
+  assert.equal(singleVideo.coverage.transcriptConfirmationRequired, true);
+  assert.equal(singleVideo.coverage.transcriptEstimatedCredits, 2);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 212,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_research_single_note",
+        arguments: {
+          url: "https://www.douyin.com/video/single-video-existing",
+          platform: "douyin",
+          includeComments: false,
+          includeMediaText: true,
+          analysisTranscriptDecision: "recommend",
+          analysisTranscriptReason: "需要分析视频实际口播结构",
+        },
+      },
+    })}\n`,
+  );
+  const existingVideoResponse = await reader.waitFor(
+    (message) => message.id === 212,
+  );
+  const existingVideo = existingVideoResponse.result.structuredContent.result;
+  assert.equal(existingVideo.mediaText.status, "already_available");
+  assert.equal(existingVideo.mediaText.text, "已有视频逐字稿");
+  assert.equal(existingVideo.mediaText.chargedCredits, 0);
+  assert.equal(existingVideo.coverage.transcriptConfirmationRequired, false);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 213,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_research_single_note",
+        arguments: {
+          url: "https://www.douyin.com/video/single-video-not-needed",
+          platform: "douyin",
+          includeComments: false,
+          analysisTranscriptDecision: "not_needed",
+          analysisTranscriptReason: "当前只比较标题、发布时间和互动指标",
+        },
+      },
+    })}\n`,
+  );
+  const noTranscriptVideoResponse = await reader.waitFor(
+    (message) => message.id === 213,
+  );
+  const noTranscriptVideo =
+    noTranscriptVideoResponse.result.structuredContent.result;
+  assert.equal(noTranscriptVideo.mediaText.status, "not_needed");
+  assert.equal(noTranscriptVideo.mediaText.chargedCredits, 0);
+  assert.equal(noTranscriptVideo.coverage.transcriptConfirmationRequired, false);
+  assert.equal(noTranscriptVideo.coverage.transcriptDecision, "not_needed");
 
   const satellite = spawn(process.execPath, [serverPath], {
     env: {...process.env, MEDIACLAW_AGENT_PORT: String(port)},

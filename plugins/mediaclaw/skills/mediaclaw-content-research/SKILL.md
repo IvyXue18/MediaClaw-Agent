@@ -34,11 +34,11 @@ Agent 的分析、生成和报告输出不消耗 MediaClaw 积分。会员只控
 
 每个新会话第一次进入 MediaClaw 工作流时，先执行 `mediaclaw_connection_status`，并先处理返回的 `agentUpdate`：
 
-1. `status=up_to_date`、`ahead`、`unavailable` 或 `disabled`：不要打扰用户，继续当前请求。更新检查失败不是采集失败。
-2. `status=update_available`：在执行任何采集或分析前，用一句话告诉用户当前版本、最新版本和“安装完成后需要重新打开当前宿主才能激活”，并取得明确授权。用户当前消息已经明确说“升级社媒虾／升级到最新版”等同义表达时，该消息本身就是授权，不得重复询问。不得向用户展示或要求用户执行任何终端、CLI、斜杠命令、安装路径或缓存操作。
+1. `status=up_to_date` 或 `ahead`：自动检查时不要打扰用户；如果用户主动说“升级 Agent／检查更新”，明确告诉用户当前版本以及“已经是最新版”，不要重复安装。`status=unavailable` 或 `disabled`：自动检查时继续当前请求；用户主动要求升级时准确说明本次无法检查，并继续保留当前版本。更新检查失败不是采集失败。
+2. `status=update_available`：在执行任何采集或分析前，用一句话告诉用户当前版本、最新版本和“安装完成后需要完全退出并重新打开 Codex／WorkBuddy 才能激活”，并取得明确授权。用户当前消息已经明确说“升级 Agent／升级社媒虾／升级到最新版”等同义表达时，该消息本身就是授权，立即使用本次 `approvalId` 执行升级，不得重复询问。不得向用户展示或要求用户执行任何终端、CLI、斜杠命令、安装路径或缓存操作。
 3. 获得授权后，只调用一次 `mediaclaw_manage_agent_update`，传入 `decision=approve`、本次 `approvalId` 和用户尚未完成的原始目标。Adapter 会自行执行固定安装动作并解析验版输出。工具返回失败时停在当前任务，准确报告 `failedStage`，不得声称升级成功。
-4. 工具返回 `oldSessionFenced=true` 或 `status=installed_restart_required` 后，只能说明“新版已经安装，完全重新打开当前宿主后会激活并继续原任务”。不得在同一宿主进程里创建新任务、调用其他 MediaClaw 工具或把安装动作转交给用户；同一进程中的新任务仍可能引用被替换的旧缓存。
-5. “已安装”不等于“已激活”。只有宿主重新打开后，新会话调用 `mediaclaw_connection_status` 返回 `agentUpdate.status=activated` 且 `activeVersion=latestVersion`，才可以宣布升级完成；随后直接续接 `continuation.originalGoal`，不要要求用户重复描述需求。
+4. 工具返回 `oldSessionFenced=true` 或 `status=installed_restart_required` 后，必须明确报告“已安装并验版到哪个版本”，再逐步引导用户：完全退出状态中指定的 Codex／WorkBuddy 并确保旧进程结束；重新打开同一宿主；回到原对话发送“继续”。不得只说含糊的“重启当前宿主”，不得要求创建新任务、重新安装、重新配对或重复描述需求。此时不得在旧进程里调用其他 MediaClaw 工具。
+5. “已安装”不等于“已激活”。用户重开宿主并说“继续”后，先调用 `mediaclaw_connection_status`；只有返回 `agentUpdate.status=activated` 且 `activeVersion=latestVersion`，才宣布“MediaClaw Agent 已升级并激活到 {activeVersion}”，随后直接续接 `continuation.originalGoal`，不要要求用户重复描述需求。
 6. 如果重新打开后没有返回 `activated`，准确报告当前 `currentVersion`、`installedVersion`、`activeVersion` 和失败阶段；不得降级为网页搜索、通用浏览器或其他工具冒充 MediaClaw，也不得建议用户使用终端。配对按宿主安装实例保存；协议兼容时不得要求用户重新配对。
 7. 用户拒绝或暂不升级时，调用 `mediaclaw_manage_agent_update`，传入 `decision=reject` 和本次 `approvalId`。它不得执行任何安装动作，并会把本会话状态改为 `dismissed`；随后继续当前版本且不重复催促。只有用户主动询问更新时才再次说明。
 
@@ -69,6 +69,21 @@ Agent 接管仍需要插件内已验证且有效的激活码，但欢迎语不�
 ## 数据目标澄清与方案确认
 
 能力选择必须发生在数据目标明确之后。不得先选择一个风险较低的基础工具，再用该工具的默认输出反向解释用户意图。
+
+“帮我分析这个账号”“看看这篇为什么火”“拆一下这条视频”等分析请求已经明确了结果用途，不要反问用户需要哪些内部字段、多少详情或哪种分析维度。账号分析和单篇拆解分别使用对应版本化方法中的工作台同构证据基线与输出契约，Agent 自己检查资产覆盖并决定缺少哪些证据。只有账号、作品或链接无法从当前页面与上下文识别，或者用户的范围会实质改变采集量、积分与风险时才追问。
+
+逐字稿采用双向触发，不允许只等待一方提出：
+
+- 用户主动触发：用户说“提取逐字稿”“把视频文案／口播文字／字幕文字版弄出来”“看看视频里说了什么”等，且对象是已有视频时，识别为逐字稿提取意图；“帮我写一段视频文案”属于生成请求，不得误判为提取。
+- Agent 主动触发：任何分析都必须先判断逐字稿是否会显著提升当前任务；不仅限于账号分析和单篇拆解。只有当前问题需要口播原文、叙事推进、语言表达、论证细节、视频内容机制或节奏时间证据，且现有标题／正文／OCR／评论无法可靠回答时，才为最小充分视频样本主动生成报价并说明增量价值。用户不需要先知道“逐字稿”这个术语。
+- 两条路径汇入同一确认协议：先复用已有逐字稿，只为缺失项报价；展示具体作品、逐条预计积分、总积分、余额和有效期，只有用户明确同意后才确认提取。用户拒绝时继续使用现有证据分析，并明确降级维度。
+
+逐字稿必要性判断默认偏向不新增提取，因为它消耗积分且耗时。TRACE 的 Terrain 阶段必须内部完成以下判断：
+
+1. 当前问题只涉及标题、发布时间、互动分布、内容类型、账号选题结构、链接或基础指标时，通常不需要逐字稿。
+2. 当前问题要求分析视频具体说了什么、开头如何留人、观点怎样展开、语言风格、论证和故事结构、口播节奏或按其方法写脚本时，逐字稿通常具有明显增量价值。
+3. 先查看已有逐字稿覆盖；已有就直接使用。需要新增时只选能改变结论的最小样本，不为了“更完整”机械提取。
+4. 判断为不需要时继续完成分析，不用用一段提示打扰用户；判断为建议提取时，说明“不提取能回答什么、提取后能多回答什么”，再展示真实报价让用户决定。
 
 直接采集请求先在内部形成数据目标契约：
 
@@ -116,10 +131,12 @@ Agent 接管仍需要插件内已验证且有效的激活码，但欢迎语不�
 ## 强制执行链
 
 1. 第一次调用工具前执行 `mediaclaw_connection_status`，并先完成上面的更新检查协议。
+   MediaClaw 资产命中必须来自 `mediaclaw_list_assets`／`mediaclaw_get_asset` 或本次 MediaClaw 任务结果。旧 Codex 任务消息、终端日志、Obsidian 导出、任意本地文件或浏览器历史都不等于 MediaClaw 资产；除非用户明确把它们指定为本次输入，否则不得用来冒充已有报告或原始数据。连接失败时停止 MediaClaw 资产分析并准确报告连接状态，不得读取这些旁路来源继续生成一份看似有证据的 MediaClaw 报告。`read_thread` 最多只能恢复用户曾提供的账号名、主页链接或作品链接，不得恢复旧报告正文、样本结论或统计数字作为本次证据。
 2. 根据用户意图选择一个主要分析方法，完整读取对应 reference。
 3. 任何分析或生成都先读取 [TRACE → BUILD 底层方法](references/evidence-to-content-framework.md)。
 4. 先用 `mediaclaw_list_assets` 检查已有数据，命中后用 `mediaclaw_get_asset` 读取，避免重复采集。
    `list_assets` 只返回索引摘要，不能据此判断正文、评论或提取内容为空。`get_asset` 对本地数据池返回统一 manifest；根据用户任务选择 `identity`、`content`、`creator`、`metrics`、`media`、`comments`、`extractedContent`、`context`，并沿各分区的 `nextCursor` 读完所需数据。不得再自行解析 `rawPayload`、`normalizedPayload.detailPayload` 或 `items[0]` 的差异；只有无损调试才使用 `view=raw`。评论已经合并到采集记录中，不要只查询 `recordType=comments`。
+   `remote.workbench` 的 `account_analysis` 也必须先读 manifest，不得默认整包读取报告。根据任务组合 `reportOverview`、`reportStrategy`、`reportExpression`、`reportFrameworks`、`reportIdeation`、`stylePack`、`evidence`、`sampleAnalyses`、`samples` 和 `coverage`；`samples` 是工作台保存的原始分析样本，不是精简索引。大型数组沿对应 page 的 `nextCursor` 读取到任务需要的范围。普通账号分析优先读取报告、覆盖率和证据；只有需要复核报告证据或重新分析时才分页读取 `sampleAnalyses` 与原始 `samples`，避免大对象堵塞 Agent 输出。
    “读取、查看、分析、导出已有数据”都属于本地读取。只要本地资产已经命中，本轮不得因读取超时、扩展重连或传输失败改调任何 `capture_*` 工具；工具失败不等于本地无数据。只有用户明确要求“重新采集、更新、补采、采更多”，或本地确实未命中且用户同意后，才能进入采集。
    评论分区中的 `savedCount` 是插件已保存且可读取的数量，`platformCount` 是作品页面互动指标；不得混用，也不得把页面指标表述为已保存评论数。本地读取需要浏览器扩展传输其数据库内容，但不代表打开作品页或重新爬取。
 5. 未命中时根据已确认的数据目标选择能力。账号直接采集先走方案／确认工具；研究方法内部需要的最小证据可使用匹配的原子工具。用户明确范围覆盖方法默认参数。
@@ -129,6 +146,27 @@ Agent 接管仍需要插件内已验证且有效的激活码，但欢迎语不�
 9. 只向用户展示有用结论、证据、限制和成品，不展示冗长内部推理。
 
 不得只调用工具后凭通用常识输出。不得把 `recommendedMethodId` 当作结论；它表示下一步必须执行的方法资产。
+
+## 分析资产复用顺序（强制）
+
+用户只说“分析这个账号”或“分析这篇内容”时，不得把这句话直接解释成重新采集或重新运行分析。先识别账号主页／平台／账号名，或作品链接／平台／作品 ID，再严格执行以下顺序。
+
+### 账号
+
+1. 先查 `local.studio + account_analysis`；命中匹配账号后读取完整资产，直接基于已有报告回答。
+2. 本地没有时查 `remote.workbench + account_analysis`；命中后先读 manifest、报告分区、`coverage` 和 `evidence`，直接复用工作台报告。普通回答不读取全部原始 `samples`；只有复核证据或用户明确要求重算时才分页读取。
+3. 两处都没有账号分析时，再查 `local.data_pool + capture_record`，用主页链接、平台、账号 ID／账号名定位该账号已采集的作品。索引命中后读取 manifest 和任务需要的分区，不得重复采集。
+4. 已有原始数据达到方法证据要求时，直接按工作台同构契约分析；没有达到时只补缺失层，例如基础作品不足、代表详情不足、OCR 缺失或逐字稿不足，禁止清空后重采整个账号。
+5. 原始数据也没有，或当前账号无法匹配时，才制定 `purpose=account_analysis` 的采集方案。默认目标是最多 50 条基础作品、15 条高／典型／低表现代表详情和最多 12 个封面证据；同时必须判断当前分析是否需要最多 8 条代表视频逐字稿。默认不新增提取，只有它会显著提升当前问题时才加入报价。账号实际作品不足时使用全部可得作品并降低覆盖说明。用户没有要求全量归档时，不得把 50 条基础作品变成 50 个详情页。
+
+### 单篇
+
+1. 先查 `local.studio + note_breakdown`；命中同一作品后直接复用。
+2. 本地没有时查 `remote.workbench + note_breakdown`；命中后读取完整拆解与覆盖信息，直接复用。
+3. 两处都没有拆解时，再查 `local.data_pool + capture_record`；命中同一作品后读取完整 manifest 与 `identity/content/creator/metrics/media/comments/extractedContent/context`，直接按工作台同构契约分析。
+4. 只有同一作品既没有拆解资产也没有采集记录，或已保存记录明确缺少当前结论必需的证据时，才调用 `mediaclaw_capture_note` 或只补 OCR／逐字稿等缺失层。
+
+“已有分析直接复用”不等于隐藏其时效和覆盖。最终回答要说明使用了已有报告还是基于已有原始数据新分析，并给出分析时间、基础样本数、详情数、逐字稿数、评论／媒体覆盖和主要缺口。用户明确说“重新分析”“更新到最近”“不要用旧报告”时才跳过已有结论，但仍优先复用已采集原始数据并只补增量。
 
 ## 分析方法路由
 
@@ -207,6 +245,8 @@ Agent 负责把自然语言意图转成标准参数；平台能力、参数校�
 
 先调用 `mediaclaw_quote_video_transcript(recordIds)`。向用户展示逐条预计积分、总额、余额和有效期；只有用户明确同意后，才把返回的 `quoteId` 原样传给 `mediaclaw_confirm_video_transcript`。不得代替用户确认，不得提供 BYOK、本地模型或第三方供应商参数。
 
+报价既可以由用户主动请求触发，也可以由任一分析方法完成必要性判断和代表样本选择后主动触发。账号分析最多为 8 条代表视频中的缺失逐字稿报价，单篇视频分析为目标作品的缺失逐字稿报价，其他分析只选能改变当前结论的最小充分样本；不得机械地给全部作品报价。报价项标记 `alreadyExtracted=true` 时直接读取且积分为 0，不再要求付费确认；混合批次只对未提取项计算总积分。
+
 确认成功后优先直接使用返回的 `text`。如果逐字稿已经由插件生成、确认结果未携带完整文本，或完整资产读取超时，必须调用 `mediaclaw_get_video_transcript(recordId)` 精确读取；当 `hasMore=true` 时按 `nextOffset` 自动续读并拼接，直到完整取回。不要让用户到大量数据中手动查找。只有精确读取仍失败时，才把“到插件复制逐字稿”作为兜底提示；该提示必须说明是否已生成、是否扣积分，避免用户重复提取。
 
 没有深采权益时继续交付免费结论，并降低机制判断的置信度。不得把分析包装成失败或称为付费能力。
@@ -256,7 +296,7 @@ Agent 负责把自然语言意图转成标准参数；平台能力、参数校�
 - 图片 OCR：`mediaclaw_extract_image_text`
 - 视频逐字稿：`mediaclaw_quote_video_transcript`、`mediaclaw_confirm_video_transcript`；已有资产优先通过 `mediaclaw_get_asset` 的 `extractedContent` 分区读取，`mediaclaw_get_video_transcript` 仅作旧流程兼容
 - 当前任务数据分页：`mediaclaw_query_dataset`
-- 统一资产：`mediaclaw_list_assets`、`mediaclaw_get_asset`
+- 统一资产：`mediaclaw_list_assets`、`mediaclaw_get_asset`；工作台账号报告默认返回 manifest 和 identity，再按报告分区与游标读取完整内容和原始样本
 - 数据清理：先用 `mediaclaw_preview_clear_data` 读取影响范围；向用户展示记录数、评论数、逐字稿数和预计释放空间并取得明确确认后，才能把原样返回的 `confirmationToken` 传给 `mediaclaw_confirm_clear_data`
 - 任务状态／取消：`mediaclaw_task_status`、`mediaclaw_cancel_task`
 

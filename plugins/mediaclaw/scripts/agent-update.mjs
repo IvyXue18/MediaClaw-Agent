@@ -225,6 +225,7 @@ function buildUpdateState({currentVersion, latestVersion, hostKey, checkedAt}) {
       blocking: false,
     };
   }
+  const hostDisplayName = hostKey === "workbuddy" ? "WorkBuddy" : "Codex";
   return {
     status: "update_available",
     currentVersion,
@@ -232,7 +233,20 @@ function buildUpdateState({currentVersion, latestVersion, hostKey, checkedAt}) {
     checkedAt,
     blocking: true,
     approvalRequired: true,
-    message: `发现 MediaClaw Agent 新版本 ${latestVersion}。你只需确认升级；安装、验版和原任务保存都由 Agent 完成。插件更新后需要重新打开当前宿主才能激活。`,
+    message: `发现 MediaClaw Agent 可从 ${currentVersion} 升级到 ${latestVersion}。你只需说“升级 Agent”；安装、验版和原任务保存都由 Agent 完成。安装成功后需要完全退出并重新打开 ${hostDisplayName} 才能激活。`,
+    userGuidance: {
+      stage: "approval_required",
+      host: hostKey,
+      hostDisplayName,
+      currentVersion,
+      targetVersion: latestVersion,
+      suggestedReply: "升级 Agent",
+      steps: [
+        `当前版本是 ${currentVersion}，可升级到 ${latestVersion}。`,
+        "说“升级 Agent”即代表授权；不需要输入命令或再次确认。",
+        `Agent 将自动安装并验版，完成后会提示完全重启 ${hostDisplayName}。`,
+      ],
+    },
     releaseUrl: `https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v${latestVersion}`,
     execution: updateExecution(hostKey),
     continuation: {
@@ -485,6 +499,24 @@ export function createAgentUpdateOrchestrator({
   let durableStatePromise = null;
   let activatedState = null;
 
+  const hostDisplayName = hostKey === "workbuddy" ? "WorkBuddy" : "Codex";
+
+  function restartGuidance(installedVersion) {
+    return {
+      stage: "restart_required",
+      host: hostKey,
+      hostDisplayName,
+      installedVersion,
+      suggestedReplyAfterRestart: "继续",
+      steps: [
+        `MediaClaw Agent ${installedVersion} 已安装并通过验版。`,
+        `完全退出 ${hostDisplayName}，确保旧进程结束；不要只关闭当前对话。`,
+        `重新打开 ${hostDisplayName}，回到刚才的同一对话。`,
+        "发送“继续”；Agent 会确认新版本已激活并续接原任务，无需重新描述需求。",
+      ],
+    };
+  }
+
   async function durableState() {
     if (activatedState) return activatedState;
     if (!durableStatePromise) {
@@ -506,9 +538,19 @@ export function createAgentUpdateOrchestrator({
               required: true,
               originalGoal: String(record.originalGoal || ""),
               resumeAutomatically: true,
+              suggestedUserReply: "继续",
             },
-            message:
-              "新版 Agent 已在重新打开的宿主中真实启动并完成激活，可以继续升级前的原任务。",
+            userGuidance: {
+              stage: "activated",
+              host: hostKey,
+              hostDisplayName,
+              activeVersion: currentVersion,
+              steps: [
+                `已确认 MediaClaw Agent ${currentVersion} 在 ${hostDisplayName} 中完成激活。`,
+                "现在继续升级前的原任务，不要求用户重新描述需求。",
+              ],
+            },
+            message: `MediaClaw Agent 已升级并激活到 ${currentVersion}，现在可以继续升级前的原任务。`,
           };
           await stateStore.clear();
           return activatedState;
@@ -529,8 +571,10 @@ export function createAgentUpdateOrchestrator({
               restartHostRequired: true,
               originalGoal: String(record.originalGoal || ""),
             },
-            message:
-              "新版已经安装，但当前宿主仍在运行旧版。请完全重新打开当前宿主；不要在本进程中继续创建新任务。",
+            userGuidance: restartGuidance(
+              record.installedVersion || record.targetVersion,
+            ),
+            message: `MediaClaw Agent ${record.installedVersion || record.targetVersion} 已安装并通过验版，但当前 ${hostDisplayName} 仍在运行旧版。请完全退出并重新打开 ${hostDisplayName}，回到同一对话后发送“继续”。`,
           };
         }
         await stateStore.clear();
@@ -693,8 +737,8 @@ export function createAgentUpdateOrchestrator({
         restartHostRequired: true,
         installedAt,
         continuation,
-        message:
-          "新版已安装并完成静态验版，但尚未激活。请完全重新打开当前宿主；新版 Adapter 真实启动并回报目标版本后，才会继续原任务。",
+        userGuidance: restartGuidance(installedVersion),
+        message: `MediaClaw Agent ${installedVersion} 已安装并通过验版，但尚未激活。请完全退出并重新打开 ${hostDisplayName}，回到同一对话后发送“继续”；确认 activeVersion=${installedVersion} 后会续接原任务。`,
       };
       return {ok: true, agentUpdate: fencedState, continuation};
     })();

@@ -56,6 +56,10 @@ test("Codex update plan requires approval and a host restart without user comman
   assert.equal(result.continuation.createNewTask, false);
   assert.equal(result.continuation.restartHostRequired, true);
   assert.equal(result.continuation.projectless, true);
+  assert.equal(result.userGuidance.suggestedReply, "升级 Agent");
+  assert.equal(result.userGuidance.hostDisplayName, "Codex");
+  assert.match(result.message, /0\.3\.0-rc\.1/);
+  assert.match(result.message, /0\.3\.1/);
 });
 
 test("WorkBuddy refreshes the marketplace and installed plugin", async () => {
@@ -202,6 +206,13 @@ test("approved update runs fixed commands, verifies the version, and fences the 
   assert.equal(approved.agentUpdate.currentVersion, "0.3.0-rc.1");
   assert.equal(approved.agentUpdate.oldSessionFenced, true);
   assert.equal(approved.agentUpdate.restartHostRequired, true);
+  assert.equal(approved.agentUpdate.userGuidance.hostDisplayName, "Codex");
+  assert.equal(
+    approved.agentUpdate.userGuidance.suggestedReplyAfterRestart,
+    "继续",
+  );
+  assert.match(approved.agentUpdate.message, /已安装并通过验版/);
+  assert.match(approved.agentUpdate.message, /Codex/);
   assert.equal(approved.continuation.createNewTask, false);
   assert.equal(approved.continuation.hostAction, "restart_host");
   assert.equal(approved.continuation.projectless, true);
@@ -242,6 +253,9 @@ test("a restarted target-version Adapter activates the durable upgrade and resum
   assert.equal(status.activeVersion, "0.3.1");
   assert.equal(status.blocking, false);
   assert.equal(status.continuation.resumeAutomatically, true);
+  assert.equal(status.continuation.suggestedUserReply, "继续");
+  assert.equal(status.userGuidance.activeVersion, "0.3.1");
+  assert.match(status.message, /已升级并激活到 0\.3\.1/);
   assert.equal(status.continuation.originalGoal, "继续完成账号分析");
   assert.equal(stateStore.current(), null);
 });
@@ -265,6 +279,8 @@ test("an old Adapter keeps reporting restart required from durable state", async
   const status = await orchestrator.status();
   assert.equal(status.status, "installed_restart_required");
   assert.equal(status.restartHostRequired, true);
+  assert.equal(status.userGuidance.hostDisplayName, "Codex");
+  assert.equal(status.userGuidance.suggestedReplyAfterRestart, "继续");
   assert.equal(status.continuation.createNewTask, false);
   assert.equal(status.continuation.originalGoal, "继续原任务");
 });
@@ -298,6 +314,8 @@ test("WorkBuddy approval refreshes marketplace, updates plugin, then verifies JS
     ["codebuddy", "plugin", "list", "--json"],
   ]);
   assert.equal(result.agentUpdate.oldSessionFenced, true);
+  assert.equal(result.agentUpdate.userGuidance.hostDisplayName, "WorkBuddy");
+  assert.match(result.agentUpdate.message, /WorkBuddy/);
 });
 
 test("upgrade stops before verification when installation fails", async () => {

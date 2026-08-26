@@ -61,6 +61,10 @@ const TASK_CANCEL_TIMEOUT_MS = Math.max(
 const AGENT_PRICING_URL =
   "https://mediaclaw.app/pricing?source=agent";
 const BROWSER_EXTENSION_DOWNLOAD_URL = "https://mediaclaw.app/download";
+const OFFICIAL_BROWSER_EXTENSION_IDS = new Set([
+  "ihclbgfnkclacfkbedkdnbpmkcdaccje",
+  "moalagonhjmhmoiaehciejkkingpajpl",
+]);
 const AGENT_FIRST_USE_VALUE_PROMISE =
   "你不需要研究该采什么数据，也不用记任何命令。只要告诉我你在做什么、现在卡在哪里，我会自己判断应该研究关键词、账号、爆款还是评论，再把真实数据整理成你能直接使用的结论、选题或初稿。";
 const AGENT_FIRST_USE_FIXED_COPY = [
@@ -150,6 +154,9 @@ const PROFILE_DETAIL_YELLOW_THRESHOLD = 20;
 const PROFILE_DETAIL_RED_THRESHOLD = 100;
 const PROFILE_COMMENT_RED_TOTAL_THRESHOLD = 5_000;
 const PROFILE_RECENT_RISK_SIGNAL_WINDOW_MS = 30 * 60 * 1000;
+const ACCOUNT_ANALYSIS_DETAIL_TARGET = 15;
+const ACCOUNT_ANALYSIS_TRANSCRIPT_TARGET = 8;
+const ACCOUNT_ANALYSIS_COVER_TARGET = 12;
 const PROFILE_COLLECTION_PURPOSES = Object.freeze({
   full_collection: Object.freeze({
     label: "完整归档或导出",
@@ -185,6 +192,12 @@ const PROFILE_COLLECTION_DETAIL_FIELDS = Object.freeze([
   "comments",
   "blogger_metrics",
   "video_transcript",
+]);
+const ACCOUNT_ANALYSIS_REQUIRED_FIELDS = Object.freeze([
+  "account_profile",
+  ...PROFILE_COLLECTION_BASIC_FIELDS,
+  "content_text",
+  "media_urls",
 ]);
 const PROFILE_COLLECTION_FIELD_LABELS = Object.freeze({
   account_profile: "账号主页信息",
@@ -227,6 +240,7 @@ const pendingTaskCancellations = new Map();
 const profileCollectionPlans = new Map();
 const TASK_STATE_PATH = path.join(BROKER_STATE_DIRECTORY, "tasks-v1.json");
 let taskStateWrite = Promise.resolve();
+const extensionPeers = new Set();
 let extensionPeer = null;
 let extensionInfo = null;
 let activeExtensionTaskId = "";
@@ -319,10 +333,16 @@ function publicDevice(adapter) {
     displayName: adapter.displayName,
     host: adapter.hostKey,
     adapterVersion: adapter.adapterVersion,
+    agentChannel: adapter.agentChannel,
   };
 }
 
-async function ensureAdapterIdentity({hostKey, displayName, adapterVersion}) {
+async function ensureAdapterIdentity({
+  hostKey,
+  displayName,
+  adapterVersion,
+  agentChannel,
+}) {
   const normalizedHostKey = normalizeHostKey(hostKey);
   let adapter = adapters.get(normalizedHostKey);
   if (!adapter) {
@@ -339,6 +359,7 @@ async function ensureAdapterIdentity({hostKey, displayName, adapterVersion}) {
       hostKey: normalizedHostKey,
       displayName: displayName || identity.displayName,
       adapterVersion: adapterVersion || SERVER_VERSION,
+      agentChannel: agentChannel === "local" ? "local" : "release",
       identity,
       instances: new Map(),
       registeredAt: Date.now(),
@@ -348,8 +369,10 @@ async function ensureAdapterIdentity({hostKey, displayName, adapterVersion}) {
   } else {
     adapter.displayName = displayName || adapter.displayName;
     adapter.adapterVersion = adapterVersion || adapter.adapterVersion;
+    adapter.agentChannel = agentChannel === "local" ? "local" : "release";
     adapter.lastSeenAt = Date.now();
   }
+  disconnectIncompatibleExtension(adapter);
   return adapter;
 }
 
@@ -363,12 +386,36 @@ function adapterSession(adapter) {
   return adapter ? deviceSessions.get(adapter.identity.deviceId) || null : null;
 }
 
+function extensionAllowedForAdapter(adapter, extensionId) {
+  return !(
+    adapter?.agentChannel === "local" &&
+    OFFICIAL_BROWSER_EXTENSION_IDS.has(normalizeText(extensionId, 200))
+  );
+}
+
+function disconnectIncompatibleExtension(adapter) {
+  const session = adapterSession(adapter);
+  if (!session || extensionAllowedForAdapter(adapter, session.extensionId)) {
+    return;
+  }
+  const rejectedPeer = extensionPeer;
+  deviceSessions.delete(adapter.identity.deviceId);
+  extensionPeer = null;
+  extensionInfo = null;
+  rejectedPeer?.close(
+    1008,
+    "The local MediaClaw Agent candidate only accepts a local browser extension",
+  );
+}
+
 function announceAdapter(adapter) {
-  extensionPeer?.send({
-    type: "device.hello",
-    protocolVersion: PROTOCOL_VERSION,
-    device: publicDevice(adapter),
-  });
+  for (const peer of extensionPeers) {
+    peer.send({
+      type: "device.hello",
+      protocolVersion: PROTOCOL_VERSION,
+      device: publicDevice(adapter),
+    });
+  }
 }
 
 function recommendedMethod(methodId) {
@@ -560,7 +607,7 @@ function normalizeProfileCollectionPlatform(value, profileUrl = "") {
   throw new Error("无法从主页链接识别平台，请先明确是小红书还是抖音");
 }
 
-function normalizeProfileCollectionFields(value) {
+function normalizeProfileCollectionFields(value, {allowEmpty = false} = {}) {
   const allowed = new Set([
     "account_profile",
     ...PROFILE_COLLECTION_BASIC_FIELDS,
@@ -573,7 +620,7 @@ function normalizeProfileCollectionFields(value) {
         .filter(Boolean),
     ),
   ];
-  if (fields.length === 0) {
+  if (fields.length === 0 && !allowEmpty) {
     throw new Error("requestedFields 不能为空；请先明确用户要获取哪些数据");
   }
   const unknown = fields.filter((field) => !allowed.has(field));
@@ -631,14 +678,14 @@ function profileCollectionRecommendation(purpose, requestedCount) {
 function profileCollectionRiskLevel({
   requestedCount,
   recommendedCount,
-  requiresDetail,
+  detailTargetCount,
   scanBatchCount,
   estimatedCommentCount,
   recentRiskSignalCount,
 }) {
   if (
     requestedCount > 1000 ||
-    (requiresDetail && requestedCount > PROFILE_DETAIL_RED_THRESHOLD) ||
+    detailTargetCount > PROFILE_DETAIL_RED_THRESHOLD ||
     estimatedCommentCount > PROFILE_COMMENT_RED_TOTAL_THRESHOLD ||
     recentRiskSignalCount > 0
   ) {
@@ -647,7 +694,7 @@ function profileCollectionRiskLevel({
   if (
     requestedCount > recommendedCount ||
     scanBatchCount > 1 ||
-    (requiresDetail && requestedCount > PROFILE_DETAIL_YELLOW_THRESHOLD)
+    detailTargetCount > PROFILE_DETAIL_YELLOW_THRESHOLD
   ) {
     return "yellow";
   }
@@ -752,6 +799,7 @@ function publicProfileCollectionPlan(plan = {}) {
     requestedFields: plan.requestedFields,
     requestedData: plan.requestedData,
     recommendation: plan.recommendation,
+    analysisContract: plan.analysisContract,
     archive: plan.archive,
     riskNotice: plan.riskNotice,
     solution: plan.solution,
@@ -809,8 +857,60 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
   if (!purpose) {
     throw new Error("purpose 不能为空；请先明确用户采集这些数据是为了什么");
   }
-  const requestedFields = normalizeProfileCollectionFields(
+  const userRequestedFields = normalizeProfileCollectionFields(
     input.requestedFields,
+    {allowEmpty: purpose === "account_analysis"},
+  );
+  const userRequestsTranscript = userRequestedFields.includes(
+    "video_transcript",
+  );
+  const requestedAnalysisTranscriptDecision = normalizeEnum(
+    input.analysisTranscriptDecision,
+    ["recommend", "not_needed"],
+    "",
+  );
+  const analysisTranscriptReason = normalizeText(
+    input.analysisTranscriptReason,
+    800,
+  );
+  const analysisTranscriptDecision =
+    contentType === "image"
+      ? "not_applicable"
+      : userRequestsTranscript
+        ? "user_requested"
+        : requestedAnalysisTranscriptDecision;
+  if (
+    purpose === "account_analysis" &&
+    contentType !== "image" &&
+    !analysisTranscriptDecision
+  ) {
+    throw new Error(
+      "账号分析必须先判断逐字稿是否会显著提升当前任务：请设置 analysisTranscriptDecision=recommend 或 not_needed",
+    );
+  }
+  if (
+    purpose === "account_analysis" &&
+    ["recommend", "not_needed"].includes(analysisTranscriptDecision) &&
+    !analysisTranscriptReason
+  ) {
+    throw new Error(
+      "账号分析必须说明逐字稿必要性判断理由，不能机械提取或机械跳过",
+    );
+  }
+  const analysisRequiredFields =
+    purpose === "account_analysis"
+      ? [
+          ...ACCOUNT_ANALYSIS_REQUIRED_FIELDS,
+          ...(analysisTranscriptDecision === "recommend"
+            ? ["video_transcript"]
+            : []),
+        ]
+      : [];
+  const requestedFields = [
+    ...new Set([...analysisRequiredFields, ...userRequestedFields]),
+  ];
+  const autoAddedFields = requestedFields.filter(
+    (field) => !userRequestedFields.includes(field),
   );
   if (
     purpose === "full_collection" &&
@@ -837,10 +937,46 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
   if (requestsTranscript && contentType === "image") {
     throw new Error("图文作品不能请求视频逐字稿；请先确认内容类型或移除该字段");
   }
-  const executionItemLimit = requestedMaxItems;
+  const defaultDetailTarget =
+    purpose === "account_analysis"
+      ? ACCOUNT_ANALYSIS_DETAIL_TARGET
+      : purpose === "representative_research"
+        ? PROFILE_COLLECTION_PURPOSES.representative_research.recommendation
+        : requestedMaxItems;
+  const requestedDetailTarget = Number(input.detailMaxItems);
+  const detailTargetLimit = requiresDetail
+    ? Math.min(
+        requestedMaxItems,
+        Math.max(
+          1,
+          Math.floor(
+            Number.isFinite(requestedDetailTarget) && requestedDetailTarget > 0
+              ? requestedDetailTarget
+              : defaultDetailTarget,
+          ),
+        ),
+      )
+    : 0;
+  const executionItemLimit = requiresDetail
+    ? detailTargetLimit
+    : requestedMaxItems;
+  const requestedTranscriptTarget = Number(input.transcriptMaxItems);
+  const defaultTranscriptTarget =
+    purpose === "account_analysis"
+      ? ACCOUNT_ANALYSIS_TRANSCRIPT_TARGET
+      : MAX_TRANSCRIPT_QUOTE_ITEMS;
   const transcriptQuoteLimit = Math.min(
     executionItemLimit,
     MAX_TRANSCRIPT_QUOTE_ITEMS,
+    Math.max(
+      1,
+      Math.floor(
+        Number.isFinite(requestedTranscriptTarget) &&
+          requestedTranscriptTarget > 0
+          ? requestedTranscriptTarget
+          : defaultTranscriptTarget,
+      ),
+    ),
   );
   const scanBatches = splitProfileCollectionBatches(
     requestedMaxItems,
@@ -865,7 +1001,7 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
       )
     : 0;
   const estimatedCommentCount = includeComments
-    ? executionItemLimit * commentsPerItemLimit
+    ? detailTargetLimit * commentsPerItemLimit
     : 0;
   const recentRiskSignals = recentProfileCollectionRiskSignals(
     adapter,
@@ -874,7 +1010,7 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
   const riskLevel = profileCollectionRiskLevel({
     requestedCount: requestedMaxItems,
     recommendedCount: recommendation.recommendedCount,
-    requiresDetail,
+    detailTargetCount: detailTargetLimit,
     scanBatchCount: scanBatches.length,
     estimatedCommentCount,
     recentRiskSignalCount: recentRiskSignals.length,
@@ -897,6 +1033,9 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
   const requestedData = requestedFields.map((field) => ({
     field,
     label: PROFILE_COLLECTION_FIELD_LABELS[field],
+    source: autoAddedFields.includes(field)
+      ? "analysis_method"
+      : "user_request",
     availability:
       field === "video_transcript"
         ? "详情采集后先报价，仍需用户单独确认积分"
@@ -937,7 +1076,7 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
       label: "逐条补采作品详情",
       capability: "capture.enhancement",
       purpose: "打开选中记录的详情页，补齐用户已经确认的数据字段",
-      maxItems: executionItemLimit,
+      maxItems: detailTargetLimit,
       batches: detailBatches,
       includeComments,
       commentsPerItemLimit,
@@ -983,6 +1122,18 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
   if (requiresDetail) {
     limitations.push("详情字段以平台页面和插件本次实际可读取结果为准，缺失字段不会被推测补写");
   }
+  if (purpose === "account_analysis" && requiresDetail) {
+    limitations.push(
+      `账号分析先读取最多 ${requestedMaxItems} 条基础作品，再按工作台样本规则选择最多 ${detailTargetLimit} 条高表现、典型和低表现代表作品补齐详情`,
+    );
+  }
+  if (purpose === "account_analysis" && autoAddedFields.length > 0) {
+    limitations.push(
+      `账号分析方法已自动补入工作台同构证据字段：${autoAddedFields
+        .map((field) => PROFILE_COLLECTION_FIELD_LABELS[field])
+        .join("、")}；逐字稿仍只生成报价，必须由用户另行确认积分后才提取`,
+    );
+  }
   if (requestedFields.includes("media_urls")) {
     limitations.push(
       "媒体字段返回页面实际可读取的图片或视频源地址；本方案不下载图片、视频二进制文件",
@@ -1001,12 +1152,12 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
   }
   if (
     requiresDetail &&
-    executionItemLimit > PROFILE_DETAIL_YELLOW_THRESHOLD
+    detailTargetLimit > PROFILE_DETAIL_YELLOW_THRESHOLD
   ) {
     riskWarnings.push(
-      executionItemLimit > PROFILE_DETAIL_RED_THRESHOLD
-        ? `最多会逐条打开 ${executionItemLimit} 个详情页，超过 ${PROFILE_DETAIL_RED_THRESHOLD} 条详情红色风险阈值；本次确认将作为分批继续的风险授权`
-        : `最多会逐条打开 ${executionItemLimit} 个详情页，超过 ${PROFILE_DETAIL_YELLOW_THRESHOLD} 条详情黄色提示阈值`,
+      detailTargetLimit > PROFILE_DETAIL_RED_THRESHOLD
+        ? `最多会逐条打开 ${detailTargetLimit} 个详情页，超过 ${PROFILE_DETAIL_RED_THRESHOLD} 条详情红色风险阈值；本次确认将作为分批继续的风险授权`
+        : `最多会逐条打开 ${detailTargetLimit} 个详情页，超过 ${PROFILE_DETAIL_YELLOW_THRESHOLD} 条详情黄色提示阈值`,
     );
   }
   if (estimatedCommentCount > PROFILE_COMMENT_RED_TOTAL_THRESHOLD) {
@@ -1048,6 +1199,7 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
       scanLimit: requestedMaxItems,
       scanBatches,
       executionItemLimit,
+      detailTargetLimit,
       detailBatches,
       transcriptQuoteLimit,
       requiresDetail,
@@ -1066,11 +1218,46 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
         coverage === "all_available"
           ? `主页当前可加载范围，最多 ${requestedMaxItems} 条`
           : `主页最近 ${requestedMaxItems} 条`,
-      detailTargetLimit: requiresDetail ? executionItemLimit : 0,
+      detailTargetLimit,
     },
     requestedFields,
     requestedData,
     recommendation,
+    analysisContract:
+      purpose === "account_analysis"
+        ? {
+            id: "workbench-account-analysis-v1",
+            methodId: "account-content-strategy-v1",
+            methodVersion: "2.0.0",
+            workbenchPromptVersion: "4.2.0",
+            workbenchSchemaVersion: "3.7",
+            evidenceBaseline: {
+              basicItems: requestedMaxItems,
+              representativeDetails: detailTargetLimit,
+              transcripts: requestsTranscript ? transcriptQuoteLimit : 0,
+              covers: Math.min(
+                ACCOUNT_ANALYSIS_COVER_TARGET,
+                requestedMaxItems,
+              ),
+            },
+            representativeSelection:
+              "workbench_high5_typical6_low4",
+            reusePolicy:
+              "existing_analysis_then_existing_capture_then_collect_missing_evidence",
+            fieldPolicy: {
+              userRequestedFields,
+              methodRequiredFields: analysisRequiredFields,
+              autoAddedFields,
+              transcriptTrigger:
+                analysisTranscriptDecision,
+              transcriptReason:
+                analysisTranscriptDecision === "user_requested"
+                  ? "用户主动要求逐字稿或对应的视频文字提取"
+                  : analysisTranscriptReason,
+              transcriptConfirmation: "explicit_quote_confirmation_required",
+            },
+          }
+        : null,
     archive: archiveMode
       ? {
           enabled: true,
@@ -1118,7 +1305,7 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
       warnings: riskWarnings,
       estimates: {
         listItems: requestedMaxItems,
-        detailPageVisits: requiresDetail ? executionItemLimit : 0,
+        detailPageVisits: detailTargetLimit,
         comments: estimatedCommentCount,
       },
       thresholds: {
@@ -1149,7 +1336,7 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
       profilePageVisits: scanBatches.length + (includeProfile ? 1 : 0),
       maximumDetailPageVisits: requiresDetail ? executionItemLimit : 0,
       maximumDetailPageVisitsWithRetries: requiresDetail
-        ? executionItemLimit * (1 + failureRetryPasses)
+        ? detailTargetLimit * (1 + failureRetryPasses)
         : 0,
       scanBatches,
       detailBatches,
@@ -1176,7 +1363,7 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
       : `计划按 ${requestedMaxItems} 条范围执行。`,
     `将打开 ${profileCollectionContentLabel(contentType)}所在的账号主页，基础列表分批为 ${scanBatches.join(" + ")}。`,
     requiresDetail
-      ? `筛选后逐条打开最多 ${executionItemLimit} 个详情页，按 ${MAX_DEEP_COLLECT_LIMIT} 条以内分批。`
+      ? `筛选后按代表样本规则逐条打开最多 ${detailTargetLimit} 个详情页，按 ${MAX_DEEP_COLLECT_LIMIT} 条以内分批。`
       : "只读取主页基础清单，不打开作品详情页。",
     failureRetryPasses > 0
       ? `页面加载或解析失败会自动重试最多 ${failureRetryPasses} 轮，单条失败不会中断其余记录。`
@@ -1357,9 +1544,25 @@ async function restoreTaskState() {
     }
     return;
   }
+  const snapshots = Array.isArray(payload?.tasks) ? payload.tasks : [];
   const restoredAtMs = Date.now();
+  const unrestorableWorkflowChildIds = new Set(
+    snapshots
+      .filter(
+        (snapshot) =>
+          ["batch", "workflow"].includes(snapshot?.kind) &&
+          ["running", "cancel_pending", "waiting_for_extension"].includes(
+            snapshot?.status,
+          ),
+      )
+      .flatMap((snapshot) =>
+        Array.isArray(snapshot?.childTaskIds) ? snapshot.childTaskIds : [],
+      )
+      .map((taskId) => normalizeText(taskId, 160))
+      .filter(Boolean),
+  );
   let restoredStateChanged = false;
-  for (const snapshot of Array.isArray(payload?.tasks) ? payload.tasks : []) {
+  for (const snapshot of snapshots) {
     const taskId = normalizeText(snapshot?.taskId, 160);
     const updatedAtMs = Date.parse(String(snapshot?.updatedAt || ""));
     const ttlMs = Math.max(
@@ -1404,39 +1607,61 @@ async function restoreTaskState() {
           : LOCAL_ASSET_QUEUE_TIMEOUT_MS);
     const invalidRestoredLocalAssetQuery =
       legacyLocalAssetRead || expiredLocalAssetQuery;
+    const unrestorableWorkflow =
+      wasInFlight && ["batch", "workflow"].includes(snapshot.kind);
+    const orphanedWorkflowChild =
+      wasInFlight && unrestorableWorkflowChildIds.has(taskId);
+    const invalidRestoredTask =
+      invalidRestoredLocalAssetQuery ||
+      unrestorableWorkflow ||
+      orphanedWorkflowChild;
     const task = {
       ...snapshot,
       taskId,
       ttlMs,
-      status: invalidRestoredLocalAssetQuery
+      status: invalidRestoredTask
         ? "failed"
         : wasInFlight
           ? "waiting_for_extension"
           : snapshot.status,
-      message: invalidRestoredLocalAssetQuery
-        ? legacyLocalAssetRead
-          ? "旧版完整资产读取已终止；请使用统一分区读取重新发起"
-          : "本地资产读取已过期并自动终止，队列已释放"
+      message: invalidRestoredTask
+        ? unrestorableWorkflow
+          ? "多阶段任务因 Agent Broker 重启已自动终止；已完成采集结果仍保留"
+          : orphanedWorkflowChild
+            ? "所属多阶段任务已在重启时终止；未完成子任务已释放"
+            : legacyLocalAssetRead
+              ? "旧版完整资产读取已终止；请使用统一分区读取重新发起"
+              : "本地资产读取已过期并自动终止，队列已释放"
         : wasInFlight
           ? isLocalAssetReadTask(snapshot)
           ? "本地资产读取已恢复，等待浏览器插件继续传输已保存数据"
           : "任务已从持久状态恢复，等待浏览器插件断点续跑"
         : snapshot.message,
-      error: invalidRestoredLocalAssetQuery
-        ? legacyLocalAssetRead
+      error: invalidRestoredTask
+        ? unrestorableWorkflow
           ? {
-            code: "LEGACY_LOCAL_ASSET_READ_REPLACED",
-            message: "旧版完整资产读取可能产生超大重复数据，已由统一分区读取替代",
-          }
-          : {
-              code: "LOCAL_ASSET_READ_EXPIRED",
-              message: "本地资产读取等待或执行时间过长，已自动终止",
+              code: "ORCHESTRATION_RESTARTED",
+              message: "多阶段任务无法在 Broker 进程重启后从内存执行点继续，已自动终止",
             }
+          : orphanedWorkflowChild
+            ? {
+                code: "ORCHESTRATION_CHILD_RELEASED",
+                message: "所属多阶段任务已终止，未完成子任务不再恢复",
+              }
+            : legacyLocalAssetRead
+              ? {
+                  code: "LEGACY_LOCAL_ASSET_READ_REPLACED",
+                  message: "旧版完整资产读取可能产生超大重复数据，已由统一分区读取替代",
+                }
+              : {
+                  code: "LOCAL_ASSET_READ_EXPIRED",
+                  message: "本地资产读取等待或执行时间过长，已自动终止",
+                }
         : snapshot.error,
       completion,
       resolveCompletion,
     };
-    if (invalidRestoredLocalAssetQuery) restoredStateChanged = true;
+    if (invalidRestoredTask) restoredStateChanged = true;
     tasks.set(taskId, task);
     if (task.idempotencyKey) {
       idempotentTaskIds.set(task.idempotencyKey, taskId);
@@ -2617,7 +2842,7 @@ function handleResultTransferEnd(message = {}) {
   });
 }
 
-function handleExtensionMessage(message = {}) {
+function handleExtensionMessage(message = {}, peer = null) {
   if (message.type === "session.challenge") {
     const challenge = message.challenge || {};
     const purpose = normalizeEnum(
@@ -2643,7 +2868,7 @@ function handleExtensionMessage(message = {}) {
       !Number.isFinite(expiresAt) ||
       expiresAt <= Date.now()
     ) {
-      extensionPeer?.send({
+      peer?.send({
         type: "session.proof.error",
         code: "INVALID_SESSION_CHALLENGE",
         deviceId,
@@ -2659,7 +2884,7 @@ function handleExtensionMessage(message = {}) {
       extensionId,
       protocolVersion,
     });
-    extensionPeer?.send({
+    peer?.send({
       type: "session.proof",
       purpose,
       deviceId,
@@ -2679,8 +2904,36 @@ function handleExtensionMessage(message = {}) {
     ) {
       return;
     }
+    const nextExtensionId = normalizeText(message.extensionId, 200);
+    if (!extensionAllowedForAdapter(adapter, nextExtensionId)) {
+      peer?.close(
+        1008,
+        "The local MediaClaw Agent candidate only accepts a local browser extension",
+      );
+      return;
+    }
+    const activeExtensionId = normalizeText(extensionInfo?.extensionId, 200);
+    if (
+      extensionPeer &&
+      extensionPeer !== peer &&
+      activeExtensionId &&
+      nextExtensionId !== activeExtensionId
+    ) {
+      peer?.close(
+        1008,
+        "Another authenticated MediaClaw extension is already active",
+      );
+      return;
+    }
+    if (extensionPeer && extensionPeer !== peer) {
+      extensionPeer.close(
+        1012,
+        "The same MediaClaw extension opened a newer connection",
+      );
+    }
+    extensionPeer = peer;
     extensionInfo = {
-      extensionId: normalizeText(message.extensionId, 200),
+      extensionId: nextExtensionId,
       extensionVersion: normalizeText(message.extensionVersion, 80),
       protocolVersion: normalizeText(message.protocolVersion, 40),
       pendingResultCount:
@@ -2699,9 +2952,11 @@ function handleExtensionMessage(message = {}) {
     return;
   }
   if (message.type === "extension.ping") {
-    extensionPeer?.send({type: "server.pong", at: Date.now()});
+    peer?.send({type: "server.pong", at: Date.now()});
     return;
   }
+
+  if (!extensionPeer || peer !== extensionPeer) return;
 
   if (message.type === "task.result.start") {
     handleResultTransferStart(message);
@@ -2762,6 +3017,7 @@ function handleExtensionMessage(message = {}) {
 }
 
 function handleExtensionClose(peer) {
+  extensionPeers.delete(peer);
   if (extensionPeer !== peer) return;
   extensionPeer = null;
   extensionInfo = null;
@@ -3379,6 +3635,248 @@ function mergeProfileCollectionEntries(target, entries = []) {
   return addedCount;
 }
 
+function profileCollectionEntryLikes(entry = {}) {
+  const likes = Number(entry.basic?.likes);
+  return Number.isFinite(likes) && likes >= 0 ? likes : 0;
+}
+
+function selectAccountAnalysisDetailEntries(
+  entries = [],
+  limit = ACCOUNT_ANALYSIS_DETAIL_TARGET,
+) {
+  const eligible = entries.filter((entry) => entry.recordId);
+  const target = Math.min(
+    Math.max(1, Math.floor(Number(limit) || ACCOUNT_ANALYSIS_DETAIL_TARGET)),
+    eligible.length,
+  );
+  if (eligible.length <= target) return eligible;
+
+  const ranked = [...eligible].sort(
+    (left, right) =>
+      profileCollectionEntryLikes(right) - profileCollectionEntryLikes(left),
+  );
+  const likes = ranked.map(profileCollectionEntryLikes).sort((a, b) => a - b);
+  const medianLikes = percentile(likes, 0.5);
+  const tierSize = Math.min(
+    10,
+    Math.max(1, Math.ceil(eligible.length * 0.2)),
+  );
+  const high = ranked.slice(0, tierSize);
+  const low = ranked.slice(-tierSize).reverse();
+  const highKeys = new Set(high.map(profileCollectionEntryKey));
+  const lowKeys = new Set(low.map(profileCollectionEntryKey));
+  const typical = eligible
+    .filter((entry) => {
+      const key = profileCollectionEntryKey(entry);
+      return !highKeys.has(key) && !lowKeys.has(key);
+    })
+    .sort(
+      (left, right) =>
+        Math.abs(profileCollectionEntryLikes(left) - medianLikes) -
+        Math.abs(profileCollectionEntryLikes(right) - medianLikes),
+    );
+  const selected = [];
+  const seen = new Set();
+  const take = (group, count) => {
+    for (const entry of group) {
+      if (count <= 0 || selected.length >= target) break;
+      const key = profileCollectionEntryKey(entry);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      selected.push(entry);
+      count -= 1;
+    }
+  };
+  take(high, 5);
+  take(typical, 6);
+  take(low, 4);
+  take(eligible, target);
+  return selected.slice(0, target);
+}
+
+function selectAccountAnalysisTranscriptEntries(
+  entries = [],
+  platform = "",
+  limit = ACCOUNT_ANALYSIS_TRANSCRIPT_TARGET,
+) {
+  const eligible = entries
+    .filter((entry) => isProfileCollectionVideoEntry(entry, platform))
+    .sort(
+      (left, right) =>
+        profileCollectionEntryLikes(right) - profileCollectionEntryLikes(left),
+    );
+  const target = Math.min(
+    Math.max(1, Math.floor(Number(limit) || ACCOUNT_ANALYSIS_TRANSCRIPT_TARGET)),
+    eligible.length,
+  );
+  if (eligible.length <= target) return eligible;
+  const middleStart = Math.max(
+    4,
+    Math.floor((eligible.length - 2 + 4) / 2) - 1,
+  );
+  const groups = [
+    eligible.slice(0, 4),
+    eligible.slice(middleStart, middleStart + 2),
+    eligible.slice(-2),
+    eligible,
+  ];
+  const selected = [];
+  const seen = new Set();
+  for (const group of groups) {
+    for (const entry of group) {
+      const key = profileCollectionEntryKey(entry);
+      if (!key || seen.has(key) || selected.length >= target) continue;
+      seen.add(key);
+      selected.push(entry);
+    }
+  }
+  return selected.slice(0, target);
+}
+
+function profileCollectionPreviewLayers(record = {}) {
+  const layers = [];
+  const seen = new Set();
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || seen.has(value) || depth > 3) {
+      return;
+    }
+    seen.add(value);
+    if (value.detailPayload && typeof value.detailPayload === "object") {
+      visit(value.detailPayload, depth + 1);
+    }
+    if (Array.isArray(value.items) && value.items[0]) {
+      visit(value.items[0], depth + 1);
+    }
+    layers.push(value);
+    for (const key of ["normalizedPayload", "payload", "rawPayload"]) {
+      if (value[key] && typeof value[key] === "object") {
+        visit(value[key], depth + 1);
+      }
+    }
+  };
+  visit(record);
+  return layers;
+}
+
+function firstProfileCollectionPreviewValue(layers, keys) {
+  for (const layer of layers) {
+    for (const key of keys) {
+      const value = layer?.[key];
+      if (value !== undefined && value !== null && value !== "") return value;
+    }
+  }
+  return null;
+}
+
+function countProfileCollectionMedia(layers, keys) {
+  const values = new Set();
+  const append = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(append);
+      return;
+    }
+    if (typeof value === "object") {
+      append(value.url || value.src || value.imageUrl || value.videoUrl || value.audioUrl);
+      return;
+    }
+    const normalized = String(value || "").trim();
+    if (normalized) values.add(normalized);
+  };
+  for (const layer of layers) {
+    for (const key of keys) append(layer?.[key]);
+  }
+  return values.size;
+}
+
+function summarizeProfileCollectionRecord(record = {}) {
+  const layers = profileCollectionPreviewLayers(record);
+  const id = normalizeText(record.id, 160);
+  const numeric = (keys) => {
+    const value = Number(firstProfileCollectionPreviewValue(layers, keys));
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  return {
+    previewOnly: true,
+    assetId: id
+      ? `local.data_pool|capture_record|${encodeURIComponent(id)}`
+      : "",
+    id,
+    platform: normalizeText(record.platform, 80),
+    recordType: normalizeText(record.recordType || record.type, 120),
+    title: normalizeText(
+      firstProfileCollectionPreviewValue(layers, ["title", "noteTitle"]),
+      300,
+    ),
+    contentPreview: normalizeText(
+      firstProfileCollectionPreviewValue(layers, [
+        "content",
+        "noteContent",
+        "description",
+      ]),
+      600,
+    ),
+    url: normalizeText(
+      firstProfileCollectionPreviewValue(layers, [
+        "url",
+        "noteUrl",
+        "detailPageUrl",
+      ]),
+      1000,
+    ),
+    author: normalizeText(
+      firstProfileCollectionPreviewValue(layers, [
+        "author",
+        "authorName",
+        "bloggerName",
+      ]),
+      240,
+    ),
+    contentType: normalizeText(
+      firstProfileCollectionPreviewValue(layers, [
+        "noteType",
+        "contentType",
+        "type",
+      ]),
+      80,
+    ),
+    publishedAt: firstProfileCollectionPreviewValue(layers, [
+      "publishTimestamp",
+      "publishTime",
+      "publishDate",
+      "lastEditedAt",
+    ]),
+    metrics: {
+      likes: numeric(["likes", "likeCount", "diggCount"]),
+      collects: numeric(["collects", "collectCount", "favoriteCount"]),
+      comments: numeric(["comments", "commentCount", "commentTotal"]),
+      shares: numeric(["shares", "shareCount"]),
+    },
+    mediaCounts: {
+      images: countProfileCollectionMedia(layers, [
+        "imageUrl",
+        "imageUrls",
+        "images",
+      ]),
+      videos: countProfileCollectionMedia(layers, [
+        "videoUrl",
+        "videoUrls",
+        "playUrl",
+      ]),
+      audios: countProfileCollectionMedia(layers, [
+        "audioUrl",
+        "audioUrls",
+        "musicUrl",
+        "musicUrls",
+      ]),
+    },
+    detailCaptureStatus: normalizeText(
+      firstProfileCollectionPreviewValue(layers, ["detailCaptureStatus"]),
+      80,
+    ),
+  };
+}
+
 function profileCollectionRiskAuthorization(
   plan,
   category,
@@ -3924,9 +4422,15 @@ async function runProfileCollectionWorkflow(parent, plan) {
     plan.execution.scanLimit,
   );
   const matchingEntries = [...matchingEntryMap.values()];
-  const selectedEntries = matchingEntries
-    .filter((entry) => entry.recordId)
-    .slice(0, plan.execution.executionItemLimit);
+  const eligibleEntries = matchingEntries.filter((entry) => entry.recordId);
+  const selectedEntries =
+    plan.intent.purpose === "account_analysis" &&
+    plan.execution.requiresDetail
+      ? selectAccountAnalysisDetailEntries(
+          eligibleEntries,
+          plan.execution.detailTargetLimit,
+        )
+      : eligibleEntries.slice(0, plan.execution.executionItemLimit);
   Object.assign(inventoryStage, {
     status: executionInterruption
       ? "paused"
@@ -4188,9 +4692,18 @@ async function runProfileCollectionWorkflow(parent, plan) {
     });
   }
 
+  const transcriptCandidates =
+    plan.intent.purpose === "account_analysis"
+      ? selectAccountAnalysisTranscriptEntries(
+          selectedEntries,
+          platform,
+          plan.execution.transcriptQuoteLimit,
+        )
+      : selectedEntries.filter((entry) =>
+          isProfileCollectionVideoEntry(entry, platform),
+        );
   const transcriptRecordIds = (
-    selectedEntries
-      .filter((entry) => isProfileCollectionVideoEntry(entry, platform))
+    transcriptCandidates
       .map((entry) => entry.recordId)
       .filter((recordId) =>
         !plan.execution.requiresDetail ||
@@ -4232,7 +4745,9 @@ async function runProfileCollectionWorkflow(parent, plan) {
       finishedAt: nowIso(),
       actualCount: Array.isArray(transcriptQuote?.recordIds)
         ? transcriptQuote.recordIds.length
-        : 0,
+        : Array.isArray(transcriptQuote?.items)
+          ? transcriptQuote.items.length
+          : 0,
       error: quoteTask.error || transcriptQuote?.error || null,
     });
   }
@@ -4265,7 +4780,16 @@ async function runProfileCollectionWorkflow(parent, plan) {
   );
   const transcriptQuoteFailed =
     plan.execution.requestsTranscript &&
-    (transcriptRecordIds.length === 0 || !transcriptQuote?.quoteId);
+    transcriptRecordIds.length > 0 &&
+    !transcriptQuote?.quoteId;
+  const transcriptQuoteItems = Array.isArray(transcriptQuote?.items)
+    ? transcriptQuote.items
+    : [];
+  const transcriptConfirmationRequired = Boolean(
+    transcriptQuote?.quoteId &&
+      (transcriptQuoteItems.length === 0 ||
+        transcriptQuoteItems.some((item) => item?.alreadyExtracted !== true)),
+  );
   const profileIncomplete = plan.execution.includeProfile && !profile;
   Object.assign(auditStage, {
     status: executionInterruption ? "paused" : "completed",
@@ -4287,14 +4811,16 @@ async function runProfileCollectionWorkflow(parent, plan) {
     ? "paused_for_user_action"
     : workflowPartial
       ? "partial"
-      : plan.execution.requestsTranscript && transcriptQuote?.quoteId
+      : transcriptConfirmationRequired
         ? "awaiting_transcript_confirmation"
         : "completed";
   const targetRecordIds = selectedEntries
     .map((entry) => entry.recordId)
     .filter(Boolean);
   const deliveredRecords = archiveEnabled
-    ? resultRecords.slice(0, MAX_PROFILE_ARCHIVE_RESULT_PREVIEW)
+    ? resultRecords
+        .slice(0, MAX_PROFILE_ARCHIVE_RESULT_PREVIEW)
+        .map((record) => summarizeProfileCollectionRecord(record))
     : resultRecords;
   const retrySummary = {
     configuredPasses: plan.execution.failureRetryPasses,
@@ -4380,6 +4906,15 @@ async function runProfileCollectionWorkflow(parent, plan) {
           detailResult?.primaryBatchCount || 0,
         ),
         detailRetryBatchCount: Number(detailResult?.retryBatchCount || 0),
+        transcriptCandidateCount: transcriptRecordIds.length,
+        transcriptQuoteItemCount: transcriptQuoteItems.length,
+        transcriptAlreadyAvailableCount: transcriptQuoteItems.filter(
+          (item) => item?.alreadyExtracted === true,
+        ).length,
+        transcriptMissingCount: transcriptQuoteItems.filter(
+          (item) => item?.alreadyExtracted !== true,
+        ).length,
+        transcriptConfirmationRequired,
       },
       analysisPerformed: archiveEnabled
         ? [
@@ -4391,6 +4926,9 @@ async function runProfileCollectionWorkflow(parent, plan) {
             "按已确认的数据目标筛选内容类型",
             "核对计划范围与实际匹配数量",
             "汇总详情成功、失败和未执行范围",
+            ...(plan.intent.purpose === "account_analysis"
+              ? ["按工作台样本规则选择代表详情和视频，并只为缺失逐字稿生成报价"]
+              : []),
           ],
       retrySummary,
       executionLog,
@@ -4450,12 +4988,12 @@ async function runProfileCollectionWorkflow(parent, plan) {
           }
         : null,
       nextConfirmation:
-        transcriptQuote?.quoteId
+        transcriptConfirmationRequired
           ? {
               required: true,
               action: "confirm_video_transcript",
               quoteId: transcriptQuote.quoteId,
-              message: "逐字稿尚未执行；请先向用户展示报价，取得明确同意后再确认",
+              message: "只对尚未提取的逐字稿收费；请先向用户展示逐条积分、总积分、余额和有效期，取得明确同意后再确认",
             }
           : null,
       limitations,
@@ -4852,6 +5390,39 @@ async function runSingleNoteResearch(parent, input = {}) {
   }
   const url = normalizeText(input.url);
   const platform = normalizePlatform(input.platform);
+  const analysisTranscriptDecision = normalizeEnum(
+    input.analysisTranscriptDecision,
+    ["user_requested", "recommend", "not_needed"],
+    "",
+  );
+  const analysisTranscriptReason = normalizeText(
+    input.analysisTranscriptReason,
+    800,
+  );
+  if (!analysisTranscriptDecision) {
+    finishTask(parent, {
+      status: "failed",
+      error: {
+        code: "TRANSCRIPT_DECISION_REQUIRED",
+        message:
+          "单篇分析必须先判断逐字稿是否会显著提升当前任务：请设置 analysisTranscriptDecision=user_requested、recommend 或 not_needed",
+      },
+    });
+    return;
+  }
+  if (
+    ["recommend", "not_needed"].includes(analysisTranscriptDecision) &&
+    !analysisTranscriptReason
+  ) {
+    finishTask(parent, {
+      status: "failed",
+      error: {
+        code: "TRANSCRIPT_DECISION_REASON_REQUIRED",
+        message: "单篇分析必须说明逐字稿必要性判断理由，不能机械提取或机械跳过",
+      },
+    });
+    return;
+  }
   updateTask(parent, {
     status: "running",
     message: "正在采集单篇内容详情",
@@ -4917,46 +5488,138 @@ async function runSingleNoteResearch(parent, input = {}) {
   const isVideo = contentType.includes("video") || Boolean(source.videoUrl);
   const hasImages =
     Array.isArray(source.imageUrls) && source.imageUrls.length > 0;
-  if (input.includeMediaText !== false && recordId && (isVideo || hasImages)) {
-    if (isVideo) {
-      mediaText = {
-        ok: true,
-        status: "quote_required",
-        recordId,
-        nextTool: "mediaclaw_quote_video_transcript",
-      };
-      limitations.push("视频逐字稿需要先报价，并由用户确认 quoteId 后单独执行");
+  const shouldPrepareTranscript =
+    isVideo &&
+    ["user_requested", "recommend"].includes(analysisTranscriptDecision);
+  if (
+    recordId &&
+    (shouldPrepareTranscript ||
+      (input.includeMediaText !== false && hasImages && !isVideo))
+  ) {
+    if (shouldPrepareTranscript) {
+      updateTask(parent, {
+        message: "正在生成这条视频的逐字稿报价",
+      });
+      const quoteTask = addChildTask(
+        parent,
+        startSingleCapture("extract_video_transcript", {
+          platform,
+          featureKey: "extract.video_transcript",
+          options: {
+            meteredAction: "quote",
+            recordIds: [recordId],
+          },
+        }),
+      );
+      await quoteTask.completion;
+      const transcriptQuote = quoteTask.result || null;
+      const quoteItems = Array.isArray(transcriptQuote?.items)
+        ? transcriptQuote.items
+        : [];
+      const transcriptAlreadyAvailable =
+        quoteTask.status === "succeeded" &&
+        quoteItems.length > 0 &&
+        quoteItems.every((item) => item?.alreadyExtracted === true);
+      if (transcriptAlreadyAvailable) {
+        const transcriptTask = addChildTask(
+          parent,
+          startSingleCapture("data_pool_query", {
+            platform,
+            options: {
+              operation: "transcript",
+              recordId,
+              format: "plain",
+              offset: 0,
+              limit: 12_000,
+            },
+          }),
+        );
+        await transcriptTask.completion;
+        mediaText =
+          transcriptTask.status === "succeeded"
+            ? {
+                ...(transcriptTask.result || {}),
+                status: "already_available",
+                recordId,
+                chargedCredits: 0,
+              }
+            : {
+                ok: true,
+                status: "already_available_read_failed",
+                recordId,
+                chargedCredits: 0,
+                quote: transcriptQuote,
+              };
+        if (transcriptTask.status !== "succeeded") {
+          limitations.push("逐字稿已存在且无需积分，但本次精确读取失败");
+        }
+      } else if (quoteTask.status === "succeeded" && transcriptQuote?.quoteId) {
+        mediaText = {
+          ...transcriptQuote,
+          status: transcriptQuote.status || "quoted",
+          recordId,
+          nextConfirmation: {
+            required: true,
+            action: "confirm_video_transcript",
+            quoteId: transcriptQuote.quoteId,
+            message: "请先向用户展示逐条积分、总积分、余额和有效期，取得明确同意后再确认",
+          },
+        };
+        limitations.push("视频逐字稿已经报价，用户确认 quoteId 后才会提取和扣积分");
+      } else {
+        mediaText = {
+          ok: false,
+          status: "quote_failed",
+          recordId,
+          error: quoteTask.error || transcriptQuote?.error || null,
+        };
+        limitations.push("视频逐字稿报价失败，当前只能基于标题、正文和互动数据分析");
+      }
     } else {
-    updateTask(parent, {
-      message: "正在提取图片文字",
-    });
-    const extractionTask = addChildTask(
-      parent,
-      startSingleCapture("extract_image_text", {
+      updateTask(parent, {
+        message: "正在提取图片文字",
+      });
+      const extractionTask = addChildTask(
+        parent,
+        startSingleCapture("extract_image_text", {
           platform,
           options: {
             recordId,
             force: input.forceMediaExtraction === true,
           },
-        }),
-    );
-    await extractionTask.completion;
-    mediaText = extractionTask.result || null;
-    if (extractionTask.status !== "succeeded") {
-      mediaPaywall = extractionTask.error?.paywall || null;
-      if (mediaPaywall) {
-        mediaText = {
-          ok: false,
-          status: "paywall_required",
-          paywall: mediaPaywall,
-        };
-        limitations.push("图片文字尚未提取；仍可基于标题、正文和互动数据完成基础分析");
-      } else {
-        limitations.push("图片文字提取失败");
+          }),
+      );
+      await extractionTask.completion;
+      mediaText = extractionTask.result || null;
+      if (extractionTask.status !== "succeeded") {
+        mediaPaywall = extractionTask.error?.paywall || null;
+        if (mediaPaywall) {
+          mediaText = {
+            ok: false,
+            status: "paywall_required",
+            paywall: mediaPaywall,
+          };
+          limitations.push(
+            "图片文字尚未提取；仍可基于标题、正文和互动数据完成基础分析",
+          );
+        } else {
+          limitations.push("图片文字提取失败");
+        }
       }
     }
-    }
-  } else if (input.includeMediaText !== false && !recordId) {
+  } else if (isVideo && !shouldPrepareTranscript) {
+    mediaText = {
+      ok: true,
+      status: "not_needed",
+      decision: analysisTranscriptDecision,
+      reason: analysisTranscriptReason,
+      chargedCredits: 0,
+    };
+  } else if (
+    !recordId &&
+    (shouldPrepareTranscript ||
+      (input.includeMediaText !== false && hasImages && !isVideo))
+  ) {
     limitations.push("详情已采集，但没有拿到数据池记录 ID，未执行媒体文字提取");
   }
 
@@ -4973,6 +5636,18 @@ async function runSingleNoteResearch(parent, input = {}) {
         recordId: recordId || null,
         commentCount: comments.length,
         mediaTextStatus: mediaText?.status || "not_requested",
+        transcriptConfirmationRequired:
+          mediaText?.nextConfirmation?.required === true,
+        transcriptEstimatedCredits:
+          Number(mediaText?.totalEstimatedCredits ?? mediaText?.estimatedCredits) || 0,
+        transcriptRemainingCredits:
+          Number.isFinite(
+            Number(mediaText?.remainingCredits ?? mediaText?.balance),
+          )
+            ? Number(mediaText?.remainingCredits ?? mediaText?.balance)
+            : null,
+        transcriptDecision: analysisTranscriptDecision,
+        transcriptDecisionReason: analysisTranscriptReason || null,
       },
       source,
       mediaText,
@@ -5241,7 +5916,7 @@ const tools = [
   {
     name: "mediaclaw_list_assets",
     description:
-      "统一列出 MediaClaw 资产。用户要求模仿、仿写或按某人/某账号风格创作时，无需用户声明已保存：先查询 local.studio 的 style_profile，本地未命中再查询 remote.workbench。全量账号归档使用 local.data_pool + capture_record，并按返回方案的 profileUrl、platform、recordType、contentType filters 与 cursor 分页。返回稳定 assetId，随后必须读取完整对象。浏览器本地数据池和本地 Studio 数据无限读取；remote.workbench 需要有效会员。",
+      "统一列出 MediaClaw 资产。用户说‘分析这个账号’时，必须依次查询 local.studio、remote.workbench 的 account_analysis；都没有时再查询 local.data_pool 的 capture_record，只有原始数据也没有或证据覆盖不足时才制定补采方案。用户说‘分析这篇’时对 note_breakdown 与对应 capture_record 执行同样顺序。已有分析默认直接复用，不重复分析；只有用户明确要求重新分析、更新或旧报告不能回答当前问题时才读取原始证据重算。模仿或仿写则先查 local.studio 的 style_profile，本地未命中再查 remote.workbench。全量账号归档使用 local.data_pool + capture_record，并按返回方案的 profileUrl、platform、recordType、contentType filters 与 cursor 分页。返回稳定 assetId，随后必须读取完整对象。浏览器本地数据池和本地 Studio 数据无限读取；remote.workbench 需要有效会员。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -5273,7 +5948,7 @@ const tools = [
   {
     name: "mediaclaw_get_asset",
     description:
-      "按 mediaclaw_list_assets 返回的稳定 assetId 读取资产。local.data_pool 默认返回 manifest 和所选语义分区，底层仍是一条完整缓存记录；大型数组和长文本通过统一 page 参数分页或分段，不会重新采集、打开作品页或扣积分。先读 manifest，再按任务选择 identity/content/creator/metrics/media/comments/extractedContent/context；只有无损调试才使用 view=raw。读取失败或超时不代表本地未命中，禁止自动改用采集工具。local.studio 与 remote.workbench 暂保持完整对象读取。",
+      "按 mediaclaw_list_assets 返回的稳定 assetId 读取资产。local.data_pool 与 remote.workbench 的账号分析默认只返回 manifest 和 identity，避免完整评论、逐字稿、工作台报告或原始样本一次性堵塞 Agent 上下文；再按任务选择语义分区，并沿 page.nextCursor 读取大型数组。工作台账号报告可读取 reportOverview/reportStrategy/reportExpression/reportFrameworks/reportIdeation/stylePack/evidence/sampleAnalyses/samples/coverage，其中 samples 是后端保存的原始分析样本。读取不会重新采集、打开作品页或扣积分；只有无损调试才使用 view=raw。读取失败或超时不代表本地未命中，禁止自动改用采集工具。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -5298,6 +5973,16 @@ const tools = [
               "comments",
               "extractedContent",
               "context",
+              "reportOverview",
+              "reportStrategy",
+              "reportExpression",
+              "reportFrameworks",
+              "reportIdeation",
+              "stylePack",
+              "evidence",
+              "sampleAnalyses",
+              "samples",
+              "coverage",
             ],
           },
           uniqueItems: true,
@@ -5321,6 +6006,29 @@ const tools = [
                 "extractedContent.transcript.sentenceText",
                 "extractedContent.transcript.sentences",
                 "context.items",
+                "report.contentPillars",
+                "report.topicPatterns",
+                "report.viralPatterns",
+                "report.contentFrameworks",
+                "report.scriptArchetypes",
+                "report.topicPlaybooks",
+                "report.ideaBank",
+                "report.audienceInsights",
+                "report.topicDirections",
+                "report.learnable",
+                "report.avoid",
+                "stylePack.contentPillars",
+                "stylePack.topicRules",
+                "stylePack.titleRules",
+                "stylePack.angleRules",
+                "stylePack.viewpointRules",
+                "stylePack.contentFrameworks",
+                "stylePack.diagnosisRubric",
+                "stylePack.avoidRules",
+                "evidenceIndex",
+                "evidenceSamples",
+                "sampleAnalyses",
+                "samples",
               ],
             },
             cursor: {type: "string", default: "0"},
@@ -5328,7 +6036,7 @@ const tools = [
           },
           required: ["path"],
           additionalProperties: false,
-          description: "大型数组或长文本的通用分页参数；数组实际单页最多 500 项，文本最多 50000 字符。",
+          description: "大型数组或长文本的通用分页参数。数据池数组单页最多 500 项、文本最多 50000 字符；工作台报告数组和原始样本单页最多 100 项。",
         },
         async: {type: "boolean", default: false},
       },
@@ -5339,7 +6047,7 @@ const tools = [
   {
     name: "mediaclaw_capture_note",
     description:
-      "调用插件现有的单条笔记完整采集能力。单条路径可按插件现状附带评论和博主指标，不增加 Agent 专属限制。",
+      "仅在 local.studio、remote.workbench 都没有匹配 note_breakdown，且 local.data_pool 也没有匹配 capture_record 或证据确有缺口时，调用插件现有的单条笔记完整采集能力。单条路径可按插件现状附带评论和博主指标，不增加 Agent 专属限制。分析必须采用工作台单篇契约，不得另写精简版框架。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -5401,7 +6109,7 @@ const tools = [
   {
     name: "mediaclaw_prepare_profile_collection",
     description:
-      "根据已经澄清的用户用途和数据目标制定账号采集方案，但不启动浏览器、不采集数据。‘全部采下来／完整导出／爬这个账号／每篇详情都要’必须映射为 full_collection，不套用 50/80 条研究建议终点。工具会按用途建议样本量，同时保留用户明确要求的总量，把超过单批或连续建议额度的目标拆成可审计批次，并返回普通／黄色／红色三级确认：多批、超过用途建议量或 21～100 个详情页为黄色；超过 1000 条列表、超过 100 个详情页、预计评论超过 5000 条或近期同平台发生限频／登录／验证码为红色。风险提示不会静默缩小用户范围，也不会把 80/300 等默认值误报成平台总量能力。调用前必须先明确主页、用途、内容类型、范围和字段；如果‘视频链接’等表达可能指作品页链接或媒体源地址，应先向用户澄清。",
+      "仅在账号分析报告与已采集账号作品都无法满足当前分析时，根据已经澄清的用户用途和数据缺口制定账号采集方案；不启动浏览器、不采集数据。purpose=account_analysis 会自动补齐工作台同构的基础作品、15 条高/典型/低表现代表详情和最多 12 个封面证据；逐字稿不是机械默认项。若用户没有主动要求逐字稿，Agent 必须先用 analysisTranscriptDecision 和 analysisTranscriptReason 判断它是否会显著提升当前问题：默认优先 not_needed；只有分析口播、叙事、语言、节奏或视频内容机制等必须依赖真实口播时才 recommend，并对最多 8 条最小代表样本报价。用户也可以主动要求逐字稿，或用‘视频文案／口播文字／视频说了什么／字幕文字版’等同义表达触发。逐字稿只生成报价，必须展示逐条积分、总积分、余额和有效期并取得明确确认后才提取。detailMaxItems 与 transcriptMaxItems 可覆盖代表层数量，但不会把 50 条基础作品误变成 50 个详情页。‘全部采下来／完整导出／爬这个账号／每篇详情都要’必须映射为 full_collection，不套用研究建议终点。工具会保留用户明确要求的总量，把超过单批或连续建议额度的目标拆成可审计批次，并返回普通／黄色／红色三级确认。风险提示不会静默缩小用户范围。",
     inputSchema: {
       type: "object",
       properties: {
@@ -5439,6 +6147,31 @@ const tools = [
           description:
             "本次确认的总量上限，不是单批数量。工具会自动拆成基础列表每批最多 300、详情增强每批最多 100；完整采集必须提供已知总量或明确授权上限。",
         },
+        detailMaxItems: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_DEEP_COLLECT_LIMIT,
+          description:
+            "详情代表样本上限。账号分析默认 15，代表作品研究默认 20；只有用户明确要求更大详情范围时才提高。",
+        },
+        transcriptMaxItems: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_TRANSCRIPT_QUOTE_ITEMS,
+          description:
+            "进入逐字稿报价的代表视频上限。账号分析默认 8；仍需用户对报价另行确认。",
+        },
+        analysisTranscriptDecision: {
+          type: "string",
+          enum: ["recommend", "not_needed"],
+          description:
+            "仅用于账号分析且用户未主动要求逐字稿时。所有分析都必须先评估逐字稿的增量价值；默认优先 not_needed，只有没有真实口播就无法可靠回答当前问题时才 recommend。",
+        },
+        analysisTranscriptReason: {
+          type: "string",
+          description:
+            "账号分析对逐字稿必要性的具体判断理由。recommend 和 not_needed 都必须说明，防止机械提取或机械跳过。",
+        },
         failureRetryPasses: {
           type: "integer",
           minimum: 0,
@@ -5474,7 +6207,7 @@ const tools = [
             ],
           },
           description:
-            "用户明确要拿到的数据。‘全部作品详情’通常包含标题、作品页链接、封面、发布时间、互动、正文和媒体地址；评论、博主指标和逐字稿只有用户明确要求时才加入。",
+            "用户主动要求的数据。purpose=account_analysis 时可以省略，工具会自动加入基础作品、代表详情和封面；只有用户主动要求，或 analysisTranscriptDecision=recommend 时才加入最多 8 条代表视频逐字稿报价。直接归档或导出时，评论、博主指标和逐字稿仍按用户明确需求加入。",
         },
       },
       required: [
@@ -5483,7 +6216,6 @@ const tools = [
         "purpose",
         "contentType",
         "coverage",
-        "requestedFields",
       ],
       additionalProperties: false,
     },
@@ -5814,7 +6546,7 @@ const tools = [
   {
     name: "mediaclaw_research_single_note",
     description:
-      "为单篇分析准备完整详情和可选评论；图片 OCR 复用插件能力。视频只返回 recordId，逐字稿必须另走报价与 quoteId 确认。",
+      "为单篇分析准备完整详情和可选评论；图片 OCR 复用插件能力。调用前必须判断逐字稿是否会显著提升任务，并传入 analysisTranscriptDecision：默认优先 not_needed；用户主动索要原视频的逐字稿／视频文案／口播文字／视频说了什么／字幕文字版时用 user_requested；只有口播、叙事、语言、论证、节奏或脚本机制分析确需原文时才 recommend。user_requested 或 recommend 会先检查已有逐字稿：已有时直接读取且不收费，缺失时返回真实报价与 quoteId，仍需用户明确确认；not_needed 不报价、不提取。‘帮我写视频文案’属于生成请求，不得误判为提取。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -5833,11 +6565,26 @@ const tools = [
           default: 30,
           description: "单轮安全上限 500；超过后需要分批并遵循插件连续采集保护。",
         },
-        includeMediaText: {type: "boolean", default: true},
+        includeMediaText: {
+          type: "boolean",
+          default: true,
+          description: "是否提取图片 OCR；视频逐字稿由 analysisTranscriptDecision 单独控制。",
+        },
+        analysisTranscriptDecision: {
+          type: "string",
+          enum: ["user_requested", "recommend", "not_needed"],
+          description:
+            "所有单篇分析都必须给出。默认优先 not_needed；用户主动索要原视频文字时为 user_requested；只有逐字稿会显著提升当前分析时才 recommend。",
+        },
+        analysisTranscriptReason: {
+          type: "string",
+          description:
+            "recommend 或 not_needed 时必须说明任务相关理由；不得用‘更完整’作为机械提取理由。",
+        },
         forceMediaExtraction: {type: "boolean", default: false},
         async: {type: "boolean", default: false},
       },
-      required: ["url"],
+      required: ["url", "analysisTranscriptDecision"],
       additionalProperties: false,
     },
   },
@@ -6405,7 +7152,9 @@ async function handleToolCall(params = {}) {
   if (name === "mediaclaw_connection_status") {
     const session = adapterSession(adapter);
     const connected = Boolean(extensionPeer && session);
-    const awaitingPairing = Boolean(extensionPeer && adapter && !session);
+    const awaitingPairing = Boolean(
+      extensionPeers.size > 0 && adapter && !session,
+    );
     const message = !bridgeStatus.listening
       ? `MediaClaw 本地桥接启动失败：${bridgeStatus.error || "未知错误"}`
       : connected
@@ -6624,6 +7373,7 @@ async function registerAdapter(payload = {}) {
     hostKey,
     displayName: normalizeText(payload.displayName, 160),
     adapterVersion,
+    agentChannel: normalizeText(payload.agentChannel, 40),
   });
   const previous = adapter.instances.get(instanceId);
   if (previous?.token) adapterTokens.delete(previous.token);
@@ -6653,7 +7403,9 @@ function scheduleBrokerUpgrade(adapterVersion) {
     `[mediaclaw] newer Adapter ${adapterVersion} requested Broker ${SERVER_VERSION} restart\n`,
   );
   const timer = setTimeout(() => {
-    extensionPeer?.close(1012, "MediaClaw Agent is loading a newer Broker");
+    for (const peer of extensionPeers) {
+      peer.close(1012, "MediaClaw Agent is loading a newer Broker");
+    }
     void websocketServer.close().finally(() => process.exit(0));
   }, 100);
   timer.unref?.();
@@ -6764,12 +7516,7 @@ const websocketServer = createLoopbackWebSocketServer({
   serviceName: SERVER_NAME,
   onHttpRequest: handleBridgeHttpRequest,
   onConnection(peer) {
-    if (extensionPeer && extensionPeer !== peer) {
-      extensionPeer.close(1012, "A newer MediaClaw extension connection opened");
-    }
-    extensionPeer = peer;
-    extensionInfo = null;
-    deviceSessions.clear();
+    extensionPeers.add(peer);
     peer.send({
       type: "broker.hello",
       serverName: "MediaClaw Agent Broker",
@@ -6819,7 +7566,9 @@ const adapterSweepTimer = setInterval(() => {
     if (adapter.instances.size > 0) continue;
     const deviceId = adapter.identity.deviceId;
     deviceSessions.delete(deviceId);
-    extensionPeer?.send({type: "device.offline", deviceId});
+    for (const peer of extensionPeers) {
+      peer.send({type: "device.offline", deviceId});
+    }
   }
   const hasActiveAdapter = [...adapters.values()].some(
     (adapter) => adapter.instances.size > 0,
@@ -6830,7 +7579,7 @@ const adapterSweepTimer = setInterval(() => {
   );
   if (
     !hasActiveAdapter &&
-    !extensionPeer &&
+    extensionPeers.size === 0 &&
     mostRecentAdapterAt > 0 &&
     Date.now() - mostRecentAdapterAt >= BROKER_IDLE_TIMEOUT_MS
   ) {
