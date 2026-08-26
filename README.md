@@ -53,7 +53,7 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 
 你可以直接把下面的话发给 Codex 或 WorkBuddy：
 
-> 请从 https://github.com/IvyXue18/MediaClaw-Agent 安装当前宿主对应的 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。所有可以自动完成的步骤都由你完成，不要让我使用终端，也不要向我索取激活码、Cookie、平台 Token、端口或本机令牌。
+> 请从 https://github.com/IvyXue18/MediaClaw-Agent 通过当前宿主的 marketplace 安装、升级或修复 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。平台和芯片识别、官方运行时准备、SHA-256 校验及连接复查都由你完成；不要让我下载 ZIP、选择 `.exe`、使用终端，或向我索取激活码、Cookie、平台 Token、端口和本机令牌。
 
 也可以查看分宿主安装步骤：[安装与连接](docs/INSTALLATION.md)。
 

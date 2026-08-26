@@ -56,7 +56,7 @@ test("a newer Adapter makes an older shared Broker exit for replacement", async 
       body: JSON.stringify({
         hostKey: "codex",
         displayName: "Future MediaClaw Agent",
-        adapterVersion: "0.3.1",
+        adapterVersion: "0.3.2",
         instanceId: "future-adapter",
       }),
     },
@@ -65,8 +65,8 @@ test("a newer Adapter makes an older shared Broker exit for replacement", async 
   const body = await response.json();
   assert.equal(body.restartRequired, true);
   assert.equal(body.error.code, "BROKER_RESTART_REQUIRED");
-  assert.equal(body.brokerVersion, "0.3.0");
-  assert.equal(body.adapterVersion, "0.3.1");
+  assert.equal(body.brokerVersion, "0.3.1");
+  assert.equal(body.adapterVersion, "0.3.2");
 
   const exitCode = await Promise.race([
     exited,

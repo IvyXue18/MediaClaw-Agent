@@ -13,8 +13,37 @@ const UPDATE_COMMAND_TIMEOUT_MS = 2 * 60 * 1000;
 const UPDATE_OUTPUT_LIMIT = 64 * 1024;
 const UPDATE_STATE_VERSION = 1;
 const WORKBUDDY_CLI_FALLBACKS = [
+  process.env.CODEBUDDY_CLI_PATH,
   "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
-];
+  process.env.APPDATA && path.join(process.env.APPDATA, "npm", "codebuddy.cmd"),
+  process.env.LOCALAPPDATA && path.join(
+    process.env.LOCALAPPDATA,
+    "Programs",
+    "WorkBuddy AI",
+    "resources",
+    "app.asar.unpacked",
+    "cli",
+    "bin",
+    "codebuddy.cmd",
+  ),
+  process.env.HOME && path.join(process.env.HOME, ".local", "bin", "codebuddy"),
+  "/usr/local/bin/codebuddy",
+  "/usr/bin/codebuddy",
+].filter(Boolean);
+const CODEX_CLI_FALLBACKS = [
+  process.env.CODEX_CLI_PATH,
+  process.env.APPDATA && path.join(process.env.APPDATA, "npm", "codex.cmd"),
+  process.env.LOCALAPPDATA && path.join(
+    process.env.LOCALAPPDATA,
+    "Programs",
+    "Codex",
+    "codex.exe",
+  ),
+  process.env.HOME && path.join(process.env.HOME, ".local", "bin", "codex"),
+  "/opt/homebrew/bin/codex",
+  "/usr/local/bin/codex",
+  "/usr/bin/codex",
+].filter(Boolean);
 
 export const AGENT_UPDATE_TOOL = {
   name: "mediaclaw_manage_agent_update",
@@ -107,10 +136,15 @@ function updateCommandPlan(hostKey) {
     commands: [
       {
         file: "codex",
+        fallbackFiles: CODEX_CLI_FALLBACKS,
         args: ["plugin", "marketplace", "upgrade", MARKETPLACE_NAME],
       },
     ],
-    verify: {file: "codex", args: ["plugin", "list"]},
+    verify: {
+      file: "codex",
+      fallbackFiles: CODEX_CLI_FALLBACKS,
+      args: ["plugin", "list"],
+    },
   };
 }
 
@@ -324,7 +358,8 @@ export function runAgentUpdateCommand(
       timer.unref?.();
       try {
         child = spawnImpl(candidates[candidateIndex], command.args, {
-          shell: false,
+          shell: process.platform === "win32",
+          windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
           env,
         });

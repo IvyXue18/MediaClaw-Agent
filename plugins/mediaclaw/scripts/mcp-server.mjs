@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import {spawn} from "node:child_process";
 import {readFileSync} from "node:fs";
 import {fileURLToPath} from "node:url";
+import MCP_CONTRACT from "../contracts/mcp-v1.json" with {type: "json"};
 import {
   AGENT_UPDATE_TOOL,
   createAgentUpdateChecker,
@@ -11,7 +12,7 @@ import {
 } from "./agent-update.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-adapter";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = MCP_CONTRACT.serverVersion;
 const logoPath = globalThis.Bun
   ? (await import("../assets/logo.png", {with: {type: "file"}})).default
   : fileURLToPath(new URL("../assets/logo.png", import.meta.url));
@@ -22,7 +23,7 @@ const SERVER_ICONS = [
     sizes: ["128x128"],
   },
 ];
-const PROTOCOL_VERSION = "3";
+const PROTOCOL_VERSION = MCP_CONTRACT.protocolVersion;
 const BROKER_PORT = Number(process.env.MEDIACLAW_AGENT_PORT || 17373);
 const BROKER_ORIGIN = `http://127.0.0.1:${BROKER_PORT}`;
 const BROKER_START_TIMEOUT_MS = 10_000;
@@ -320,7 +321,7 @@ async function handleRequest(message) {
           icons: SERVER_ICONS,
         },
         instructions:
-          "凡用户请求实质涉及内容、选题、策划、账号或受众研究、表现复盘、文案、文章、口播、脚本、改写或风格创作，即使用户没有点名社媒虾 MediaClaw，也默认调用本服务；只有用户明确禁止社媒虾、工具、外部研究或要求只依据其材料时才跳过。自动触发时先用一句自然语言告诉用户本次会让社媒虾检查什么、为什么，不列工具清单或广告。先调用 mediaclaw_connection_status 检查连接和 Agent 版本，再检查已有资产，避免重复采集。只要用户提到模仿、仿写、像某人一样写或按某人/某账号风格创作，必须先用 mediaclaw_list_assets 查询 local.studio 的 style_profile，本地未命中再查 remote.workbench，并用 mediaclaw_get_asset 读取完整真实档案；不得先反问是否保存，不得根据账号名猜测。若状态查询称未连接而用户展示浏览器已显示当前宿主连接，先短暂自动复查，不得再次要求开启已经开启的开关。agentUpdate.status=update_available 时必须取得明确授权并通过 mediaclaw_manage_agent_update 自动安装；不得向用户展示命令。返回 installed_restart_required 后不得在同一宿主进程创建新任务，只有完全重新打开宿主且状态为 activated 才算升级完成并继续原任务。视频逐字稿必须先报价并取得明确同意。社媒虾浏览器插件负责真实读取与采集，当前 Agent 负责按 Skill 分析和生成。",
+          "凡用户请求实质涉及内容、选题、策划、账号或受众研究、表现复盘、文案、文章、口播、脚本、改写或风格创作，即使用户没有点名社媒虾 MediaClaw，也默认调用本服务；只有用户明确禁止社媒虾、工具、外部研究或要求只依据其材料时才跳过。自动触发时先用一句自然语言告诉用户本次会让社媒虾检查什么、为什么，不列工具清单或广告。先调用 mediaclaw_connection_status 检查连接和 Agent 版本，再检查已有资产，避免重复采集。本地资产命中后用 mediaclaw_get_asset 的 manifest、语义分区和游标按需读取；读取超时、扩展重连或传输失败不等于数据不存在，禁止自动切换到 capture 工具。savedCount 表示插件已保存数量，platformCount 只是页面指标，不得混用。只有用户明确要求重新采集、更新、补采或采更多，或本地未命中后用户同意，才能进入采集。直接采集账号数据时，必须先理解用户要哪个主页、采集用途、哪些内容、多少范围和哪些字段；影响能力组合的信息不清楚时先用用户语言澄清，不能用基础采集默认值替代用户意图。目标明确后先调用 mediaclaw_prepare_profile_collection，把用途建议量、用户要求量、分批方案、浏览器动作、字段和风险完整展示给用户；建议量不是能力上限，用户确认更大范围后不得静默缩量。只有用户明确同意后才能用原样 planId 调用 mediaclaw_confirm_profile_collection。只要用户提到模仿、仿写、像某人一样写或按某人/某账号风格创作，必须先用 mediaclaw_list_assets 查询 local.studio 的 style_profile，本地未命中再查 remote.workbench，并用 mediaclaw_get_asset 读取完整真实档案；不得先反问是否保存，不得根据账号名猜测。若状态查询称未连接而用户展示浏览器已显示当前宿主连接，先短暂自动复查，不得再次要求开启已经开启的开关。agentUpdate.status=update_available 时必须取得明确授权并通过 mediaclaw_manage_agent_update 自动安装；不得向用户展示命令。返回 installed_restart_required 后不得在同一宿主进程创建新任务，只有完全重新打开宿主且状态为 activated 才算升级完成并继续原任务。视频逐字稿必须先报价并取得明确同意。社媒虾浏览器插件负责真实读取与采集，当前 Agent 负责按 Skill 分析和生成。",
       });
       return;
     }

@@ -38,11 +38,11 @@ test("WorkBuddy plugin launches the shared adapter with an independent host", ()
     ),
   );
   const server = mcpConfig.mcpServers.mediaclaw;
-  assert.equal(server.command, "/bin/bash");
-  assert.deepEqual(server.args, [
-    "-lc",
-    'exec "${CODEBUDDY_PLUGIN_ROOT}/scripts/launch-agent.sh"',
-  ]);
+  assert.equal(
+    server.command,
+    "${CODEBUDDY_PLUGIN_ROOT}/scripts/launch-agent.cmd",
+  );
+  assert.equal(Object.hasOwn(server, "args"), false);
   assert.equal(
     Object.hasOwn(server, "cwd"),
     false,
@@ -64,14 +64,25 @@ test("WorkBuddy inline discovery keeps the shared MCP definition host-neutral", 
     ),
   );
   const server = mcpConfig.mcpServers.mediaclaw;
-  assert.equal(server.command, "/bin/bash");
-  assert.equal(server.args[0], "-lc");
-  assert.match(server.args[1], /CODEBUDDY_PLUGIN_ROOT/);
-  assert.match(server.args[1], /CODEX_PLUGIN_ROOT/);
-  assert.match(server.args[1], /scripts\/launch-agent\.sh/);
+  assert.equal(server.command, "./scripts/launch-agent.cmd");
+  assert.equal(server.cwd, ".");
+  assert.equal(Object.hasOwn(server, "args"), false);
   assert.equal(
     Object.hasOwn(server, "env"),
     false,
     "the inline definition must detect WorkBuddy instead of forcing Codex",
   );
+});
+
+test("the marketplace ships native launchers for POSIX and Windows hosts", () => {
+  const scripts = path.join(projectRoot, "plugins", "mediaclaw", "scripts");
+  const posixLauncher = path.join(scripts, "launch-agent");
+  const windowsLauncher = path.join(scripts, "launch-agent.cmd");
+  assert.equal(fs.existsSync(posixLauncher), true);
+  assert.equal(fs.existsSync(windowsLauncher), true);
+  assert.match(fs.readFileSync(posixLauncher, "utf8"), /PLUGIN_DATA/);
+  assert.match(fs.readFileSync(posixLauncher, "utf8"), /Linux-aarch64/);
+  assert.match(fs.readFileSync(posixLauncher, "utf8"), /linux-arm64-musl/);
+  assert.match(fs.readFileSync(windowsLauncher, "utf8"), /windows-arm64\.exe/);
+  assert.match(fs.readFileSync(windowsLauncher, "utf8"), /Get-FileHash/);
 });

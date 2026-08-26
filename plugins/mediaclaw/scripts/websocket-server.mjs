@@ -3,7 +3,17 @@ import http from "node:http";
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_CLIENT_FRAME_BYTES = 1024 * 1024;
+const MAX_HTTP_REQUEST_BODY_BYTES = 1024 * 1024;
 const MAX_MESSAGES_PER_MINUTE = 180;
+
+function isAllowedWebSocketOrigin(origin) {
+  const normalized = String(origin || "").trim();
+  return (
+    !normalized ||
+    normalized.startsWith("chrome-extension://") ||
+    normalized.startsWith("moz-extension://")
+  );
+}
 
 function encodeFrame(payload, opcode = 0x1) {
   const body = Buffer.isBuffer(payload)
@@ -139,7 +149,248 @@ function createSocketPeer(socket, handlers = {}) {
   return peer;
 }
 
-export function createLoopbackWebSocketServer({
+function createBunRequestMetadata(request) {
+  const requestUrl = new URL(request.url);
+  return {
+    method: request.method,
+    url: `${requestUrl.pathname}${requestUrl.search}`,
+    headers: Object.fromEntries(request.headers.entries()),
+  };
+}
+
+async function createBunRequestFacade(request) {
+  const metadata = createBunRequestMetadata(request);
+  const chunks = [];
+  let size = 0;
+  if (!["GET", "HEAD"].includes(request.method)) {
+    const declaredLength = Number(request.headers.get("content-length") || 0);
+    if (declaredLength > MAX_HTTP_REQUEST_BODY_BYTES) {
+      throw new Error("bridge RPC request body is too large");
+    }
+    const reader = request.body?.getReader();
+    if (reader) {
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        size += chunk.length;
+        if (size > MAX_HTTP_REQUEST_BODY_BYTES) {
+          await reader.cancel();
+          throw new Error("bridge RPC request body is too large");
+        }
+        chunks.push(chunk);
+      }
+    }
+  }
+  return {
+    ...metadata,
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk;
+    },
+  };
+}
+
+function createBunResponseFacade() {
+  let body = "";
+  let status = 200;
+  let headers = {};
+  let headersSent = false;
+  return {
+    get headersSent() {
+      return headersSent;
+    },
+    writeHead(nextStatus, nextHeaders = {}) {
+      status = Number(nextStatus) || 200;
+      headers = {...headers, ...nextHeaders};
+      headersSent = true;
+    },
+    end(nextBody = "") {
+      body = Buffer.isBuffer(nextBody) ? nextBody : String(nextBody ?? "");
+      headersSent = true;
+    },
+    toResponse() {
+      return new Response(body, {status, headers});
+    },
+  };
+}
+
+function createBunSocketPeer(socket, handlers = {}) {
+  let closed = false;
+  let closeNotified = false;
+  const messageTimes = [];
+
+  function reportError(error) {
+    handlers.onError?.(error, peer);
+  }
+
+  const peer = {
+    send(payload) {
+      if (closed) return false;
+      try {
+        return socket.send(JSON.stringify(payload)) !== -1;
+      } catch (error) {
+        reportError(error);
+        return false;
+      }
+    },
+    close(code = 1000, reason = "") {
+      if (closed) return;
+      closed = true;
+      try {
+        socket.close(code, reason);
+      } catch (error) {
+        reportError(error);
+      }
+    },
+  };
+
+  return {
+    peer,
+    message(rawMessage) {
+      const currentTime = Date.now();
+      while (messageTimes.length && messageTimes[0] <= currentTime - 60_000) {
+        messageTimes.shift();
+      }
+      if (messageTimes.length >= MAX_MESSAGES_PER_MINUTE) {
+        peer.close(1008, "Message rate limit exceeded");
+        return;
+      }
+      messageTimes.push(currentTime);
+      try {
+        const text = typeof rawMessage === "string"
+          ? rawMessage
+          : Buffer.from(rawMessage).toString("utf8");
+        handlers.onMessage?.(JSON.parse(text), peer);
+      } catch (error) {
+        handlers.onMalformedMessage?.(error, peer);
+      }
+    },
+    close() {
+      closed = true;
+      if (closeNotified) return;
+      closeNotified = true;
+      handlers.onClose?.(peer);
+    },
+  };
+}
+
+function createBunLoopbackWebSocketServer({
+  port,
+  path,
+  serviceName,
+  onHttpRequest,
+  onConnection,
+  onMessage,
+  onClose,
+  logger,
+}) {
+  let server = null;
+  const peers = new WeakMap();
+
+  async function handleHttpRequest(request) {
+    const requestUrl = new URL(request.url);
+    if (
+      request.method === "GET" &&
+      (requestUrl.pathname === "/health" || requestUrl.pathname === "/")
+    ) {
+      return Response.json({
+        ok: true,
+        service: serviceName,
+        websocketPath: path,
+      });
+    }
+    const responseFacade = createBunResponseFacade();
+    try {
+      const requestFacade = await createBunRequestFacade(request);
+      if (await onHttpRequest?.(requestFacade, responseFacade)) {
+        return responseFacade.toResponse();
+      }
+    } catch (error) {
+      logger.error?.("[mediaclaw] local bridge HTTP request failed", error);
+      if (!responseFacade.headersSent) {
+        responseFacade.writeHead(500, {"content-type": "application/json"});
+      }
+      responseFacade.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      return responseFacade.toResponse();
+    }
+    return Response.json({ok: false, error: "not_found"}, {status: 404});
+  }
+
+  return {
+    async listen() {
+      server = globalThis.Bun.serve({
+        hostname: "127.0.0.1",
+        port,
+        async fetch(request, bunServer) {
+          const requestUrl = new URL(request.url);
+          if (requestUrl.pathname === path) {
+            if (
+              request.method !== "GET" ||
+              !isAllowedWebSocketOrigin(request.headers.get("origin"))
+            ) {
+              return new Response("Forbidden", {status: 403});
+            }
+            const upgraded = bunServer.upgrade(request, {
+              data: {request: createBunRequestMetadata(request)},
+            });
+            return upgraded
+              ? undefined
+              : new Response("WebSocket upgrade failed", {status: 400});
+          }
+          return await handleHttpRequest(request);
+        },
+        websocket: {
+          maxPayloadLength: MAX_CLIENT_FRAME_BYTES,
+          open(socket) {
+            const state = createBunSocketPeer(socket, {
+              onMessage,
+              onClose,
+              onMalformedMessage(error) {
+                logger.error?.("[mediaclaw] invalid extension message", error);
+              },
+              onError(error) {
+                logger.error?.("[mediaclaw] extension socket error", error);
+              },
+            });
+            peers.set(socket, state);
+            onConnection?.(state.peer, socket.data?.request);
+          },
+          message(socket, message) {
+            peers.get(socket)?.message(message);
+          },
+          close(socket) {
+            const state = peers.get(socket);
+            peers.delete(socket);
+            state?.close();
+          },
+        },
+        error(error) {
+          logger.error?.("[mediaclaw] local bridge server error", error);
+          return Response.json(
+            {ok: false, error: "internal_server_error"},
+            {status: 500},
+          );
+        },
+      });
+      return {host: "127.0.0.1", port, path};
+    },
+    async close() {
+      const activeServer = server;
+      server = null;
+      await activeServer?.stop(true);
+    },
+    get server() {
+      return server;
+    },
+  };
+}
+
+function createNodeLoopbackWebSocketServer({
   port = 17373,
   path = "/extension",
   serviceName = "mediaclaw-agent-broker",
@@ -204,12 +455,7 @@ export function createLoopbackWebSocketServer({
       socket.destroy();
       return;
     }
-    const origin = String(request.headers.origin || "").trim();
-    if (
-      origin &&
-      !origin.startsWith("chrome-extension://") &&
-      !origin.startsWith("moz-extension://")
-    ) {
+    if (!isAllowedWebSocketOrigin(request.headers.origin)) {
       socket.destroy();
       return;
     }
@@ -260,4 +506,17 @@ export function createLoopbackWebSocketServer({
     },
     server,
   };
+}
+
+export function createLoopbackWebSocketServer(options = {}) {
+  const normalized = {
+    port: 17373,
+    path: "/extension",
+    serviceName: "mediaclaw-agent-broker",
+    logger: console,
+    ...options,
+  };
+  return typeof globalThis.Bun?.serve === "function"
+    ? createBunLoopbackWebSocketServer(normalized)
+    : createNodeLoopbackWebSocketServer(normalized);
 }

@@ -86,6 +86,20 @@ function waitForText(stream, pattern, timeoutMs = 5000) {
   });
 }
 
+async function waitForJsonFile(filePath, predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const value = JSON.parse(await readFile(filePath, "utf8"));
+      if (predicate(value)) return value;
+    } catch {
+      // The broker may be between its temporary write and atomic rename.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for JSON state at ${filePath}`);
+}
+
 function sendChunkedResult(socket, {taskId, task, response}, chunkSize = 16_384) {
   const serialized = JSON.stringify({task, response});
   const transferId = `${taskId}:test:${serialized.length}`;
@@ -173,8 +187,8 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   await writeFile(
     fakeCodexPath,
     process.platform === "win32"
-      ? "@echo off\r\nif \"%1 %2\"==\"plugin list\" (echo mediaclaw@mediaclaw-agent  installed, enabled  0.3.1  C:\\fake) else (echo upgraded)\r\n"
-      : "#!/bin/sh\nif [ \"$1 $2\" = \"plugin list\" ]; then\n  echo 'mediaclaw@mediaclaw-agent  installed, enabled  0.3.1  /tmp/fake'\nelse\n  echo 'upgraded'\nfi\n",
+      ? "@echo off\r\nif \"%1 %2\"==\"plugin list\" (echo mediaclaw@mediaclaw-agent  installed, enabled  0.3.2  C:\\fake) else (echo upgraded)\r\n"
+      : "#!/bin/sh\nif [ \"$1 $2\" = \"plugin list\" ]; then\n  echo 'mediaclaw@mediaclaw-agent  installed, enabled  0.3.2  /tmp/fake'\nelse\n  echo 'upgraded'\nfi\n",
     "utf8",
   );
   if (process.platform !== "win32") await chmod(fakeCodexPath, 0o755);
@@ -188,7 +202,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       MEDIACLAW_AGENT_ADAPTER_SWEEP_MS: "100",
       MEDIACLAW_AGENT_BROKER_IDLE_MS: "500",
       MEDIACLAW_AGENT_UPDATE_MANIFEST_URL:
-        "data:application/json,%5B%7B%22tag_name%22%3A%22v0.3.1%22%2C%22draft%22%3Afalse%7D%5D",
+        "data:application/json,%5B%7B%22tag_name%22%3A%22v0.3.2%22%2C%22draft%22%3Afalse%7D%5D",
       PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH || ""}`,
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -257,11 +271,11 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.currentVersion,
-    "0.3.0",
+    "0.3.1",
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.latestVersion,
-    "0.3.1",
+    "0.3.2",
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.approvalRequired,
@@ -332,6 +346,15 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   t.after(() => socket.close());
   let resolveRecoveredAck;
   let resolveHandshake;
+  let collectionPlanTaskStarts = 0;
+  let assetReadTaskStarts = 0;
+  let transientDetailAttempts = 0;
+  let transientScanAttempts = 0;
+  let permanentDetailAttempts = 0;
+  let captchaScanAttempts = 0;
+  let detailCaptchaAttempts = 0;
+  let cooldownScanAttempts = 0;
+  let loginScanAttempts = 0;
   const recoveredAck = new Promise((resolve) => {
     resolveRecoveredAck = resolve;
   });
@@ -380,7 +403,315 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       return;
     }
     if (message.type !== "task.start") return;
+    if (message.task.mode === "data_pool_assets") {
+      assetReadTaskStarts += 1;
+      assert.equal(message.task.options.operation, "get");
+      assert.equal(message.task.options.view, "sections");
+      assert.deepEqual(message.task.options.sections, ["identity", "comments"]);
+      assert.deepEqual(message.task.options.page, {
+        path: "comments.items",
+        cursor: "0",
+        limit: 100,
+      });
+      setTimeout(() => {
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: true,
+              data: {
+                rawCaptureResult: {
+                  ok: true,
+                  type: "agent_asset",
+                  data: {
+                    ok: true,
+                    assetId: message.task.options.assetId,
+                    source: "local.data_pool",
+                    type: "capture_record",
+                    asset: {
+                      operation: "read_local_asset",
+                      didCapture: false,
+                      manifest: {
+                        availableSections: {
+                          comments: {savedCount: 1000, platformCount: 2450},
+                        },
+                      },
+                      comments: {
+                        savedCount: 1000,
+                        platformCount: 2450,
+                        items: [{commentId: "comment-1", content: "本地评论"}],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }),
+        );
+      }, 80);
+      return;
+    }
     if (message.task.mode === "profile_posts") {
+      if (message.task.profileUrl.includes("collection-detail-captcha-test")) {
+        const records = Array.from({length: 101}, (_, index) => {
+          const number = index + 1;
+          return {
+            id: `rec-plan-detail-captcha-${number}`,
+            recordType: "blogger_notes",
+            normalizedPayload: {
+              items: [
+                {
+                  noteId: `plan-detail-captcha-${number}`,
+                  title: `详情验证码样本 ${number}`,
+                  url: `https://www.xiaohongshu.com/explore/plan-detail-captcha-${number}`,
+                  bloggerUrl: message.task.profileUrl,
+                  author: "方案博主",
+                  noteType: "video",
+                },
+              ],
+            },
+          };
+        });
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: true,
+              data: {
+                captureResult: {
+                  recordIds: records.map((record) => record.id),
+                  records,
+                  stats: {itemCount: records.length},
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.profileUrl.includes("collection-captcha-test")) {
+        captchaScanAttempts += 1;
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: false,
+              error: {
+                code: "CAPTCHA_REQUIRED",
+                message: "请先在浏览器完成验证码",
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.profileUrl.includes("collection-cooldown-test")) {
+        cooldownScanAttempts += 1;
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: false,
+              error: {
+                code: "AGENT_CAPTURE_CONTINUOUS_LIMIT_REACHED",
+                message: "平台要求等待后继续",
+                risk: {nextAllowedAt: "2099-01-01T00:00:00.000Z"},
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.profileUrl.includes("collection-login-test")) {
+        loginScanAttempts += 1;
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: false,
+              error: {
+                code: "LOGIN_REQUIRED",
+                message: "请先在浏览器恢复账号登录",
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.profileUrl.includes("collection-scan-retry-test")) {
+        transientScanAttempts += 1;
+        if (transientScanAttempts === 1) {
+          socket.send(
+            JSON.stringify({
+              type: "task.result",
+              taskId: message.taskId,
+              response: {
+                ok: false,
+                error: {
+                  code: "PROFILE_PAGE_LOAD_FAILED",
+                  message: "主页首次加载超时",
+                },
+              },
+            }),
+          );
+          return;
+        }
+        const item = {
+          noteId: "plan-scan-retry",
+          title: "主页扫描重试样本",
+          url: "https://www.xiaohongshu.com/explore/plan-scan-retry",
+          bloggerUrl: message.task.profileUrl,
+          author: "方案博主",
+          noteType: "image",
+        };
+        const record = {
+          id: "rec-plan-scan-retry",
+          recordType: "blogger_notes",
+          normalizedPayload: {items: [item]},
+        };
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: true,
+              data: {
+                captureResult: {
+                  recordIds: [record.id],
+                  records: [record],
+                  stats: {itemCount: 1},
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.profileUrl.includes("collection-retry-test")) {
+        const item = {
+          noteId: "plan-retry",
+          title: "详情重试样本",
+          url: "https://www.xiaohongshu.com/explore/plan-retry",
+          bloggerUrl: message.task.profileUrl,
+          author: "方案博主",
+          noteType: "video",
+        };
+        const record = {
+          id: "rec-plan-retry",
+          recordType: "blogger_notes",
+          normalizedPayload: {items: [item]},
+        };
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: true,
+              data: {
+                captureResult: {
+                  recordIds: [record.id],
+                  records: [record],
+                  stats: {itemCount: 1},
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.profileUrl.includes("collection-failure-test")) {
+        const item = {
+          noteId: "plan-failure",
+          title: "详情解析失败样本",
+          url: "https://www.xiaohongshu.com/explore/plan-failure",
+          author: "方案博主",
+          noteType: "video",
+        };
+        const record = {
+          id: "rec-plan-failure",
+          recordType: "blogger_notes",
+          normalizedPayload: {items: [item]},
+        };
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: true,
+              data: {
+                captureResult: {
+                  recordIds: [record.id],
+                  records: [record],
+                  stats: {itemCount: 1},
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.profileUrl.includes("collection-plan-test")) {
+        collectionPlanTaskStarts += 1;
+        const items = [
+          {
+            noteId: "plan-video-1",
+            title: "方案视频一",
+            url: "https://www.xiaohongshu.com/explore/plan-video-1",
+            author: "方案博主",
+            likes: 1200,
+            collects: 300,
+            comments: 50,
+            noteType: "video",
+          },
+          {
+            noteId: "plan-image-1",
+            title: "方案图文一",
+            url: "https://www.xiaohongshu.com/explore/plan-image-1",
+            author: "方案博主",
+            likes: 800,
+            collects: 220,
+            comments: 30,
+            noteType: "image",
+          },
+          {
+            noteId: "plan-video-2",
+            title: "方案视频二",
+            url: "https://www.xiaohongshu.com/explore/plan-video-2",
+            author: "方案博主",
+            likes: 600,
+            collects: 180,
+            comments: 20,
+            noteType: "video",
+          },
+        ];
+        const records = items.map((item) => ({
+          id: `rec-${item.noteId}`,
+          recordType: "blogger_notes",
+          normalizedPayload: {items: [item]},
+        }));
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: true,
+              data: {
+                captureResult: {
+                  recordIds: records.map((record) => record.id),
+                  records,
+                  stats: {itemCount: records.length},
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
       if (message.task.profileUrl.includes("recent-test")) {
         const items = Array.from({length: 8}, (_, index) => ({
           noteId: `recent-${index + 1}`,
@@ -474,6 +805,9 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       return;
     }
     if (message.task.mode === "profile_info") {
+      if (message.task.profileUrl.includes("collection-plan-test")) {
+        collectionPlanTaskStarts += 1;
+      }
       const profileId = message.task.profileUrl.split("/").pop();
       socket.send(
         JSON.stringify({
@@ -554,6 +888,114 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       assert.deepEqual(message.task.resultSinks, ["local_agent"]);
       assert.equal(message.task.featureKey, "capture.enhancement");
       assert.equal(message.task.options.confirmation.confirmed, true);
+      if (
+        message.task.options.confirmation.source ===
+        "mediaclaw_confirm_profile_collection"
+      ) {
+        collectionPlanTaskStarts += 1;
+      }
+      if (
+        message.task.options.recordIds.some((recordId) =>
+          recordId.startsWith("rec-plan-detail-captcha-"),
+        )
+      ) {
+        detailCaptchaAttempts += 1;
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: false,
+              error: {
+                code: "CAPTCHA_REQUIRED",
+                message: "详情采集需要先完成验证码",
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.options.recordIds.includes("rec-plan-failure")) {
+        permanentDetailAttempts += 1;
+        socket.send(
+          JSON.stringify({
+            type: "task.result",
+            taskId: message.taskId,
+            response: {
+              ok: true,
+              data: {
+                rawCaptureResult: {
+                  ok: true,
+                  type: "detail_enhancement",
+                  data: {
+                    successCount: 0,
+                    failedCount: 1,
+                    recordIds: [],
+                    records: [],
+                    results: [
+                      {
+                        ok: false,
+                        recordId: "rec-plan-failure",
+                        error: {
+                          code: "DETAIL_PARSE_FAILED",
+                          message: "详情页面加载后未解析到目标内容",
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.task.options.recordIds.includes("rec-plan-retry")) {
+        transientDetailAttempts += 1;
+        assert.equal(message.task.options.commentsMaxDetectedItems, 45);
+        if (transientDetailAttempts === 1) {
+          socket.send(
+            JSON.stringify({
+              type: "task.result",
+              taskId: message.taskId,
+              response: {
+                ok: true,
+                data: {
+                  rawCaptureResult: {
+                    ok: true,
+                    type: "detail_enhancement",
+                    data: {
+                      successCount: 0,
+                      failedCount: 1,
+                      recordIds: [],
+                      records: [],
+                      results: [{
+                        ok: false,
+                        recordId: "rec-plan-retry",
+                        reason: "DETAIL_PARSE_FAILED",
+                        message: "详情节点暂未加载",
+                      }],
+                    },
+                  },
+                },
+              },
+            }),
+          );
+          return;
+        }
+      }
+      const enhancedRecords = message.task.options.recordIds.map((recordId) => ({
+        id: recordId,
+        recordType: "blogger_notes",
+        status: "ready",
+        normalizedPayload: {
+          title: "增强采集后的完整笔记",
+          content: "完整正文",
+          imageUrls: ["https://example.com/enhanced.jpg"],
+          likes: 321,
+        },
+        rawPayload: {source: "plugin-detail-owner"},
+      }));
       socket.send(
         JSON.stringify({
           type: "task.result",
@@ -565,23 +1007,10 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
                 ok: true,
                 type: "detail_enhancement",
                 data: {
-                  successCount: 1,
+                  successCount: enhancedRecords.length,
                   failedCount: 0,
                   recordIds: message.task.options.recordIds,
-                  records: [
-                    {
-                      id: message.task.options.recordIds[0],
-                      recordType: "single_note",
-                      status: "ready",
-                      normalizedPayload: {
-                        title: "增强采集后的完整笔记",
-                        content: "完整正文",
-                        imageUrls: ["https://example.com/enhanced.jpg"],
-                        likes: 321,
-                      },
-                      rawPayload: {source: "plugin-detail-owner"},
-                    },
-                  ],
+                  records: enhancedRecords,
                 },
               },
             },
@@ -739,7 +1168,9 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
               records: [
                 {
                   recordType: "comments",
-                  normalizedPayload: {items: comments},
+                  normalizedPayload: {
+                    detailPayload: {commentsCleanedItems: comments},
+                  },
                 },
               ],
               stats: {itemCount: comments.length},
@@ -1096,6 +1527,23 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.ok(toolNames.includes("mediaclaw_research_longtail_keywords"));
   assert.ok(toolNames.includes("mediaclaw_research_account_hits"));
   assert.ok(toolNames.includes("mediaclaw_capture_account_profile"));
+  assert.ok(toolNames.includes("mediaclaw_prepare_profile_collection"));
+  assert.ok(toolNames.includes("mediaclaw_confirm_profile_collection"));
+  const prepareProfileCollectionTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_prepare_profile_collection",
+  );
+  const confirmProfileCollectionTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_confirm_profile_collection",
+  );
+  assert.match(prepareProfileCollectionTool.description, /不启动浏览器/);
+  assert.ok(
+    prepareProfileCollectionTool.inputSchema.required.includes(
+      "requestedFields",
+    ),
+  );
+  assert.deepEqual(confirmProfileCollectionTool.inputSchema.required, [
+    "planId",
+  ]);
   assert.ok(toolNames.includes("mediaclaw_research_benchmark_accounts"));
   assert.ok(toolNames.includes("mediaclaw_research_single_note"));
   assert.ok(toolNames.includes("mediaclaw_capture_comments_full"));
@@ -1137,6 +1585,83 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.ok(toolNames.includes("mediaclaw_confirm_video_transcript"));
   assert.ok(toolNames.includes("mediaclaw_list_assets"));
   assert.ok(toolNames.includes("mediaclaw_get_asset"));
+  const getAssetTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_get_asset",
+  );
+  assert.deepEqual(getAssetTool.inputSchema.properties.view.enum, [
+    "sections",
+    "raw",
+  ]);
+  assert.ok(
+    getAssetTool.inputSchema.properties.sections.items.enum.includes(
+      "comments",
+    ),
+  );
+  assert.ok(
+    getAssetTool.inputSchema.properties.page.properties.path.enum.includes(
+      "extractedContent.transcript.text",
+    ),
+  );
+  assert.match(getAssetTool.description, /不会重新采集/);
+  const assetReadArguments = {
+    assetId: "local.data_pool|capture_record|rec-local-comments",
+    sections: ["identity", "comments"],
+    page: {path: "comments.items", cursor: "0", limit: 100},
+    async: true,
+  };
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7001,
+      method: "tools/call",
+      params: {name: "mediaclaw_get_asset", arguments: assetReadArguments},
+    })}\n`,
+  );
+  const firstAssetRead = await reader.waitFor((message) => message.id === 7001);
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7002,
+      method: "tools/call",
+      params: {name: "mediaclaw_get_asset", arguments: assetReadArguments},
+    })}\n`,
+  );
+  const repeatedAssetRead = await reader.waitFor((message) => message.id === 7002);
+  assert.equal(
+    firstAssetRead.result.structuredContent.task.taskId,
+    repeatedAssetRead.result.structuredContent.task.taskId,
+  );
+  assert.match(
+    firstAssetRead.result.structuredContent.task.statusMessage,
+    /本地已保存资产.*不会重新采集/,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(assetReadTaskStarts, 1);
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7003,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_task_status",
+        arguments: {taskId: firstAssetRead.result.structuredContent.task.taskId},
+      },
+    })}\n`,
+  );
+  const completedAssetRead = await reader.waitFor((message) => message.id === 7003);
+  assert.equal(completedAssetRead.result.structuredContent.task.status, "completed");
+  assert.equal(
+    completedAssetRead.result.structuredContent.result.asset.comments.savedCount,
+    1000,
+  );
+  assert.equal(
+    completedAssetRead.result.structuredContent.result.asset.comments.platformCount,
+    2450,
+  );
+  assert.match(
+    completedAssetRead.result.structuredContent.task.statusMessage,
+    /本地已保存资产读取完成/,
+  );
   assert.ok(toolNames.includes("mediaclaw_list_paired_devices"));
   assert.ok(toolNames.includes("mediaclaw_list_style_profiles"));
   assert.ok(toolNames.includes("mediaclaw_get_style_profile"));
@@ -1380,6 +1905,721 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     profileResponse.result.structuredContent.result.profile.followersCount,
     12000,
   );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 151,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "采集这个主页所有视频的详情",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-plan-test",
+          purpose: "full_collection",
+          contentType: "video",
+          coverage: "all_available",
+          maxItems: 3,
+          requestedFields: [
+            "account_profile",
+            "title",
+            "post_page_url",
+            "publish_time",
+            "engagement_metrics",
+            "content_text",
+            "media_urls",
+          ],
+        },
+      },
+    })}\n`,
+  );
+  const preparedProfileCollection = await reader.waitFor(
+    (message) => message.id === 151,
+  );
+  const profileCollectionPlan =
+    preparedProfileCollection.result.structuredContent.plan;
+  assert.equal(
+    preparedProfileCollection.result.structuredContent.collectionStarted,
+    false,
+  );
+  assert.equal(profileCollectionPlan.status, "awaiting_confirmation");
+  assert.equal(profileCollectionPlan.intent.contentType, "video");
+  assert.equal(profileCollectionPlan.collectionScope.detailTargetLimit, 3);
+  assert.equal(profileCollectionPlan.browserActions.maximumDetailPageVisits, 3);
+  assert.equal(profileCollectionPlan.riskNotice.level, "normal");
+  assert.equal(profileCollectionPlan.riskNotice.label, "普通确认");
+  assert.equal(profileCollectionPlan.riskNotice.warnings.length, 0);
+  assert.match(profileCollectionPlan.confirmation.prompt, /确认后才会开始采集/);
+  assert.equal(collectionPlanTaskStarts, 0);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1511,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "完整采集这个账号约 372 条作品的基础清单",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-plan-test",
+          purpose: "full_collection",
+          contentType: "all",
+          coverage: "all_available",
+          maxItems: 372,
+          requestedFields: ["title", "post_page_url"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedLargeProfileCollection = await reader.waitFor(
+    (message) => message.id === 1511,
+  );
+  const largeProfileCollectionPlan =
+    preparedLargeProfileCollection.result.structuredContent.plan;
+  assert.deepEqual(largeProfileCollectionPlan.browserActions.scanBatches, [
+    300,
+    72,
+  ]);
+  assert.equal(largeProfileCollectionPlan.intent.operationMode, "full_archive");
+  assert.equal(largeProfileCollectionPlan.archive.enabled, true);
+  assert.equal(largeProfileCollectionPlan.archive.failureRetryPasses, 1);
+  assert.equal(
+    largeProfileCollectionPlan.archive.fullRecordQuery.arguments.filters
+      .contentType,
+    "all",
+  );
+  assert.equal(largeProfileCollectionPlan.recommendation.requestedCount, 372);
+  assert.equal(largeProfileCollectionPlan.recommendation.userScopePreserved, true);
+  assert.equal(largeProfileCollectionPlan.riskNotice.level, "yellow");
+  assert.equal(largeProfileCollectionPlan.riskNotice.label, "黄色风险提示");
+  assert.match(
+    largeProfileCollectionPlan.confirmation.prompt,
+    /300 \+ 72/,
+  );
+  assert.equal(collectionPlanTaskStarts, 0);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1513,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "采集 372 条作品用于账号内容分析",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-plan-test",
+          purpose: "account_analysis",
+          contentType: "all",
+          coverage: "all_available",
+          maxItems: 372,
+          requestedFields: ["title", "post_page_url", "engagement_metrics"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedAnalysisCollection = await reader.waitFor(
+    (message) => message.id === 1513,
+  );
+  const analysisCollectionPlan =
+    preparedAnalysisCollection.result.structuredContent.plan;
+  assert.equal(analysisCollectionPlan.recommendation.recommendedCount, 50);
+  assert.equal(analysisCollectionPlan.recommendation.followsRecommendation, false);
+  assert.equal(analysisCollectionPlan.recommendation.userScopePreserved, true);
+  assert.equal(analysisCollectionPlan.riskNotice.level, "yellow");
+  assert.equal(analysisCollectionPlan.riskNotice.changesRequestedScope, false);
+  assert.match(
+    analysisCollectionPlan.confirmation.prompt,
+    /建议先采 50 条.*仍按 372 条执行/,
+  );
+  assert.equal(collectionPlanTaskStarts, 0);
+
+  for (const riskCase of [
+    {
+      id: 1514,
+      maxItems: 21,
+      commentsPerItemLimit: undefined,
+      requestedFields: ["title", "content_text"],
+      expectedLevel: "yellow",
+      expectedWarning: /21 个详情页/,
+    },
+    {
+      id: 1515,
+      maxItems: 20,
+      commentsPerItemLimit: 300,
+      requestedFields: ["title", "comments"],
+      expectedLevel: "red",
+      expectedWarning: /6000 条评论/,
+    },
+    {
+      id: 1516,
+      maxItems: 1001,
+      commentsPerItemLimit: undefined,
+      requestedFields: ["title", "post_page_url"],
+      expectedLevel: "red",
+      expectedWarning: /超过 15 分钟 1000 条/,
+    },
+  ]) {
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: riskCase.id,
+        method: "tools/call",
+        params: {
+          name: "mediaclaw_prepare_profile_collection",
+          arguments: {
+            userGoal: "验证账号采集风险分级",
+            profileUrl:
+              "https://www.xiaohongshu.com/user/profile/collection-risk-test",
+            purpose: "full_collection",
+            contentType: "all",
+            coverage: "all_available",
+            maxItems: riskCase.maxItems,
+            ...(riskCase.commentsPerItemLimit
+              ? {commentsPerItemLimit: riskCase.commentsPerItemLimit}
+              : {}),
+            requestedFields: riskCase.requestedFields,
+          },
+        },
+      })}\n`,
+    );
+    const preparedRiskCollection = await reader.waitFor(
+      (message) => message.id === riskCase.id,
+    );
+    const riskPlan = preparedRiskCollection.result.structuredContent.plan;
+    assert.equal(riskPlan.riskNotice.level, riskCase.expectedLevel);
+    assert.match(
+      riskPlan.riskNotice.warnings.join("；"),
+      riskCase.expectedWarning,
+    );
+    assert.equal(
+      preparedRiskCollection.result.structuredContent.collectionStarted,
+      false,
+    );
+  }
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 152,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: profileCollectionPlan.planId},
+      },
+    })}\n`,
+  );
+  const confirmedProfileCollection = await reader.waitFor(
+    (message) => message.id === 152,
+  );
+  const profileCollectionResult =
+    confirmedProfileCollection.result.structuredContent.result;
+  assert.equal(
+    confirmedProfileCollection.result.structuredContent.task.ttl,
+    7 * 24 * 60 * 60 * 1000,
+  );
+  assert.equal(profileCollectionResult.workflow, "profile_collection");
+  assert.equal(profileCollectionResult.goalStatus, "completed");
+  assert.equal(profileCollectionResult.coverage.actualScannedCount, 3);
+  assert.equal(profileCollectionResult.coverage.matchedCount, 2);
+  assert.equal(profileCollectionResult.coverage.detailRequestedCount, 2);
+  assert.equal(profileCollectionResult.coverage.detailSuccessCount, 2);
+  assert.equal(profileCollectionResult.records.length, 2);
+  assert.match(profileCollectionResult.archiveJobId, /^archive_/);
+  assert.equal(
+    profileCollectionResult.archive.archiveJobId,
+    profileCollectionResult.archiveJobId,
+  );
+  assert.equal(profileCollectionResult.archive.taskRetentionDays, 7);
+  assert.equal(profileCollectionResult.archive.storedRecordCount, 2);
+  assert.equal(
+    profileCollectionResult.archive.fullRecordQuery.arguments.filters
+      .contentType,
+    "video",
+  );
+  assert.equal(
+    profileCollectionResult.archive.fullRecordRead.tool,
+    "mediaclaw_get_asset",
+  );
+  assert.deepEqual(
+    profileCollectionResult.executionLog.map((step) => step.id),
+    [
+      "profile_info",
+      "profile_inventory",
+      "content_filter",
+      "detail_enhancement",
+      "coverage_audit",
+    ],
+  );
+  assert.equal(collectionPlanTaskStarts, 3);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 153,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: profileCollectionPlan.planId},
+      },
+    })}\n`,
+  );
+  const reusedProfileCollectionPlan = await reader.waitFor(
+    (message) => message.id === 153,
+  );
+  assert.equal(
+    reusedProfileCollectionPlan.result.structuredContent.error.code,
+    "PROFILE_COLLECTION_PLAN_ALREADY_USED",
+  );
+  assert.equal(collectionPlanTaskStarts, 3);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1512,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: largeProfileCollectionPlan.planId},
+      },
+    })}\n`,
+  );
+  const confirmedLargeProfileCollection = await reader.waitFor(
+    (message) => message.id === 1512,
+  );
+  const largeProfileCollectionResult =
+    confirmedLargeProfileCollection.result.structuredContent.result;
+  assert.equal(largeProfileCollectionResult.goalStatus, "completed");
+  assert.equal(largeProfileCollectionResult.coverage.requestedScanCount, 372);
+  assert.equal(largeProfileCollectionResult.coverage.scanBatchCount, 2);
+  assert.deepEqual(
+    largeProfileCollectionResult.executionLog[0].batches.map(
+      (batch) => batch.requestedCount,
+    ),
+    [300, 72],
+  );
+  assert.equal(collectionPlanTaskStarts, 5);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 154,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "采集这条视频详情并保留失败原因",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-failure-test",
+          purpose: "full_collection",
+          contentType: "video",
+          coverage: "all_available",
+          maxItems: 1,
+          requestedFields: ["title", "post_page_url", "content_text"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedFailureCollection = await reader.waitFor(
+    (message) => message.id === 154,
+  );
+  const failurePlanId =
+    preparedFailureCollection.result.structuredContent.plan.planId;
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 155,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: failurePlanId},
+      },
+    })}\n`,
+  );
+  const failedDetailCollection = await reader.waitFor(
+    (message) => message.id === 155,
+  );
+  const failedDetailResult =
+    failedDetailCollection.result.structuredContent.result;
+  assert.equal(failedDetailResult.goalStatus, "partial");
+  assert.equal(failedDetailResult.coverage.detailFailedCount, 1);
+  assert.equal(
+    failedDetailResult.failureSummary.detailItems[0].classification,
+    "page_load_or_parse_failure",
+  );
+  assert.equal(failedDetailResult.failureSummary.quantityLimitFailureCount, 0);
+  assert.equal(failedDetailResult.retrySummary.detail.attemptedPasses, 1);
+  assert.equal(failedDetailResult.retrySummary.detail.unresolvedRecordCount, 1);
+  assert.equal(permanentDetailAttempts, 2);
+  assert.match(failedDetailResult.limitations.join("；"), /不属于数量上限/);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 156,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "完整归档这条视频，详情失败时自动重试，并采集 45 条评论",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-retry-test",
+          purpose: "full_collection",
+          contentType: "video",
+          coverage: "all_available",
+          maxItems: 1,
+          commentsPerItemLimit: 45,
+          requestedFields: [
+            "title",
+            "post_page_url",
+            "content_text",
+            "comments",
+          ],
+        },
+      },
+    })}\n`,
+  );
+  const preparedRetryCollection = await reader.waitFor(
+    (message) => message.id === 156,
+  );
+  const retryPlanId =
+    preparedRetryCollection.result.structuredContent.plan.planId;
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 157,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: retryPlanId},
+      },
+    })}\n`,
+  );
+  const retriedDetailCollection = await reader.waitFor(
+    (message) => message.id === 157,
+  );
+  const retriedDetailResult =
+    retriedDetailCollection.result.structuredContent.result;
+  assert.equal(retriedDetailResult.goalStatus, "completed");
+  assert.equal(retriedDetailResult.coverage.detailSuccessCount, 1);
+  assert.equal(retriedDetailResult.coverage.detailFailedCount, 0);
+  assert.equal(retriedDetailResult.retrySummary.detail.attemptedPasses, 1);
+  assert.equal(retriedDetailResult.retrySummary.detail.recoveredRecordCount, 1);
+  assert.equal(retriedDetailResult.failureSummary.detailItems.length, 0);
+  assert.equal(transientDetailAttempts, 2);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 158,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "完整归档账号基础清单，主页加载失败时继续重试",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-scan-retry-test",
+          purpose: "full_collection",
+          contentType: "all",
+          coverage: "all_available",
+          maxItems: 1,
+          requestedFields: ["title", "post_page_url"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedScanRetryCollection = await reader.waitFor(
+    (message) => message.id === 158,
+  );
+  const scanRetryPlanId =
+    preparedScanRetryCollection.result.structuredContent.plan.planId;
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 159,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: scanRetryPlanId},
+      },
+    })}\n`,
+  );
+  const retriedScanCollection = await reader.waitFor(
+    (message) => message.id === 159,
+  );
+  const retriedScanResult =
+    retriedScanCollection.result.structuredContent.result;
+  assert.equal(retriedScanResult.goalStatus, "completed");
+  assert.equal(retriedScanResult.coverage.actualScannedCount, 1);
+  assert.equal(retriedScanResult.retrySummary.scan.attemptedPasses, 1);
+  assert.equal(retriedScanResult.retrySummary.scan.recoveredBatchCount, 1);
+  assert.equal(retriedScanResult.failureSummary.scanBatches.length, 0);
+  assert.equal(transientScanAttempts, 2);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1591,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "归档 101 条视频详情，详情页验证码时暂停",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-detail-captcha-test",
+          purpose: "full_collection",
+          contentType: "video",
+          coverage: "all_available",
+          maxItems: 101,
+          failureRetryPasses: 2,
+          requestedFields: ["title", "post_page_url", "content_text"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedDetailCaptchaCollection = await reader.waitFor(
+    (message) => message.id === 1591,
+  );
+  assert.equal(
+    preparedDetailCaptchaCollection.result.structuredContent.plan.riskNotice
+      .level,
+    "red",
+  );
+  const detailCaptchaPlanId =
+    preparedDetailCaptchaCollection.result.structuredContent.plan.planId;
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1592,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: detailCaptchaPlanId},
+      },
+    })}\n`,
+  );
+  const pausedDetailCaptchaCollection = await reader.waitFor(
+    (message) => message.id === 1592,
+  );
+  const pausedDetailCaptchaPayload =
+    pausedDetailCaptchaCollection.result.structuredContent;
+  assert.equal(pausedDetailCaptchaPayload.task.status, "input_required");
+  assert.equal(
+    pausedDetailCaptchaPayload.result.executionInterruption.stage,
+    "detail_enhancement",
+  );
+  assert.equal(
+    pausedDetailCaptchaPayload.result.coverage.detailAttemptedCount,
+    100,
+  );
+  assert.equal(
+    pausedDetailCaptchaPayload.result.coverage.detailFailedCount,
+    100,
+  );
+  assert.equal(
+    pausedDetailCaptchaPayload.result.coverage.detailUnattemptedCount,
+    1,
+  );
+  assert.equal(detailCaptchaAttempts, 1);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 160,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "完整归档账号基础清单，验证码时暂停等待处理",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-captcha-test",
+          purpose: "full_collection",
+          contentType: "all",
+          coverage: "all_available",
+          maxItems: 1,
+          failureRetryPasses: 2,
+          requestedFields: ["title", "post_page_url"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedCaptchaCollection = await reader.waitFor(
+    (message) => message.id === 160,
+  );
+  const captchaPlanId =
+    preparedCaptchaCollection.result.structuredContent.plan.planId;
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 161,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {planId: captchaPlanId},
+      },
+    })}\n`,
+  );
+  const pausedCaptchaCollection = await reader.waitFor(
+    (message) => message.id === 161,
+  );
+  const pausedCaptchaPayload =
+    pausedCaptchaCollection.result.structuredContent;
+  assert.equal(pausedCaptchaPayload.task.status, "input_required");
+  assert.equal(pausedCaptchaPayload.result.goalStatus, "paused_for_user_action");
+  assert.equal(
+    pausedCaptchaPayload.result.nextAction.action,
+    "complete_browser_verification",
+  );
+  assert.equal(
+    pausedCaptchaPayload.result.nextAction.preservesCompletedRecords,
+    true,
+  );
+  assert.equal(
+    pausedCaptchaPayload.result.nextAction.doesNotMeanUnsupported,
+    true,
+  );
+  assert.doesNotMatch(pausedCaptchaPayload.task.statusMessage, /做不了/);
+  assert.match(pausedCaptchaPayload.task.statusMessage, /采集已暂停/);
+  assert.equal(captchaScanAttempts, 1);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 162,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "验证码处理后继续采集另一个小范围账号",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-after-captcha-test",
+          purpose: "full_collection",
+          contentType: "all",
+          coverage: "all_available",
+          maxItems: 1,
+          requestedFields: ["title", "post_page_url"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedAfterCaptcha = await reader.waitFor(
+    (message) => message.id === 162,
+  );
+  const afterCaptchaRisk =
+    preparedAfterCaptcha.result.structuredContent.plan.riskNotice;
+  assert.equal(afterCaptchaRisk.level, "red");
+  assert.equal(afterCaptchaRisk.recentSignals.length > 0, true);
+  assert.match(afterCaptchaRisk.warnings.join("；"), /近期.*验证码/);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 163,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "平台冷却时暂停并告诉我何时继续",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-cooldown-test",
+          purpose: "full_collection",
+          contentType: "all",
+          coverage: "all_available",
+          maxItems: 1,
+          failureRetryPasses: 2,
+          requestedFields: ["title", "post_page_url"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedCooldownCollection = await reader.waitFor(
+    (message) => message.id === 163,
+  );
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 164,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {
+          planId:
+            preparedCooldownCollection.result.structuredContent.plan.planId,
+        },
+      },
+    })}\n`,
+  );
+  const pausedCooldownCollection = await reader.waitFor(
+    (message) => message.id === 164,
+  );
+  const pausedCooldownPayload =
+    pausedCooldownCollection.result.structuredContent;
+  assert.equal(pausedCooldownPayload.task.status, "input_required");
+  assert.equal(
+    pausedCooldownPayload.result.nextAction.action,
+    "wait_for_platform_cooldown",
+  );
+  assert.equal(
+    pausedCooldownPayload.result.nextAction.nextAllowedAt,
+    "2099-01-01T00:00:00.000Z",
+  );
+  assert.match(pausedCooldownPayload.task.statusMessage, /不表示插件做不了/);
+  assert.equal(cooldownScanAttempts, 1);
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 165,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_profile_collection",
+        arguments: {
+          userGoal: "登录失效时暂停并保留已完成数据",
+          profileUrl:
+            "https://www.xiaohongshu.com/user/profile/collection-login-test",
+          purpose: "full_collection",
+          contentType: "all",
+          coverage: "all_available",
+          maxItems: 1,
+          failureRetryPasses: 2,
+          requestedFields: ["title", "post_page_url"],
+        },
+      },
+    })}\n`,
+  );
+  const preparedLoginCollection = await reader.waitFor(
+    (message) => message.id === 165,
+  );
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 166,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_confirm_profile_collection",
+        arguments: {
+          planId: preparedLoginCollection.result.structuredContent.plan.planId,
+        },
+      },
+    })}\n`,
+  );
+  const pausedLoginCollection = await reader.waitFor(
+    (message) => message.id === 166,
+  );
+  const pausedLoginPayload = pausedLoginCollection.result.structuredContent;
+  assert.equal(pausedLoginPayload.task.status, "input_required");
+  assert.equal(
+    pausedLoginPayload.result.nextAction.action,
+    "restore_browser_login",
+  );
+  assert.equal(
+    pausedLoginPayload.result.nextAction.preservesCompletedRecords,
+    true,
+  );
+  assert.match(pausedLoginPayload.task.statusMessage, /恢复账号登录/);
+  assert.equal(loginScanAttempts, 1);
 
   child.stdin.write(
     `${JSON.stringify({
@@ -1725,7 +2965,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(approvedUpdate.result.structuredContent.ok, true);
   assert.equal(
     approvedUpdate.result.structuredContent.agentUpdate.installedVersion,
-    "0.3.1",
+    "0.3.2",
   );
   assert.equal(
     approvedUpdate.result.structuredContent.agentUpdate.oldSessionFenced,
@@ -1980,5 +3220,136 @@ test("shared Broker isolates Codex and WorkBuddy device identities and task resu
   assert.equal(
     crossHostRead.result.structuredContent.error.code,
     "TASK_NOT_FOUND",
+  );
+});
+
+test("local asset tasks expire instead of blocking the queue across restarts", async (t) => {
+  const port = 20000 + Math.floor(Math.random() * 1000);
+  const serverPath = path.resolve("plugins/mediaclaw/scripts/mcp-server.mjs");
+  const agentStateDir = await mkdtemp(
+    path.join(tmpdir(), "mediaclaw-agent-expiry-test-"),
+  );
+  const taskStatePath = path.join(agentStateDir, "tasks-v1.json");
+  const staleAt = new Date(Date.now() - 60_000).toISOString();
+  await writeFile(
+    taskStatePath,
+    JSON.stringify({
+      version: 1,
+      tasks: [
+        {
+          taskId: "capture_legacy_local_asset_read",
+          kind: "capture",
+          status: "running",
+          message: "legacy read",
+          input: {},
+          idempotencyKey: "",
+          captureTask: {
+            mode: "data_pool_assets",
+            options: {
+              operation: "get",
+              assetId: "local.data_pool|capture_record|legacy",
+            },
+          },
+          owner: {
+            hostKey: "codex",
+            deviceId: "legacy-device",
+            displayName: "MediaClaw Agent (Codex)",
+          },
+          progress: null,
+          result: null,
+          error: null,
+          childTaskIds: [],
+          currentChildTaskId: "",
+          createdAt: staleAt,
+          updatedAt: staleAt,
+          ttlMs: 24 * 60 * 60 * 1000,
+        },
+      ],
+    }),
+    "utf8",
+  );
+  t.after(() => rm(agentStateDir, {recursive: true, force: true}));
+
+  const child = spawn(process.execPath, [serverPath], {
+    env: {
+      ...process.env,
+      MEDIACLAW_AGENT_PORT: String(port),
+      MEDIACLAW_AGENT_STATE_DIR: agentStateDir,
+      MEDIACLAW_AGENT_BROKER_IDLE_MS: "5000",
+      MEDIACLAW_LOCAL_ASSET_QUEUE_TIMEOUT_MS: "200",
+      MEDIACLAW_LOCAL_ASSET_EXECUTION_TIMEOUT_MS: "200",
+      MEDIACLAW_TASK_WATCHDOG_INTERVAL_MS: "50",
+      MEDIACLAW_AGENT_UPDATE_MANIFEST_URL:
+        "data:application/json,%5B%7B%22tag_name%22%3A%22v0.3.1%22%2C%22draft%22%3Afalse%7D%5D",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => child.kill("SIGTERM"));
+  const reader = createLineReader(child.stdout);
+  await waitForText(child.stderr, /Adapter connected/);
+
+  const migratedState = await waitForJsonFile(
+    taskStatePath,
+    (value) => value.tasks?.[0]?.status === "failed",
+  );
+  assert.equal(
+    migratedState.tasks[0].error.code,
+    "LEGACY_LOCAL_ASSET_READ_REPLACED",
+  );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {protocolVersion: "2025-11-25"},
+    })}\n`,
+  );
+  await reader.waitFor((message) => message.id === 1);
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_list_assets",
+        arguments: {
+          source: "local.data_pool",
+          type: "capture_record",
+          limit: 5,
+          async: true,
+        },
+      },
+    })}\n`,
+  );
+  const queuedRead = await reader.waitFor((message) => message.id === 2);
+  const queuedTaskId = queuedRead.result.structuredContent.task.taskId;
+  assert.equal(queuedRead.result.structuredContent.task.status, "working");
+  assert.match(
+    queuedRead.result.structuredContent.task.statusMessage,
+    /本地数据库.*不会访问作品页/,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_task_status",
+        arguments: {taskId: queuedTaskId},
+      },
+    })}\n`,
+  );
+  const expiredRead = await reader.waitFor((message) => message.id === 3);
+  assert.equal(expiredRead.result.structuredContent.task.status, "failed");
+  assert.equal(
+    expiredRead.result.structuredContent.error.code,
+    "LOCAL_ASSET_READ_QUEUE_EXPIRED",
+  );
+  assert.match(
+    expiredRead.result.structuredContent.task.statusMessage,
+    /自动终止/,
   );
 });

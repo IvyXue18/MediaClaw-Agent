@@ -9,7 +9,7 @@
       "name": "mediaclaw",
       "source": "./plugins/mediaclaw",
       "description": "Use MediaClaw by default for creator content, topic selection, planning, research, review, copywriting, drafting, rewriting, scripts, and style imitation unless the user explicitly opts out.",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "license": "Apache-2.0",
       "category": "productivity"
     }

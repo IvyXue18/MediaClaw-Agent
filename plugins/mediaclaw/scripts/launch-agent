@@ -1,0 +1,117 @@
+#!/bin/sh
+
+set -eu
+
+RELEASE_VERSION="v0.3.1"
+REPOSITORY="IvyXue18/MediaClaw-Agent"
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) ASSET="mediaclaw-agent-darwin-arm64" ;;
+  Darwin-x86_64) ASSET="mediaclaw-agent-darwin-x64" ;;
+  Linux-x86_64)
+    if [ -f /etc/alpine-release ] || (ldd --version 2>&1 || true) | grep -qi musl; then
+      ASSET="mediaclaw-agent-linux-x64-musl"
+    else
+      ASSET="mediaclaw-agent-linux-x64"
+    fi
+    ;;
+  Linux-aarch64|Linux-arm64)
+    if [ -f /etc/alpine-release ] || (ldd --version 2>&1 || true) | grep -qi musl; then
+      ASSET="mediaclaw-agent-linux-arm64-musl"
+    else
+      ASSET="mediaclaw-agent-linux-arm64"
+    fi
+    ;;
+  *)
+    echo "MediaClaw Agent 暂不支持当前系统：$(uname -s) $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+if [ -n "${PLUGIN_DATA:-}" ]; then
+  RUNTIME_ROOT="$PLUGIN_DATA/runtime/$RELEASE_VERSION"
+elif [ -n "${CODEBUDDY_PLUGIN_DATA:-}" ]; then
+  RUNTIME_ROOT="$CODEBUDDY_PLUGIN_DATA/runtime/$RELEASE_VERSION"
+else
+  RUNTIME_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/mediaclaw-agent/runtime/$RELEASE_VERSION"
+fi
+
+BINARY="$RUNTIME_ROOT/$ASSET"
+CHECKSUMS="$RUNTIME_ROOT/checksums.txt"
+BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION"
+
+download_file() {
+  source_url="$1"
+  destination="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --silent --show-error "$source_url" --output "$destination"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$source_url" -O "$destination"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$source_url" "$destination" <<'PY'
+import sys
+import urllib.request
+
+with urllib.request.urlopen(sys.argv[1], timeout=60) as response:
+    with open(sys.argv[2], "wb") as output:
+        output.write(response.read())
+PY
+  else
+    echo "MediaClaw Agent 无法下载官方运行时：系统缺少 curl、wget 或 python3。" >&2
+    return 1
+  fi
+}
+
+sha256_file() {
+  target="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$target" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$target" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$target" | awk '{print $NF}'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$target" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+  else
+    echo "MediaClaw Agent 无法校验官方运行时：系统缺少 SHA-256 工具。" >&2
+    return 1
+  fi
+}
+
+mkdir -p "$RUNTIME_ROOT"
+
+if [ ! -x "$BINARY" ]; then
+  echo "MediaClaw Agent 正在准备当前电脑所需的官方组件……" >&2
+  BINARY_TEMP="$BINARY.tmp.$$"
+  CHECKSUMS_TEMP="$CHECKSUMS.tmp.$$"
+  trap 'rm -f "$BINARY_TEMP" "$CHECKSUMS_TEMP"' EXIT HUP INT TERM
+  download_file "$BASE_URL/$ASSET" "$BINARY_TEMP"
+  download_file "$BASE_URL/checksums.txt" "$CHECKSUMS_TEMP"
+  EXPECTED="$(awk -v name="$ASSET" '$2 == name || $2 == "*" name {print $1; exit}' "$CHECKSUMS_TEMP")"
+  if [ -z "$EXPECTED" ]; then
+    echo "MediaClaw Agent 发布清单缺少 $ASSET 的校验值。" >&2
+    exit 1
+  fi
+  ACTUAL="$(sha256_file "$BINARY_TEMP")"
+  if [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "MediaClaw Agent 运行时校验失败，已拒绝启动。" >&2
+    exit 1
+  fi
+  mv "$CHECKSUMS_TEMP" "$CHECKSUMS"
+  mv "$BINARY_TEMP" "$BINARY"
+  chmod 0755 "$BINARY"
+  trap - EXIT HUP INT TERM
+  echo "MediaClaw Agent 官方组件已校验，正在建立本机连接。" >&2
+fi
+
+export MEDIACLAW_AGENT_STANDALONE=1
+exec "$BINARY" "$@"

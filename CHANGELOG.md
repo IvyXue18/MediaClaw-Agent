@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — Unreleased
+
+- 保持 marketplace 和一条提示词安装入口不变，启动器自动选择当前系统和芯片对应的官方原生运行时。
+- 新增 Windows x64、Windows ARM64 发布产物与原生 CI 冒烟，并继续覆盖 macOS x64/ARM64、Linux glibc/musl x64/ARM64。
+- MCP 不再固定调用 `/bin/bash`；Windows 使用系统自带命令环境，macOS/Linux 使用 POSIX 启动器，普通用户不需要 Node、Bash、WSL 或 Git Bash。
+- 运行时保存在宿主提供的持久插件数据目录，升级后自动准备新版且复用原有设备身份；安装异常时重复同一条提示词即可执行修复，无需卸载。
+- 修复 standalone Broker 的 Bun WebSocket 传输与请求体上限，并在每个原生 runner 上验证 MCP、Broker、浏览器 WebSocket 和平台启动器。
+
 ## 0.3.0 — 2026-08-17
 
 - 首次正式发布 MediaClaw Agent，支持 Codex 与 WorkBuddy 两个宿主。

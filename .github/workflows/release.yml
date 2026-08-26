@@ -11,8 +11,52 @@ permissions:
   attestations: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  verify-source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify source and release version
+        shell: bash
+        run: |
+          npm run check
+          test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+
+  build-and-smoke:
+    needs: verify-source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: bun-darwin-arm64
+            asset: mediaclaw-agent-darwin-arm64
+          - runner: macos-15-intel
+            target: bun-darwin-x64-baseline
+            asset: mediaclaw-agent-darwin-x64
+          - runner: ubuntu-24.04-arm
+            target: bun-linux-arm64
+            asset: mediaclaw-agent-linux-arm64
+          - runner: ubuntu-24.04
+            target: bun-linux-x64-baseline
+            asset: mediaclaw-agent-linux-x64
+          - runner: ubuntu-24.04-arm
+            target: bun-linux-arm64-musl
+            asset: mediaclaw-agent-linux-arm64-musl
+          - runner: ubuntu-24.04
+            target: bun-linux-x64-baseline-musl
+            asset: mediaclaw-agent-linux-x64-musl
+          - runner: windows-11-arm
+            target: bun-windows-arm64
+            asset: mediaclaw-agent-windows-arm64.exe
+          - runner: windows-2025
+            target: bun-windows-x64-baseline
+            asset: mediaclaw-agent-windows-x64.exe
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,31 +65,61 @@ jobs:
           node-version: 22
 
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
 
-      - name: Verify source and release version
-        shell: bash
-        run: |
-          npm run check
-          test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
-
-      - name: Build standalone runtimes
+      - name: Build standalone runtime
         shell: bash
         run: |
           mkdir -p dist
-          bun build --compile --target=bun-darwin-arm64 plugins/mediaclaw/scripts/runtime-entry.mjs --outfile dist/mediaclaw-agent-darwin-arm64
-          bun build --compile --target=bun-darwin-x64 plugins/mediaclaw/scripts/runtime-entry.mjs --outfile dist/mediaclaw-agent-darwin-x64
-          bun build --compile --target=bun-linux-arm64 plugins/mediaclaw/scripts/runtime-entry.mjs --outfile dist/mediaclaw-agent-linux-arm64
-          bun build --compile --target=bun-linux-x64-baseline plugins/mediaclaw/scripts/runtime-entry.mjs --outfile dist/mediaclaw-agent-linux-x64
-          cd dist
-          sha256sum mediaclaw-agent-* > checksums.txt
+          bun build --compile --target=${{ matrix.target }} plugins/mediaclaw/scripts/runtime-entry.mjs --outfile dist/${{ matrix.asset }}
 
-      - name: Smoke test standalone runtime
-        run: node tests/standalone-runtime-smoke.mjs dist/mediaclaw-agent-linux-x64
+      - name: Smoke test MCP and browser WebSocket transport
+        if: ${{ !contains(matrix.asset, 'musl') }}
+        run: node tests/standalone-runtime-smoke.mjs dist/${{ matrix.asset }}
+
+      - name: Smoke test marketplace platform launcher
+        if: ${{ !contains(matrix.asset, 'musl') }}
+        run: node tests/launcher-smoke.mjs dist/${{ matrix.asset }}
+
+      - name: Smoke test Alpine MCP, WebSocket, and platform launcher
+        if: ${{ contains(matrix.asset, 'musl') }}
+        shell: bash
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/work" --workdir /work node:22-alpine \
+            node tests/standalone-runtime-smoke.mjs dist/${{ matrix.asset }}
+          docker run --rm --volume "$GITHUB_WORKSPACE:/work" --workdir /work node:22-alpine \
+            node tests/launcher-smoke.mjs dist/${{ matrix.asset }}
 
       - name: Attest runtime provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: "dist/mediaclaw-agent-*"
+          subject-path: dist/${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build-and-smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum mediaclaw-agent-* > checksums.txt
+
+      - name: Create platform runtime manifest
+        run: node scripts/create-runtime-manifest.mjs dist/runtime-manifest.json
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -55,3 +129,4 @@ jobs:
           files: |
             dist/mediaclaw-agent-*
             dist/checksums.txt
+            dist/runtime-manifest.json

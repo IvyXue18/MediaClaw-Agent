@@ -26,7 +26,13 @@ function waitForText(stream, pattern, timeoutMs = 5_000) {
   });
 }
 
-async function startBroker({port, stateDirectory, cancelTimeoutMs = 1_000}) {
+async function startBroker({
+  port,
+  stateDirectory,
+  cancelTimeoutMs = 1_000,
+  captureStartAckTimeoutMs = 45_000,
+  watchdogIntervalMs = 5_000,
+}) {
   const child = spawn(
     process.execPath,
     [path.resolve("plugins/mediaclaw/scripts/broker-server.mjs")],
@@ -36,6 +42,10 @@ async function startBroker({port, stateDirectory, cancelTimeoutMs = 1_000}) {
         MEDIACLAW_AGENT_PORT: String(port),
         MEDIACLAW_AGENT_STATE_DIR: stateDirectory,
         MEDIACLAW_AGENT_CANCEL_TIMEOUT_MS: String(cancelTimeoutMs),
+        MEDIACLAW_CAPTURE_START_ACK_TIMEOUT_MS: String(
+          captureStartAckTimeoutMs,
+        ),
+        MEDIACLAW_TASK_WATCHDOG_INTERVAL_MS: String(watchdogIntervalMs),
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -43,6 +53,78 @@ async function startBroker({port, stateDirectory, cancelTimeoutMs = 1_000}) {
   await waitForText(child.stderr, /shared Agent Broker listening/);
   return child;
 }
+
+test("an unacknowledged extension task expires and releases the next task", async (t) => {
+  const port = 20500 + Math.floor(Math.random() * 400);
+  const stateDirectory = await mkdtemp(path.join(tmpdir(), "mediaclaw-start-ack-"));
+  const broker = await startBroker({
+    port,
+    stateDirectory,
+    captureStartAckTimeoutMs: 100,
+    watchdogIntervalMs: 20,
+  });
+  t.after(async () => {
+    await stopChild(broker);
+    await rm(stateDirectory, {recursive: true, force: true});
+  });
+  const registration = await registerAdapter(port);
+  const extension = await connectExtension(port, registration.device.deviceId);
+  t.after(() => extension.socket.close());
+
+  const first = await callTool(
+    port,
+    registration.token,
+    "mediaclaw_capture_search_basic",
+    {keyword: "启动不确认", limit: 1, async: true},
+  );
+  const firstTaskId = first.structuredContent.taskId;
+  await extension.waitFor(
+    (message) => message.type === "task.start" && message.taskId === firstTaskId,
+  );
+
+  const second = await callTool(
+    port,
+    registration.token,
+    "mediaclaw_capture_search_basic",
+    {keyword: "队列继续", limit: 1, async: true},
+  );
+  const secondTaskId = second.structuredContent.taskId;
+  const secondStart = await extension.waitFor(
+    (message) => message.type === "task.start" && message.taskId === secondTaskId,
+    3_000,
+  );
+
+  const expired = await callTool(
+    port,
+    registration.token,
+    "mediaclaw_task_status",
+    {taskId: firstTaskId},
+  );
+  assert.equal(expired.structuredContent.task.status, "failed");
+  assert.equal(
+    expired.structuredContent.error.code,
+    "EXTENSION_TASK_START_TIMEOUT",
+  );
+  assert.match(expired.structuredContent.task.statusMessage, /自动终止.*释放队列/);
+
+  extension.socket.send(JSON.stringify({
+    type: "task.progress",
+    taskId: secondTaskId,
+    deviceId: secondStart.deviceId,
+    progress: {
+      status: "running",
+      stage: "capture",
+      message: "第二个任务已开始",
+      updatedAt: new Date().toISOString(),
+    },
+  }));
+  extension.socket.send(JSON.stringify({
+    type: "task.result",
+    taskId: secondTaskId,
+    deviceId: secondStart.deviceId,
+    response: {ok: true, data: {records: []}},
+  }));
+});
 
 async function stopChild(child) {
   if (!child || child.exitCode !== null) return;

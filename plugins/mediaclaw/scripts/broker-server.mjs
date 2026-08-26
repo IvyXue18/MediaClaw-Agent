@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {AsyncLocalStorage} from "node:async_hooks";
 import METHOD_REGISTRY from "../contracts/methods-v1.json" with {type: "json"};
+import MCP_CONTRACT from "../contracts/mcp-v1.json" with {type: "json"};
 import {compareVersions} from "./agent-update.mjs";
 import {createLoopbackWebSocketServer} from "./websocket-server.mjs";
 import {
@@ -14,14 +15,31 @@ import {
 } from "./device-identity.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-broker";
-const SERVER_VERSION = "0.3.0";
-const PROTOCOL_VERSION = "3";
+const SERVER_VERSION = MCP_CONTRACT.serverVersion;
+const PROTOCOL_VERSION = MCP_CONTRACT.protocolVersion;
 const DEFAULT_PORT = Number(process.env.MEDIACLAW_AGENT_PORT || 17373);
 const DEFAULT_SCAN_LIMIT = 80;
 const MAX_SCAN_LIMIT = 300;
 const DEFAULT_KEYWORD_EXPANSION_QUERY_LIMIT = 27;
 const TASK_TTL_MS = 24 * 60 * 60 * 1000;
+const PROFILE_ARCHIVE_JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const LEGACY_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+const LOCAL_ASSET_QUEUE_TIMEOUT_MS = Math.max(
+  100,
+  Number(process.env.MEDIACLAW_LOCAL_ASSET_QUEUE_TIMEOUT_MS || 5 * 60_000),
+);
+const LOCAL_ASSET_EXECUTION_TIMEOUT_MS = Math.max(
+  100,
+  Number(process.env.MEDIACLAW_LOCAL_ASSET_EXECUTION_TIMEOUT_MS || 2 * 60_000),
+);
+const TASK_WATCHDOG_INTERVAL_MS = Math.max(
+  50,
+  Number(process.env.MEDIACLAW_TASK_WATCHDOG_INTERVAL_MS || 5_000),
+);
+const CAPTURE_START_ACK_TIMEOUT_MS = Math.max(
+  100,
+  Number(process.env.MEDIACLAW_CAPTURE_START_ACK_TIMEOUT_MS || 45_000),
+);
 const BRIDGE_HTTP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORT}`;
 const BRIDGE_RPC_BODY_LIMIT_BYTES = 1024 * 1024;
 const ADAPTER_TTL_MS = Number(
@@ -35,6 +53,7 @@ const BROKER_IDLE_TIMEOUT_MS = Number(
 );
 const MAX_RESULT_TRANSFER_CHUNKS = 1024;
 const MAX_RESULT_TRANSFER_CHARS = 32 * 1024 * 1024;
+const PROFILE_COLLECTION_PLAN_TTL_MS = 15 * 60 * 1000;
 const TASK_CANCEL_TIMEOUT_MS = Math.max(
   100,
   Number(process.env.MEDIACLAW_AGENT_CANCEL_TIMEOUT_MS || 10_000),
@@ -122,6 +141,64 @@ const METHOD_BY_ID = new Map(
   METHOD_REGISTRY.methods.map((method) => [method.id, method]),
 );
 const MAX_DEEP_COLLECT_LIMIT = 100;
+const MAX_TRANSCRIPT_QUOTE_ITEMS = 20;
+const MAX_PROFILE_COLLECTION_PLAN_ITEMS = 10_000;
+const MAX_PROFILE_ARCHIVE_RESULT_PREVIEW = 20;
+const DEFAULT_PROFILE_ARCHIVE_RETRY_PASSES = 1;
+const MAX_PROFILE_ARCHIVE_RETRY_PASSES = 2;
+const PROFILE_DETAIL_YELLOW_THRESHOLD = 20;
+const PROFILE_DETAIL_RED_THRESHOLD = 100;
+const PROFILE_COMMENT_RED_TOTAL_THRESHOLD = 5_000;
+const PROFILE_RECENT_RISK_SIGNAL_WINDOW_MS = 30 * 60 * 1000;
+const PROFILE_COLLECTION_PURPOSES = Object.freeze({
+  full_collection: Object.freeze({
+    label: "完整归档或导出",
+    recommendation: "requested_scope",
+    rationale: "完整性就是目标，应按主页已知或估算总量制定分批方案。",
+  }),
+  inventory_export: Object.freeze({
+    label: "作品清单或链接导出",
+    recommendation: 80,
+    rationale: "80 条通常足以先验证字段和导出格式，再决定是否覆盖完整主页。",
+  }),
+  account_analysis: Object.freeze({
+    label: "账号内容与风格分析",
+    recommendation: 50,
+    rationale: "账号分析最多使用 50 条作品，继续增加基础列表通常不会提高分析输入覆盖。",
+  }),
+  representative_research: Object.freeze({
+    label: "代表作品与内容机制研究",
+    recommendation: 20,
+    rationale: "优先补齐 20 条代表作品详情，通常比机械打开全部详情更适合解释内容机制。",
+  }),
+});
+const PROFILE_COLLECTION_BASIC_FIELDS = Object.freeze([
+  "title",
+  "post_page_url",
+  "cover",
+  "publish_time",
+  "engagement_metrics",
+]);
+const PROFILE_COLLECTION_DETAIL_FIELDS = Object.freeze([
+  "content_text",
+  "media_urls",
+  "comments",
+  "blogger_metrics",
+  "video_transcript",
+]);
+const PROFILE_COLLECTION_FIELD_LABELS = Object.freeze({
+  account_profile: "账号主页信息",
+  title: "作品标题",
+  post_page_url: "作品详情页链接",
+  cover: "封面",
+  publish_time: "发布时间",
+  engagement_metrics: "点赞、收藏、评论等互动数据",
+  content_text: "作品正文",
+  media_urls: "详情页可获取的图片或视频媒体地址",
+  comments: "作品评论",
+  blogger_metrics: "详情页可获取的博主指标",
+  video_transcript: "视频逐字稿（另需报价确认）",
+});
 const AGENT_DEEP_CAPTURE_UPGRADE = Object.freeze({
   featureKey: "capture.enhancement",
   requiresCredential: true,
@@ -147,6 +224,7 @@ const tasks = new Map();
 const idempotentTaskIds = new Map();
 const resultTransfers = new Map();
 const pendingTaskCancellations = new Map();
+const profileCollectionPlans = new Map();
 const TASK_STATE_PATH = path.join(BROKER_STATE_DIRECTORY, "tasks-v1.json");
 let taskStateWrite = Promise.resolve();
 let extensionPeer = null;
@@ -473,6 +551,678 @@ function normalizeText(value, max = 1000) {
   return text.length > max ? text.slice(0, max) : text;
 }
 
+function normalizeProfileCollectionPlatform(value, profileUrl = "") {
+  const requested = normalizeText(value, 80).toLowerCase();
+  if (requested) return normalizePlatform(requested);
+  const url = normalizeText(profileUrl);
+  if (/douyin\.com/i.test(url)) return "douyin";
+  if (/xiaohongshu\.com|xhslink\.com/i.test(url)) return "xiaohongshu";
+  throw new Error("无法从主页链接识别平台，请先明确是小红书还是抖音");
+}
+
+function normalizeProfileCollectionFields(value) {
+  const allowed = new Set([
+    "account_profile",
+    ...PROFILE_COLLECTION_BASIC_FIELDS,
+    ...PROFILE_COLLECTION_DETAIL_FIELDS,
+  ]);
+  const fields = [
+    ...new Set(
+      (Array.isArray(value) ? value : [])
+        .map((item) => normalizeText(item, 80).toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+  if (fields.length === 0) {
+    throw new Error("requestedFields 不能为空；请先明确用户要获取哪些数据");
+  }
+  const unknown = fields.filter((field) => !allowed.has(field));
+  if (unknown.length > 0) {
+    throw new Error(`不支持的数据字段：${unknown.join(", ")}`);
+  }
+  return fields;
+}
+
+function normalizeProfileCollectionCount(value, fallback = DEFAULT_SCAN_LIMIT) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    return Math.max(1, Math.floor(Number(fallback) || DEFAULT_SCAN_LIMIT));
+  }
+  if (number > MAX_PROFILE_COLLECTION_PLAN_ITEMS) {
+    throw new Error(
+      `单个一次性方案最多声明 ${MAX_PROFILE_COLLECTION_PLAN_ITEMS} 条；更大的目标需要拆成多个可审计方案，不能静默截断`,
+    );
+  }
+  return Math.max(1, Math.floor(number));
+}
+
+function splitProfileCollectionBatches(total, batchLimit) {
+  const batches = [];
+  let remaining = normalizeProfileCollectionCount(total, 1);
+  while (remaining > 0) {
+    const count = Math.min(batchLimit, remaining);
+    batches.push(count);
+    remaining -= count;
+  }
+  return batches;
+}
+
+function profileCollectionRecommendation(purpose, requestedCount) {
+  const policy = PROFILE_COLLECTION_PURPOSES[purpose];
+  const recommendedCount =
+    policy.recommendation === "requested_scope"
+      ? requestedCount
+      : Math.min(requestedCount, policy.recommendation);
+  return {
+    purpose,
+    purposeLabel: policy.label,
+    requestedCount,
+    recommendedCount,
+    followsRecommendation: requestedCount <= recommendedCount,
+    userScopePreserved: true,
+    rationale: policy.rationale,
+    decision:
+      requestedCount > recommendedCount
+        ? "用户目标超过建议样本量；确认后仍按用户要求的完整范围执行"
+        : "用户目标处于建议范围内",
+  };
+}
+
+function profileCollectionRiskLevel({
+  requestedCount,
+  recommendedCount,
+  requiresDetail,
+  scanBatchCount,
+  estimatedCommentCount,
+  recentRiskSignalCount,
+}) {
+  if (
+    requestedCount > 1000 ||
+    (requiresDetail && requestedCount > PROFILE_DETAIL_RED_THRESHOLD) ||
+    estimatedCommentCount > PROFILE_COMMENT_RED_TOTAL_THRESHOLD ||
+    recentRiskSignalCount > 0
+  ) {
+    return "red";
+  }
+  if (
+    requestedCount > recommendedCount ||
+    scanBatchCount > 1 ||
+    (requiresDetail && requestedCount > PROFILE_DETAIL_YELLOW_THRESHOLD)
+  ) {
+    return "yellow";
+  }
+  return "normal";
+}
+
+function recentProfileCollectionRiskSignals(adapter, platform) {
+  const ownerDeviceId = profileCollectionPlanOwner(adapter);
+  const cutoff = Date.now() - PROFILE_RECENT_RISK_SIGNAL_WINDOW_MS;
+  const signalsByKey = new Map();
+  for (const task of tasks.values()) {
+    if (task?.owner?.deviceId !== ownerDeviceId) continue;
+    const updatedAtMs = Date.parse(String(task.updatedAt || ""));
+    if (!Number.isFinite(updatedAtMs) || updatedAtMs <= cutoff) continue;
+    const rawTaskPlatform =
+      task.captureTask?.platform || task.input?.platform || "";
+    const taskPlatform = rawTaskPlatform
+      ? normalizePlatform(rawTaskPlatform)
+      : "";
+    if (taskPlatform && platform && taskPlatform !== platform) continue;
+    const candidates = [
+      task.error,
+      task.result?.error,
+      task.result?.executionInterruption?.error,
+      task.result?.failureSummary?.profile?.error,
+      ...(task.result?.failureSummary?.scanBatches || []).map(
+        (item) => item.error,
+      ),
+      ...(task.result?.failureSummary?.detailItems || []).map(
+        (item) => item.error,
+      ),
+    ].filter(Boolean);
+    for (const error of candidates) {
+      const classification = classifyProfileCollectionFailure(error);
+      if (
+        !["platform_cooldown", "user_action_required"].includes(
+          classification,
+        )
+      ) {
+        continue;
+      }
+      const code = normalizeText(error?.code || error?.reason, 160);
+      const signalKey = `${classification}:${code}`;
+      const signal = {
+        classification,
+        code,
+        occurredAt: task.updatedAt,
+        message:
+          classification === "platform_cooldown"
+            ? "近期同一设备和平台出现过限频或冷却"
+            : "近期同一设备和平台出现过登录或验证码校验",
+      };
+      const existing = signalsByKey.get(signalKey);
+      if (
+        !existing ||
+        Date.parse(String(signal.occurredAt || "")) >
+          Date.parse(String(existing.occurredAt || ""))
+      ) {
+        signalsByKey.set(signalKey, signal);
+      }
+    }
+  }
+  return [...signalsByKey.values()]
+    .sort(
+      (left, right) =>
+        Date.parse(String(right.occurredAt || "")) -
+        Date.parse(String(left.occurredAt || "")),
+    )
+    .slice(0, 5);
+}
+
+function profileCollectionPlanOwner(adapter) {
+  return normalizeText(adapter?.identity?.deviceId, 160);
+}
+
+function profileCollectionContentLabel(contentType) {
+  if (contentType === "video") return "视频作品";
+  if (contentType === "image") return "图文作品";
+  return "全部作品";
+}
+
+function isProfileCollectionVideoEntry(entry = {}, platform = "") {
+  const noteType = normalizeText(entry.noteType, 80).toLowerCase();
+  return (
+    noteType === "video" ||
+    noteType === "视频" ||
+    noteType.includes("video") ||
+    Boolean(entry.basic?.videoUrl) ||
+    (platform === "douyin" && noteType !== "image")
+  );
+}
+
+function publicProfileCollectionPlan(plan = {}) {
+  return {
+    planId: plan.planId,
+    status: plan.usedAt ? "confirmed" : "awaiting_confirmation",
+    createdAt: plan.createdAt,
+    expiresAt: plan.expiresAt,
+    userGoal: plan.userGoal,
+    intent: plan.intent,
+    collectionScope: plan.collectionScope,
+    requestedFields: plan.requestedFields,
+    requestedData: plan.requestedData,
+    recommendation: plan.recommendation,
+    archive: plan.archive,
+    riskNotice: plan.riskNotice,
+    solution: plan.solution,
+    browserActions: plan.browserActions,
+    safetyBoundaries: plan.safetyBoundaries,
+    limitations: plan.limitations,
+    confirmation: {
+      required: true,
+      startsCollection: false,
+      nextTool: "mediaclaw_confirm_profile_collection",
+      confirmationArgument: {planId: plan.planId},
+      prompt: plan.confirmationPrompt,
+    },
+  };
+}
+
+function createProfileCollectionPlan(input = {}, adapter = null) {
+  const cleanupBefore = Date.now() - PROFILE_COLLECTION_PLAN_TTL_MS;
+  for (const [planId, existing] of profileCollectionPlans) {
+    const usedAt = Date.parse(String(existing.usedAt || ""));
+    if (
+      existing.expiresAtMs <= Date.now() ||
+      (Number.isFinite(usedAt) && usedAt <= cleanupBefore)
+    ) {
+      profileCollectionPlans.delete(planId);
+    }
+  }
+  const profileUrl = normalizeText(input.profileUrl);
+  try {
+    const parsed = new URL(profileUrl);
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error();
+  } catch {
+    throw new Error("profileUrl 必须是有效的账号主页链接");
+  }
+  const userGoal = normalizeText(input.userGoal, 1200);
+  if (!userGoal) {
+    throw new Error("userGoal 不能为空；请保留用户已经确认的数据目标");
+  }
+  const platform = normalizeProfileCollectionPlatform(input.platform, profileUrl);
+  const contentType = normalizeEnum(
+    input.contentType,
+    ["all", "video", "image"],
+    "all",
+  );
+  const coverage = normalizeEnum(
+    input.coverage,
+    ["all_available", "latest"],
+    "all_available",
+  );
+  const purpose = normalizeEnum(
+    input.purpose,
+    Object.keys(PROFILE_COLLECTION_PURPOSES),
+    "",
+  );
+  if (!purpose) {
+    throw new Error("purpose 不能为空；请先明确用户采集这些数据是为了什么");
+  }
+  const requestedFields = normalizeProfileCollectionFields(
+    input.requestedFields,
+  );
+  if (
+    purpose === "full_collection" &&
+    (!Number.isFinite(Number(input.maxItems)) || Number(input.maxItems) <= 0)
+  ) {
+    throw new Error(
+      "完整采集需要提供主页已知总量或本次明确授权的数量上限，不能再用 300 条默认值代替“全部”",
+    );
+  }
+  const purposeRecommendation = PROFILE_COLLECTION_PURPOSES[purpose].recommendation;
+  const defaultMaxItems =
+    purposeRecommendation === "requested_scope"
+      ? DEFAULT_SCAN_LIMIT
+      : purposeRecommendation;
+  const requestedMaxItems = normalizeProfileCollectionCount(
+    input.maxItems,
+    defaultMaxItems,
+  );
+  const archiveMode = purpose === "full_collection";
+  const requiresDetail = requestedFields.some((field) =>
+    PROFILE_COLLECTION_DETAIL_FIELDS.includes(field),
+  );
+  const requestsTranscript = requestedFields.includes("video_transcript");
+  if (requestsTranscript && contentType === "image") {
+    throw new Error("图文作品不能请求视频逐字稿；请先确认内容类型或移除该字段");
+  }
+  const executionItemLimit = requestedMaxItems;
+  const transcriptQuoteLimit = Math.min(
+    executionItemLimit,
+    MAX_TRANSCRIPT_QUOTE_ITEMS,
+  );
+  const scanBatches = splitProfileCollectionBatches(
+    requestedMaxItems,
+    MAX_SCAN_LIMIT,
+  );
+  const detailBatches = requiresDetail
+    ? splitProfileCollectionBatches(
+        executionItemLimit,
+        MAX_DEEP_COLLECT_LIMIT,
+      )
+    : [];
+  const recommendation = profileCollectionRecommendation(
+    purpose,
+    requestedMaxItems,
+  );
+  const includeProfile = requestedFields.includes("account_profile");
+  const includeComments = requestedFields.includes("comments");
+  const commentsPerItemLimit = includeComments
+    ? Math.min(
+        500,
+        Math.max(1, Math.floor(Number(input.commentsPerItemLimit) || 30)),
+      )
+    : 0;
+  const estimatedCommentCount = includeComments
+    ? executionItemLimit * commentsPerItemLimit
+    : 0;
+  const recentRiskSignals = recentProfileCollectionRiskSignals(
+    adapter,
+    platform,
+  );
+  const riskLevel = profileCollectionRiskLevel({
+    requestedCount: requestedMaxItems,
+    recommendedCount: recommendation.recommendedCount,
+    requiresDetail,
+    scanBatchCount: scanBatches.length,
+    estimatedCommentCount,
+    recentRiskSignalCount: recentRiskSignals.length,
+  });
+  const requestedRetryPasses = Number(input.failureRetryPasses);
+  const failureRetryPasses = Math.min(
+    MAX_PROFILE_ARCHIVE_RETRY_PASSES,
+    Math.max(
+      0,
+      Math.floor(
+        Number.isFinite(requestedRetryPasses)
+          ? requestedRetryPasses
+          : archiveMode
+            ? DEFAULT_PROFILE_ARCHIVE_RETRY_PASSES
+            : 0,
+      ),
+    ),
+  );
+  const includeBloggerMetrics = requestedFields.includes("blogger_metrics");
+  const requestedData = requestedFields.map((field) => ({
+    field,
+    label: PROFILE_COLLECTION_FIELD_LABELS[field],
+    availability:
+      field === "video_transcript"
+        ? "详情采集后先报价，仍需用户单独确认积分"
+        : field === "comments"
+          ? `逐条详情页实际可获取，每篇最多 ${commentsPerItemLimit} 条`
+        : requiresDetail && PROFILE_COLLECTION_DETAIL_FIELDS.includes(field)
+          ? "逐条详情页实际可获取"
+          : "账号主页基础扫描可获取",
+  }));
+  const steps = [];
+  if (includeProfile) {
+    steps.push({
+      id: "profile_info",
+      label: "读取账号主页信息",
+      capability: "capture.blogger",
+      purpose: "获取账号名、简介、粉丝和主页指标",
+    });
+  }
+  steps.push({
+    id: "profile_inventory",
+    label: "扫描账号作品清单",
+    capability: "capture.blogger",
+    purpose: `定位主页中的${profileCollectionContentLabel(contentType)}并保存基础记录`,
+    maxItems: requestedMaxItems,
+    batches: scanBatches,
+  });
+  if (contentType !== "all") {
+    steps.push({
+      id: "content_filter",
+      label: `筛选${profileCollectionContentLabel(contentType)}`,
+      capability: "local_read",
+      purpose: "只保留符合用户内容类型要求的数据池记录",
+    });
+  }
+  if (requiresDetail) {
+    steps.push({
+      id: "detail_enhancement",
+      label: "逐条补采作品详情",
+      capability: "capture.enhancement",
+      purpose: "打开选中记录的详情页，补齐用户已经确认的数据字段",
+      maxItems: executionItemLimit,
+      batches: detailBatches,
+      includeComments,
+      commentsPerItemLimit,
+      includeBloggerMetrics,
+      failureRetryPasses,
+    });
+  }
+  if (requestsTranscript) {
+    steps.push({
+      id: "transcript_quote",
+      label: "生成视频逐字稿报价",
+      capability: "extract.video_transcript",
+      purpose: "只生成报价，不扣积分；报价后仍需用户单独确认",
+      maxItems: transcriptQuoteLimit,
+    });
+  }
+  steps.push({
+    id: "coverage_audit",
+    label: "核对实际采集覆盖",
+    capability: "local_read",
+    purpose: "报告计划数量、匹配数量、详情成功数、失败项和未执行项",
+  });
+
+  const limitations = [];
+  if (scanBatches.length > 1) {
+    limitations.push(
+      `账号基础列表单批技术上限为 ${MAX_SCAN_LIMIT} 条，完整目标将按 ${scanBatches.join(" + ")} 分 ${scanBatches.length} 批执行`,
+    );
+  }
+  if (detailBatches.length > 1) {
+    limitations.push(
+      `详情增强单批技术上限为 ${MAX_DEEP_COLLECT_LIMIT} 条，匹配记录将按最多 ${MAX_DEEP_COLLECT_LIMIT} 条一批继续补采，不会静默截断`,
+    );
+  }
+  if (requestsTranscript && requestedMaxItems > MAX_TRANSCRIPT_QUOTE_ITEMS) {
+    limitations.push(
+      `逐字稿单次最多为 ${MAX_TRANSCRIPT_QUOTE_ITEMS} 条视频报价；本方案只为前 ${transcriptQuoteLimit} 条匹配视频生成报价`,
+    );
+  }
+  if (requestsTranscript && contentType !== "video") {
+    limitations.push("逐字稿只会应用于实际识别为视频的记录");
+  }
+  if (requiresDetail) {
+    limitations.push("详情字段以平台页面和插件本次实际可读取结果为准，缺失字段不会被推测补写");
+  }
+  if (requestedFields.includes("media_urls")) {
+    limitations.push(
+      "媒体字段返回页面实际可读取的图片或视频源地址；本方案不下载图片、视频二进制文件",
+    );
+  }
+  const riskWarnings = [];
+  if (requestedMaxItems > recommendation.recommendedCount) {
+    riskWarnings.push(
+      `按“${recommendation.purposeLabel}”用途建议先采 ${recommendation.recommendedCount} 条；用户要求 ${requestedMaxItems} 条，确认后仍按用户范围执行`,
+    );
+  }
+  if (scanBatches.length > 1) {
+    riskWarnings.push(
+      `主页需要连续执行 ${scanBatches.length} 个基础列表批次，页面加载失败、登录校验或平台风控概率会随批次增加`,
+    );
+  }
+  if (
+    requiresDetail &&
+    executionItemLimit > PROFILE_DETAIL_YELLOW_THRESHOLD
+  ) {
+    riskWarnings.push(
+      executionItemLimit > PROFILE_DETAIL_RED_THRESHOLD
+        ? `最多会逐条打开 ${executionItemLimit} 个详情页，超过 ${PROFILE_DETAIL_RED_THRESHOLD} 条详情红色风险阈值；本次确认将作为分批继续的风险授权`
+        : `最多会逐条打开 ${executionItemLimit} 个详情页，超过 ${PROFILE_DETAIL_YELLOW_THRESHOLD} 条详情黄色提示阈值`,
+    );
+  }
+  if (estimatedCommentCount > PROFILE_COMMENT_RED_TOTAL_THRESHOLD) {
+    riskWarnings.push(
+      `按每篇最多 ${commentsPerItemLimit} 条评论估算，本次最多会读取 ${estimatedCommentCount} 条评论，超过 ${PROFILE_COMMENT_RED_TOTAL_THRESHOLD} 条评论红色风险阈值`,
+    );
+  }
+  if (recentRiskSignals.length > 0) {
+    riskWarnings.push(
+      `${recentRiskSignals[0].message}；本次方案升级为红色风险，请先确认平台页面已经恢复正常`,
+    );
+  }
+  if (requestedMaxItems > 1000) {
+    riskWarnings.push(
+      "基础列表总量超过 15 分钟 1000 条的建议连续额度；本方案会保持单批上限与间隔，并按用户确认继续",
+    );
+  }
+
+  const createdAtMs = Date.now();
+  const plan = {
+    planId: createId("profile_plan"),
+    ownerDeviceId: profileCollectionPlanOwner(adapter),
+    createdAt: new Date(createdAtMs).toISOString(),
+    expiresAt: new Date(createdAtMs + PROFILE_COLLECTION_PLAN_TTL_MS).toISOString(),
+    expiresAtMs: createdAtMs + PROFILE_COLLECTION_PLAN_TTL_MS,
+    usedAt: "",
+    userGoal,
+    intent: {
+      target: "account_profile",
+      profileUrl,
+      platform,
+      contentType,
+      coverage,
+      purpose,
+      operationMode: archiveMode ? "full_archive" : "research_collection",
+    },
+    execution: {
+      requestedMaxItems,
+      scanLimit: requestedMaxItems,
+      scanBatches,
+      executionItemLimit,
+      detailBatches,
+      transcriptQuoteLimit,
+      requiresDetail,
+      requestsTranscript,
+      includeProfile,
+      includeComments,
+      commentsPerItemLimit,
+      includeBloggerMetrics,
+      failureRetryPasses,
+    },
+    collectionScope: {
+      targetUrl: profileUrl,
+      platform,
+      content: profileCollectionContentLabel(contentType),
+      coverage:
+        coverage === "all_available"
+          ? `主页当前可加载范围，最多 ${requestedMaxItems} 条`
+          : `主页最近 ${requestedMaxItems} 条`,
+      detailTargetLimit: requiresDetail ? executionItemLimit : 0,
+    },
+    requestedFields,
+    requestedData,
+    recommendation,
+    archive: archiveMode
+      ? {
+          enabled: true,
+          storage: "mediaclaw_data_pool",
+          resultDelivery: "summary_and_preview",
+          fullRecordQuery: {
+            tool: "mediaclaw_list_assets",
+            arguments: {
+              source: "local.data_pool",
+              type: "capture_record",
+              filters: {
+                profileUrl,
+                platform,
+                recordType: "blogger_notes",
+                contentType,
+              },
+              cursor: "",
+              limit: 100,
+            },
+          },
+          fullRecordRead: {
+            tool: "mediaclaw_get_asset",
+            argumentFromIndex: "assetId",
+          },
+          taskRetentionDays: PROFILE_ARCHIVE_JOB_TTL_MS / 86_400_000,
+          failureRetryPasses,
+        }
+      : null,
+    riskNotice: {
+      level: riskLevel,
+      color:
+        riskLevel === "red"
+          ? "red"
+          : riskLevel === "yellow"
+            ? "yellow"
+            : "none",
+      label:
+        riskLevel === "red"
+          ? "红色风险提示"
+          : riskLevel === "yellow"
+            ? "黄色风险提示"
+            : "普通确认",
+      confirmationRequired: true,
+      changesRequestedScope: false,
+      warnings: riskWarnings,
+      estimates: {
+        listItems: requestedMaxItems,
+        detailPageVisits: requiresDetail ? executionItemLimit : 0,
+        comments: estimatedCommentCount,
+      },
+      thresholds: {
+        listBatch: MAX_SCAN_LIMIT,
+        listRedTotal: 1000,
+        detailYellow: PROFILE_DETAIL_YELLOW_THRESHOLD,
+        detailRed: PROFILE_DETAIL_RED_THRESHOLD,
+        commentsRedTotal: PROFILE_COMMENT_RED_TOTAL_THRESHOLD,
+        recentSignalWindowMinutes:
+          PROFILE_RECENT_RISK_SIGNAL_WINDOW_MS / 60_000,
+      },
+      recentSignals: recentRiskSignals,
+      alternatives: [
+        purpose === "full_collection"
+          ? `先执行首批 ${Math.min(MAX_SCAN_LIMIT, requestedMaxItems)} 条验证页面和字段，再制定剩余方案`
+          : `按建议范围先采 ${recommendation.recommendedCount} 条，再根据结果决定是否继续`,
+        `按用户要求的 ${requestedMaxItems} 条分批执行`,
+      ],
+      confirmedAction: `按用户要求的 ${requestedMaxItems} 条分批执行`,
+    },
+    solution: {
+      analysis: ["结构化用户数据目标", "按内容类型筛选记录", "核对计划与实际覆盖差异"],
+      steps,
+      producesExecutionAudit: true,
+    },
+    browserActions: {
+      startsAfterConfirmation: true,
+      profilePageVisits: scanBatches.length + (includeProfile ? 1 : 0),
+      maximumDetailPageVisits: requiresDetail ? executionItemLimit : 0,
+      maximumDetailPageVisitsWithRetries: requiresDetail
+        ? executionItemLimit * (1 + failureRetryPasses)
+        : 0,
+      scanBatches,
+      detailBatches,
+      canCancel: true,
+    },
+    safetyBoundaries: {
+      basicScanBatchLimit: MAX_SCAN_LIMIT,
+      detailBatchLimit: MAX_DEEP_COLLECT_LIMIT,
+      basicListRecommendedContinuousLimit: 1000,
+      detailRecommendedContinuousLimit: 100,
+      confirmedPlanCanContinueAcrossRecommendedBoundary: true,
+      transcriptQuoteLimit: MAX_TRANSCRIPT_QUOTE_ITEMS,
+      planIsOneTime: true,
+      planExpiresInMinutes: PROFILE_COLLECTION_PLAN_TTL_MS / 60_000,
+    },
+    limitations,
+  };
+  const fieldSummary = requestedData.map((item) => item.label).join("、");
+  plan.confirmationPrompt = [
+    `确认类型：${plan.riskNotice.label}。`,
+    `用途：${recommendation.purposeLabel}。${recommendation.rationale}`,
+    requestedMaxItems > recommendation.recommendedCount
+      ? `建议先采 ${recommendation.recommendedCount} 条，但你要求 ${requestedMaxItems} 条；确认后不会降级，仍按 ${requestedMaxItems} 条执行。`
+      : `计划按 ${requestedMaxItems} 条范围执行。`,
+    `将打开 ${profileCollectionContentLabel(contentType)}所在的账号主页，基础列表分批为 ${scanBatches.join(" + ")}。`,
+    requiresDetail
+      ? `筛选后逐条打开最多 ${executionItemLimit} 个详情页，按 ${MAX_DEEP_COLLECT_LIMIT} 条以内分批。`
+      : "只读取主页基础清单，不打开作品详情页。",
+    failureRetryPasses > 0
+      ? `页面加载或解析失败会自动重试最多 ${failureRetryPasses} 轮，单条失败不会中断其余记录。`
+      : "",
+    `计划获取：${fieldSummary}。`,
+    riskWarnings.length > 0 ? `风险提示：${riskWarnings.join("；")}。` : "",
+    limitations.length > 0 ? `限制：${limitations.join("；")}。` : "",
+    "确认后才会开始采集；确认代表接受上述分批范围和风险，不代表放弃失败记录与覆盖报告。",
+  ].filter(Boolean).join("");
+  profileCollectionPlans.set(plan.planId, plan);
+  return publicProfileCollectionPlan(plan);
+}
+
+function resolveProfileCollectionPlan(planId, adapter = null) {
+  const normalizedPlanId = normalizeText(planId, 200);
+  const plan = profileCollectionPlans.get(normalizedPlanId);
+  if (!plan) {
+    return {
+      ok: false,
+      error: {code: "PROFILE_COLLECTION_PLAN_NOT_FOUND", message: "采集方案不存在，请重新制定方案"},
+    };
+  }
+  if (
+    plan.ownerDeviceId &&
+    plan.ownerDeviceId !== profileCollectionPlanOwner(adapter)
+  ) {
+    return {
+      ok: false,
+      error: {code: "PROFILE_COLLECTION_PLAN_OWNER_MISMATCH", message: "采集方案不属于当前设备"},
+    };
+  }
+  if (plan.expiresAtMs <= Date.now()) {
+    return {
+      ok: false,
+      error: {code: "PROFILE_COLLECTION_PLAN_EXPIRED", message: "采集方案已过期，请重新制定并确认"},
+    };
+  }
+  if (plan.usedAt) {
+    return {
+      ok: false,
+      error: {code: "PROFILE_COLLECTION_PLAN_ALREADY_USED", message: "采集方案已经确认执行，不能重复使用"},
+    };
+  }
+  return {ok: true, plan};
+}
+
 function taskProtocolStatus(status) {
   if (status === "succeeded") return "completed";
   if (status === "cancelled") return "cancelled";
@@ -488,7 +1238,7 @@ function taskSnapshot(task) {
     statusMessage: task.message || "",
     createdAt: task.createdAt,
     lastUpdatedAt: task.updatedAt,
-    ttl: TASK_TTL_MS,
+    ttl: Number(task?.ttlMs) || TASK_TTL_MS,
     pollInterval: 1000,
   };
 }
@@ -509,7 +1259,10 @@ function serializableTask(task) {
     childTaskIds: task.childTaskIds,
     currentChildTaskId: task.currentChildTaskId,
     createdAt: task.createdAt,
+    queuedAt: task.queuedAt || task.createdAt,
+    startedAt: task.startedAt || "",
     updatedAt: task.updatedAt,
+    ttlMs: Number(task.ttlMs) || TASK_TTL_MS,
   };
 }
 
@@ -536,6 +1289,60 @@ function scheduleTaskStatePersist() {
   return taskStateWrite;
 }
 
+function isLocalAssetReadTask(taskOrCaptureTask = {}) {
+  const safe = taskOrCaptureTask && typeof taskOrCaptureTask === "object"
+    ? taskOrCaptureTask
+    : {};
+  const captureTask = safe.captureTask || safe;
+  return (
+    captureTask?.mode === "data_pool_assets" &&
+    captureTask?.options?.operation === "get"
+  );
+}
+
+function isLocalAssetQueryTask(taskOrCaptureTask = {}) {
+  const safe = taskOrCaptureTask && typeof taskOrCaptureTask === "object"
+    ? taskOrCaptureTask
+    : {};
+  const captureTask = safe.captureTask || safe;
+  return (
+    ["data_pool_assets", "studio_assets"].includes(captureTask?.mode) &&
+    ["get", "list"].includes(captureTask?.options?.operation)
+  );
+}
+
+function isLegacyActiveLocalAssetReadTask(task = {}) {
+  return (
+    isLocalAssetReadTask(task) &&
+    ["queued", "running", "cancel_pending", "waiting_for_extension"].includes(
+      task.status,
+    ) &&
+    !normalizeText(task.captureTask?.options?.view, 40)
+  );
+}
+
+function queuedTaskMessage(captureTask, {extensionConnected, sessionReady}) {
+  if (isLocalAssetQueryTask(captureTask)) {
+    if (extensionConnected && sessionReady) {
+      return "等待浏览器插件读取本地已保存资产（不会重新采集）";
+    }
+    if (extensionConnected) {
+      return "等待用户批准设备配对，以访问浏览器插件中的本地已保存资产";
+    }
+    return "需要连接 MediaClaw 浏览器插件以读取其本地数据库（不会访问作品页）";
+  }
+  if (extensionConnected && sessionReady) return "等待浏览器插件执行";
+  if (extensionConnected) return "等待用户在 MediaClaw 插件中批准设备配对";
+  return "等待 MediaClaw 插件开启 Agent 调用";
+}
+
+function completedTaskMessage(task, succeeded) {
+  if (isLocalAssetQueryTask(task)) {
+    return succeeded ? "本地已保存资产读取完成" : "本地已保存资产读取失败";
+  }
+  return succeeded ? "采集完成" : "采集未完成";
+}
+
 async function restoreTaskState() {
   let payload;
   try {
@@ -550,11 +1357,20 @@ async function restoreTaskState() {
     }
     return;
   }
-  const expiresBefore = Date.now() - TASK_TTL_MS;
+  const restoredAtMs = Date.now();
+  let restoredStateChanged = false;
   for (const snapshot of Array.isArray(payload?.tasks) ? payload.tasks : []) {
     const taskId = normalizeText(snapshot?.taskId, 160);
     const updatedAtMs = Date.parse(String(snapshot?.updatedAt || ""));
-    if (!taskId || !Number.isFinite(updatedAtMs) || updatedAtMs < expiresBefore) {
+    const ttlMs = Math.max(
+      TASK_TTL_MS,
+      Number(snapshot?.ttlMs) || TASK_TTL_MS,
+    );
+    if (
+      !taskId ||
+      !Number.isFinite(updatedAtMs) ||
+      updatedAtMs < Date.now() - ttlMs
+    ) {
       continue;
     }
     let resolveCompletion;
@@ -566,23 +1382,75 @@ async function restoreTaskState() {
       "cancel_pending",
       "waiting_for_extension",
     ].includes(snapshot.status);
+    const legacyLocalAssetRead = isLegacyActiveLocalAssetReadTask(snapshot);
+    const activeLocalAssetQuery =
+      isLocalAssetQueryTask(snapshot) &&
+      ["queued", "running", "cancel_pending", "waiting_for_extension"].includes(
+        snapshot.status,
+      );
+    const localAssetReferenceMs = Date.parse(
+      String(
+        snapshot.status === "running"
+          ? snapshot.startedAt || snapshot.createdAt || snapshot.updatedAt || ""
+          : snapshot.queuedAt || snapshot.createdAt || snapshot.updatedAt || "",
+      ),
+    );
+    const expiredLocalAssetQuery =
+      activeLocalAssetQuery &&
+      Number.isFinite(localAssetReferenceMs) &&
+      restoredAtMs - localAssetReferenceMs >=
+        (snapshot.status === "running"
+          ? LOCAL_ASSET_EXECUTION_TIMEOUT_MS
+          : LOCAL_ASSET_QUEUE_TIMEOUT_MS);
+    const invalidRestoredLocalAssetQuery =
+      legacyLocalAssetRead || expiredLocalAssetQuery;
     const task = {
       ...snapshot,
       taskId,
-      status: wasInFlight ? "waiting_for_extension" : snapshot.status,
-      message: wasInFlight
-        ? "任务已从持久状态恢复，等待浏览器插件断点续跑"
+      ttlMs,
+      status: invalidRestoredLocalAssetQuery
+        ? "failed"
+        : wasInFlight
+          ? "waiting_for_extension"
+          : snapshot.status,
+      message: invalidRestoredLocalAssetQuery
+        ? legacyLocalAssetRead
+          ? "旧版完整资产读取已终止；请使用统一分区读取重新发起"
+          : "本地资产读取已过期并自动终止，队列已释放"
+        : wasInFlight
+          ? isLocalAssetReadTask(snapshot)
+          ? "本地资产读取已恢复，等待浏览器插件继续传输已保存数据"
+          : "任务已从持久状态恢复，等待浏览器插件断点续跑"
         : snapshot.message,
+      error: invalidRestoredLocalAssetQuery
+        ? legacyLocalAssetRead
+          ? {
+            code: "LEGACY_LOCAL_ASSET_READ_REPLACED",
+            message: "旧版完整资产读取可能产生超大重复数据，已由统一分区读取替代",
+          }
+          : {
+              code: "LOCAL_ASSET_READ_EXPIRED",
+              message: "本地资产读取等待或执行时间过长，已自动终止",
+            }
+        : snapshot.error,
       completion,
       resolveCompletion,
     };
+    if (invalidRestoredLocalAssetQuery) restoredStateChanged = true;
     tasks.set(taskId, task);
     if (task.idempotencyKey) {
       idempotentTaskIds.set(task.idempotencyKey, taskId);
     }
-    if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+    if (
+      ["succeeded", "failed", "cancelled", "input_required"].includes(
+        task.status,
+      )
+    ) {
       resolveCompletion(task);
     }
+  }
+  if (restoredStateChanged) {
+    await scheduleTaskStatePersist();
   }
 }
 
@@ -597,6 +1465,7 @@ function createTask({
   input = {},
   captureTask = null,
   taskId: requestedTaskId = "",
+  ttlMs = TASK_TTL_MS,
 } = {}) {
   const owner = requestContext.getStore()?.adapter || null;
   const rawIdempotencyKey = normalizeText(input?.idempotencyKey, 240);
@@ -619,15 +1488,13 @@ function createTask({
     resolveCompletion = resolve;
   });
   const session = adapterSession(owner);
+  const extensionConnected = Boolean(extensionPeer);
+  const sessionReady = Boolean(session);
   const task = {
     taskId,
     kind,
-    status: extensionPeer && session ? "queued" : "waiting_for_extension",
-    message: extensionPeer && session
-      ? "等待浏览器插件执行"
-      : extensionPeer
-        ? "等待用户在 MediaClaw 插件中批准设备配对"
-        : "等待 MediaClaw 插件开启 Agent 调用",
+    status: extensionConnected && sessionReady ? "queued" : "waiting_for_extension",
+    message: queuedTaskMessage(captureTask, {extensionConnected, sessionReady}),
     input,
     idempotencyKey,
     captureTask,
@@ -644,7 +1511,10 @@ function createTask({
     childTaskIds: [],
     currentChildTaskId: "",
     createdAt: nowIso(),
+    queuedAt: nowIso(),
+    startedAt: "",
     updatedAt: nowIso(),
+    ttlMs: Math.max(TASK_TTL_MS, Number(ttlMs) || TASK_TTL_MS),
     completion,
     resolveCompletion,
   };
@@ -718,8 +1588,8 @@ function finishTask(task, {status, result = null, error = null, message = ""}) {
     message:
       message ||
       (status === "succeeded"
-        ? "采集完成"
-        : error?.message || "采集未完成"),
+        ? completedTaskMessage(task, true)
+        : error?.message || completedTaskMessage(task, false)),
   });
   task.resolveCompletion(task);
   return task;
@@ -1125,6 +1995,13 @@ function collectCommentRecords(response = {}) {
     appendComments(payload?.items);
     appendComments(payload?.comments);
     appendComments(payload?.commentsCleanedItems);
+    appendComments(payload?.commentItems);
+    appendComments(payload?.commentList);
+    appendComments(payload?.detailPayload?.items);
+    appendComments(payload?.detailPayload?.comments);
+    appendComments(payload?.detailPayload?.commentsCleanedItems);
+    appendComments(payload?.detailPayload?.commentItems);
+    appendComments(payload?.detailPayload?.commentList);
   }
 
   appendComments(data?.rawCaptureResult?.data?.items);
@@ -1459,7 +2336,10 @@ function pumpQueue() {
   next.captureTask.taskId = next.taskId;
   updateTask(next, {
     status: "running",
-    message: "浏览器正在执行采集",
+    startedAt: nowIso(),
+    message: isLocalAssetQueryTask(next)
+      ? "浏览器插件正在读取并传输本地已保存资产，不会重新采集或访问作品页"
+      : "浏览器正在执行采集",
   });
   extensionPeer.send({
     type: "task.start",
@@ -1468,6 +2348,99 @@ function pumpQueue() {
     sessionId: deviceSessions.get(next.owner?.deviceId)?.sessionId || "",
     task: next.captureTask,
   });
+}
+
+function expireStaleLocalAssetQueries(nowMs = Date.now()) {
+  let releasedActiveTask = false;
+  for (const task of tasks.values()) {
+    if (
+      !isLocalAssetQueryTask(task) ||
+      !["queued", "running", "waiting_for_extension"].includes(task.status)
+    ) {
+      continue;
+    }
+    const isRunning = task.status === "running";
+    const referenceMs = Date.parse(
+      String(
+        isRunning
+          ? task.startedAt || task.createdAt || ""
+          : task.queuedAt || task.createdAt || "",
+      ),
+    );
+    const timeoutMs = isRunning
+      ? LOCAL_ASSET_EXECUTION_TIMEOUT_MS
+      : LOCAL_ASSET_QUEUE_TIMEOUT_MS;
+    if (!Number.isFinite(referenceMs) || nowMs - referenceMs < timeoutMs) {
+      continue;
+    }
+    const wasActive = activeExtensionTaskId === task.taskId;
+    if (wasActive) {
+      extensionPeer?.send({
+        type: "task.cancel",
+        taskId: task.taskId,
+        deviceId: task.owner?.deviceId || "",
+        sessionId: deviceSessions.get(task.owner?.deviceId)?.sessionId || "",
+      });
+      activeExtensionTaskId = "";
+      releasedActiveTask = true;
+    }
+    finishTask(task, {
+      status: "failed",
+      error: {
+        code: isRunning
+          ? "LOCAL_ASSET_READ_TIMEOUT"
+          : "LOCAL_ASSET_READ_QUEUE_EXPIRED",
+        message: isRunning
+          ? "本地资产读取执行超时，已自动终止并释放队列"
+          : "本地资产读取等待超时，已自动终止",
+      },
+      message: isRunning
+        ? "本地资产读取执行超时，已自动终止并释放队列"
+        : "本地资产读取等待超时，已自动终止",
+    });
+  }
+  if (releasedActiveTask || !activeExtensionTaskId) pumpQueue();
+}
+
+function expireUnacknowledgedCaptureTask(nowMs = Date.now()) {
+  if (!activeExtensionTaskId) return;
+  const task = tasks.get(activeExtensionTaskId);
+  if (!task || task.kind !== "capture" || task.status !== "running") return;
+  const progressStage = normalizeText(task.progress?.stage, 80);
+  const isStarting =
+    !task.progress || ["accepted", "queued", "resuming"].includes(progressStage);
+  if (!isStarting) return;
+  const referenceMs = Date.parse(
+    String(
+      task.progress?.updatedAt ||
+        task.startedAt ||
+        task.updatedAt ||
+        task.createdAt ||
+        "",
+    ),
+  );
+  if (
+    !Number.isFinite(referenceMs) ||
+    nowMs - referenceMs < CAPTURE_START_ACK_TIMEOUT_MS
+  ) {
+    return;
+  }
+  extensionPeer?.send({
+    type: "task.cancel",
+    taskId: task.taskId,
+    deviceId: task.owner?.deviceId || "",
+    sessionId: deviceSessions.get(task.owner?.deviceId)?.sessionId || "",
+  });
+  activeExtensionTaskId = "";
+  finishTask(task, {
+    status: "failed",
+    error: {
+      code: "EXTENSION_TASK_START_TIMEOUT",
+      message: "浏览器插件未在规定时间内确认并开始任务，已自动终止并释放队列",
+    },
+    message: "浏览器插件未确认开始任务，已自动终止并释放队列",
+  });
+  pumpQueue();
 }
 
 function requestResultRetry(taskId, reason) {
@@ -1525,9 +2498,13 @@ function acceptTaskResultMessage(message = {}) {
         error: succeeded
           ? null
           : result.error || {
-              code: "CAPTURE_FAILED",
-            message: "浏览器采集失败",
-          },
+              code: isLocalAssetQueryTask(task)
+                ? "LOCAL_ASSET_READ_FAILED"
+                : "CAPTURE_FAILED",
+              message: isLocalAssetQueryTask(task)
+                ? "浏览器插件本地资产读取失败"
+                : "浏览器采集失败",
+            },
       });
       }
     }
@@ -1847,8 +2824,48 @@ function getTaskPublicResult(task) {
   };
 }
 
+function localAssetReadSignature(captureTask = {}) {
+  if (!isLocalAssetReadTask(captureTask)) return "";
+  const options = captureTask.options || {};
+  const sections = Array.isArray(options.sections)
+    ? [...new Set(options.sections.map((item) => normalizeText(item, 80)).filter(Boolean))]
+        .sort()
+    : [];
+  const page = options.page && typeof options.page === "object"
+    ? {
+        path: normalizeText(options.page.path, 160),
+        cursor: normalizeText(options.page.cursor ?? options.page.offset, 80),
+        limit: Number(options.page.limit) || 0,
+      }
+    : {};
+  return JSON.stringify({
+    assetId: normalizeText(options.assetId, 1000),
+    view: normalizeText(options.view, 40),
+    sections,
+    page,
+  });
+}
+
+function findActiveLocalAssetRead(captureTask) {
+  const signature = localAssetReadSignature(captureTask);
+  if (!signature) return null;
+  const ownerDeviceId = normalizeText(
+    requestContext.getStore()?.adapter?.identity?.deviceId,
+    160,
+  );
+  return [...tasks.values()].find(
+    (task) =>
+      task.kind === "capture" &&
+      task.owner?.deviceId === ownerDeviceId &&
+      ["queued", "running", "waiting_for_extension"].includes(task.status) &&
+      localAssetReadSignature(task.captureTask) === signature,
+  ) || null;
+}
+
 function startSingleCapture(mode, input = {}) {
   const captureTask = buildCaptureTask(mode, input);
+  const activeLocalRead = findActiveLocalAssetRead(captureTask);
+  if (activeLocalRead) return activeLocalRead;
   const task = createTask({input, captureTask});
   pumpQueue();
   return task;
@@ -2287,6 +3304,1190 @@ async function runLongtailResearch(parent, input = {}) {
 function startLongtailResearch(input = {}) {
   const task = createTask({kind: "workflow", input});
   void runLongtailResearch(task, input);
+  return task;
+}
+
+function profileCollectionRecordEntries(result = {}, plan = {}) {
+  const storedRecords = Array.isArray(result.records) ? result.records : [];
+  const fallbackRecordIds = Array.isArray(result.recordIds)
+    ? result.recordIds
+    : [];
+  const entries = storedRecords.map((record, index) => {
+    const recordType = normalizeText(record?.recordType || record?.type, 120);
+    if (recordType === "blogger_profile") return null;
+    const payload =
+      record?.normalizedPayload && typeof record.normalizedPayload === "object"
+        ? record.normalizedPayload
+        : record?.payload && typeof record.payload === "object"
+          ? record.payload
+          : record?.rawPayload && typeof record.rawPayload === "object"
+            ? record.rawPayload
+            : {};
+    const item =
+      Array.isArray(payload.items) && payload.items[0] &&
+      typeof payload.items[0] === "object"
+        ? payload.items[0]
+        : payload;
+    const basic = pickBasicItem(item);
+    return {
+      recordId: normalizeText(record?.id || fallbackRecordIds[index], 160),
+      record,
+      basic,
+      noteType: normalizeText(
+        item.noteType || item.contentType || item.type || basic.contentType,
+        80,
+      ).toLowerCase(),
+    };
+  }).filter(Boolean);
+  if (entries.length === 0) {
+    const basicRecords = collectAnalysisRecordsFromTaskResult(result);
+    entries.push(
+      ...basicRecords.map((basic, index) => ({
+        recordId: normalizeText(fallbackRecordIds[index], 160),
+        record: null,
+        basic,
+        noteType: normalizeText(basic.contentType, 80).toLowerCase(),
+      })),
+    );
+  }
+  const contentType = plan.intent?.contentType || "all";
+  return entries.filter((entry) => {
+    if (contentType === "all") return true;
+    const isVideo = isProfileCollectionVideoEntry(
+      entry,
+      plan.intent?.platform,
+    );
+    return contentType === "video" ? isVideo : !isVideo;
+  });
+}
+
+function profileCollectionEntryKey(entry = {}) {
+  return normalizeText(
+    entry.recordId || entry.basic?.id || entry.basic?.url,
+    1000,
+  );
+}
+
+function mergeProfileCollectionEntries(target, entries = []) {
+  let addedCount = 0;
+  for (const entry of entries) {
+    const key = profileCollectionEntryKey(entry);
+    if (!key || target.has(key)) continue;
+    target.set(key, entry);
+    addedCount += 1;
+  }
+  return addedCount;
+}
+
+function profileCollectionRiskAuthorization(
+  plan,
+  category,
+  batchIndex,
+  authorizedUnits,
+  batchGroup = category,
+) {
+  return {
+    source: "mediaclaw_confirm_profile_collection",
+    decision: "continue_after_risk_warning",
+    planId: plan.planId,
+    batchId: `${batchGroup}-${batchIndex + 1}`,
+    category,
+    authorizedUnits,
+    confirmedAt: plan.usedAt,
+  };
+}
+
+function classifyProfileCollectionFailure(error = {}) {
+  const code =
+    normalizeText(
+      error?.code || error?.reason || error?.category || error?.status,
+      160,
+    ) || "CAPTURE_FAILED";
+  const message = normalizeText(error?.message || error?.detail, 1000);
+  const signature = `${code} ${message}`;
+  if (/AGENT_CAPTURE_RISK_CONFIRMATION_REQUIRED|RISK_CONFIRMATION/i.test(signature)) {
+    return "risk_confirmation_required";
+  }
+  if (/AGENT_CAPTURE_BATCH_LIMIT_EXCEEDED|BATCH_LIMIT|BATCH_PLANNING/i.test(signature)) {
+    return "batch_planning_error";
+  }
+  if (/CONTINUOUS_LIMIT|RATE_LIMIT|TOO_MANY_REQUESTS|FREQUENCY|COOLDOWN/i.test(signature)) {
+    return "platform_cooldown";
+  }
+  if (/PAYWALL|ACCESS_REQUIRED|CREDENTIAL|MEMBERSHIP|SUBSCRIPTION/i.test(signature)) {
+    return "access_required";
+  }
+  if (/EXTENSION_NOT_CONNECTED|PAIRING_REQUIRED|CONNECTION_LOST|SOCKET_CLOSED/i.test(signature)) {
+    return "connection_required";
+  }
+  if (/CANCELLED|CANCELED|USER_CANCEL/i.test(signature)) {
+    return "cancelled";
+  }
+  if (/CAPTCHA|VERIFICATION|LOGIN|UNAUTHORIZED|AUTH_REQUIRED|USER_ACTION/i.test(signature)) {
+    return "user_action_required";
+  }
+  if (/INVALID_(URL|RECORD|LINK)|RECORD_NOT_FOUND|URL_MISSING|LINK_MISSING/i.test(signature)) {
+    return "invalid_record";
+  }
+  return "page_load_or_parse_failure";
+}
+
+function isRetryableProfileCollectionFailure(classification) {
+  return classification === "page_load_or_parse_failure";
+}
+
+function profileCollectionExecutionInterruption(error = {}, context = {}) {
+  const classification = classifyProfileCollectionFailure(error);
+  if (
+    !["platform_cooldown", "user_action_required"].includes(classification)
+  ) {
+    return null;
+  }
+  const signature = `${normalizeText(error?.code || error?.reason, 160)} ${normalizeText(error?.message, 1000)}`;
+  const isVerification = /CAPTCHA|VERIFICATION/i.test(signature);
+  const nextAllowedAt =
+    error?.risk?.nextAllowedAt || error?.nextAllowedAt || null;
+  return {
+    status: "input_required",
+    classification,
+    stage: context.stage || "profile_collection",
+    batchIndex: context.batchIndex || null,
+    recordId: context.recordId || "",
+    reason:
+      classification === "platform_cooldown"
+        ? "platform_cooldown"
+        : isVerification
+          ? "verification_required"
+          : "login_required",
+    title:
+      classification === "platform_cooldown"
+        ? "平台采集冷却中"
+        : isVerification
+          ? "需要在浏览器完成验证码"
+          : "需要在浏览器恢复登录",
+    message:
+      classification === "platform_cooldown"
+        ? "采集已暂停以避免继续触发平台限制；这不表示插件做不了。请等待冷却时间结束后，让 Agent 按原目标继续剩余范围。"
+        : isVerification
+          ? "采集已暂停；请在 MediaClaw 使用的浏览器页面完成验证码。已保存结果不会丢失，处理后可继续剩余范围。"
+          : "采集已暂停；请在 MediaClaw 使用的浏览器页面恢复账号登录。已保存结果不会丢失，处理后可继续剩余范围。",
+    nextAllowedAt,
+    preservesCompletedRecords: true,
+    continuation:
+      "处理完成后重新制定同一账号的剩余范围方案；数据池会保留已完成记录并跳过重复内容。",
+    doesNotMeanUnsupported: true,
+    error,
+  };
+}
+
+function profileCollectionDetailEntryError(entry = {}) {
+  if (entry.error && typeof entry.error === "object") return entry.error;
+  return {
+    code: normalizeText(
+      entry.reason || entry.code || entry.category,
+      160,
+    ) || "DETAIL_CAPTURE_FAILED",
+    message:
+      normalizeText(entry.message || entry.detail, 1000) ||
+      "作品详情采集未完成",
+    stage: normalizeText(entry.stage, 120) || undefined,
+  };
+}
+
+function combineProfileCollectionDetailResults(batchResults = []) {
+  const recordMap = new Map();
+  const results = [];
+  const recordStates = new Map();
+  const ensureState = (recordId) => {
+    const normalizedRecordId = normalizeText(recordId, 160);
+    if (!normalizedRecordId) return null;
+    if (!recordStates.has(normalizedRecordId)) {
+      recordStates.set(normalizedRecordId, {
+        recordId: normalizedRecordId,
+        ok: false,
+        attempts: 0,
+        hadFailure: false,
+        classification: "page_load_or_parse_failure",
+        error: null,
+        batchIndex: null,
+        phase: "primary",
+        retryPass: 0,
+      });
+    }
+    return recordStates.get(normalizedRecordId);
+  };
+  for (const item of batchResults) {
+    const result = item.result && typeof item.result === "object"
+      ? item.result
+      : {};
+    const expectedRecordIds = Array.isArray(item.recordIds)
+      ? item.recordIds.map((recordId) => normalizeText(recordId, 160)).filter(Boolean)
+      : [];
+    const successfulRecordIds = new Set(
+      item.status === "succeeded" &&
+      result.ok !== false &&
+      Array.isArray(result.recordIds)
+        ? result.recordIds.map((recordId) => normalizeText(recordId, 160)).filter(Boolean)
+        : [],
+    );
+    for (const record of Array.isArray(result.records) ? result.records : []) {
+      const recordId = normalizeText(record?.id || record?.recordId, 160);
+      if (recordId) recordMap.set(recordId, record);
+    }
+    const resultEntries = Array.isArray(result.results) ? result.results : [];
+    results.push(
+      ...resultEntries.map((entry) => ({
+        ...entry,
+        phase: item.phase || "primary",
+        retryPass: Number(item.retryPass || 0),
+      })),
+    );
+    const handledRecordIds = new Set();
+    for (const entry of resultEntries) {
+      const recordId = normalizeText(entry?.recordId || entry?.id, 160);
+      const state = ensureState(recordId);
+      if (!state) continue;
+      handledRecordIds.add(recordId);
+      state.attempts += 1;
+      state.batchIndex = item.batchIndex;
+      state.phase = item.phase || "primary";
+      state.retryPass = Number(item.retryPass || 0);
+      if (entry?.ok !== false) {
+        state.ok = true;
+        state.error = null;
+        state.classification = null;
+        successfulRecordIds.add(recordId);
+        continue;
+      }
+      state.hadFailure = true;
+      if (!state.ok) {
+        const entryError = profileCollectionDetailEntryError(entry);
+        state.error = entryError;
+        state.classification = classifyProfileCollectionFailure(entryError);
+      }
+    }
+    for (const recordId of expectedRecordIds) {
+      const state = ensureState(recordId);
+      if (!state || handledRecordIds.has(recordId)) continue;
+      state.attempts += 1;
+      state.batchIndex = item.batchIndex;
+      state.phase = item.phase || "primary";
+      state.retryPass = Number(item.retryPass || 0);
+      const inferredSuccess =
+        successfulRecordIds.has(recordId) ||
+        (item.status === "succeeded" &&
+          Number(result.failedCount || 0) === 0 &&
+          (Number(result.successCount || 0) >= expectedRecordIds.length ||
+            resultEntries.length === 0));
+      if (inferredSuccess) {
+        state.ok = true;
+        state.error = null;
+        state.classification = null;
+        continue;
+      }
+      state.hadFailure = true;
+      if (!state.ok) {
+        const fallbackError = item.error || result.error || {
+          code: "DETAIL_RESULT_MISSING",
+          message: "详情批次未返回这条记录的完成结果",
+        };
+        state.error = fallbackError;
+        state.classification = classifyProfileCollectionFailure(fallbackError);
+      }
+    }
+  }
+  const successfulStates = [...recordStates.values()].filter((state) => state.ok);
+  const failedStates = [...recordStates.values()].filter((state) => !state.ok);
+  const unresolvedRecordIds = new Set(
+    failedStates.map((state) => state.recordId),
+  );
+  const itemFailures = failedStates.map((state) => ({
+    batchIndex: state.batchIndex,
+    phase: state.phase,
+    retryPass: state.retryPass,
+    recordId: state.recordId,
+    classification: state.classification,
+    error: state.error,
+  }));
+  const failedBatches = batchResults
+    .filter((item) => {
+      const expectedRecordIds = Array.isArray(item.recordIds)
+        ? item.recordIds.map((recordId) => normalizeText(recordId, 160))
+        : [];
+      return (
+        item.status !== "succeeded" &&
+        (expectedRecordIds.length === 0 ||
+          expectedRecordIds.some((recordId) => unresolvedRecordIds.has(recordId)))
+      );
+    })
+    .map((item) => ({
+      batchIndex: item.batchIndex,
+      phase: item.phase || "primary",
+      retryPass: Number(item.retryPass || 0),
+      requestedCount: item.requestedCount,
+      classification: classifyProfileCollectionFailure(item.error),
+      error: item.error || null,
+    }));
+  return {
+    ok: failedStates.length === 0,
+    successCount: successfulStates.length,
+    failedCount: failedStates.length,
+    records: [...recordMap.values()],
+    recordIds: successfulStates.map((state) => state.recordId),
+    results,
+    itemFailures,
+    unclassifiedFailedCount: 0,
+    batchCount: batchResults.length,
+    primaryBatchCount: batchResults.filter(
+      (item) => (item.phase || "primary") === "primary",
+    ).length,
+    retryBatchCount: batchResults.filter((item) => item.phase === "retry").length,
+    retryPassesAttempted: new Set(
+      batchResults
+        .filter((item) => item.phase === "retry")
+        .map((item) => Number(item.retryPass || 0)),
+    ).size,
+    recoveredCount: successfulStates.filter((state) => state.hadFailure).length,
+    failedBatches,
+  };
+}
+
+function profileCollectionStage(parent, executionLog, plan, stageId, patch = {}) {
+  const plannedStage = plan.solution.steps.find((step) => step.id === stageId);
+  const current = executionLog.find((item) => item.id === stageId);
+  const next = current || {
+    id: stageId,
+    label: plannedStage?.label || stageId,
+    capability: plannedStage?.capability || "local_read",
+    status: "running",
+    startedAt: nowIso(),
+  };
+  Object.assign(next, patch);
+  if (!current) executionLog.push(next);
+  const stepIndex = Math.max(
+    0,
+    plan.solution.steps.findIndex((step) => step.id === stageId),
+  );
+  updateTask(parent, {
+    message: patch.message || next.label,
+    progress: {
+      stage: stageId,
+      stepIndex: stepIndex + 1,
+      totalSteps: plan.solution.steps.length,
+      processedCount: Number(patch.processedCount || 0),
+      totalCount: Number(patch.totalCount || 0),
+      currentUrl: patch.currentUrl || "",
+    },
+  });
+  return next;
+}
+
+async function runProfileCollectionWorkflow(parent, plan) {
+  if (!extensionPeer) {
+    finishTask(parent, {
+      status: "failed",
+      error: {
+        code: "EXTENSION_NOT_CONNECTED",
+        message: "MediaClaw 插件尚未连接",
+      },
+    });
+    return;
+  }
+  const executionLog = [];
+  const limitations = [...plan.limitations];
+  const profileUrl = plan.intent.profileUrl;
+  const platform = plan.intent.platform;
+  const archiveEnabled = plan.archive?.enabled === true;
+  let profile = null;
+  let profileFailure = null;
+  let detailResult = null;
+  let transcriptQuote = null;
+  let executionInterruption = null;
+  const detailAttemptedRecordIds = new Set();
+
+  updateTask(parent, {
+    status: "running",
+    message: "已按用户确认的方案开始采集账号数据",
+  });
+
+  if (plan.execution.includeProfile) {
+    const stage = profileCollectionStage(
+      parent,
+      executionLog,
+      plan,
+      "profile_info",
+      {message: "正在读取账号主页信息", currentUrl: profileUrl},
+    );
+    const profileTask = addChildTask(
+      parent,
+      startSingleCapture("profile_info", {
+        profileUrl,
+        platform,
+        featureKey: "capture.blogger",
+      }),
+    );
+    await profileTask.completion;
+    if (parent.status === "cancelled") return;
+    profile = profileTask.result?.profile || null;
+    Object.assign(stage, {
+      status: profileTask.status === "succeeded" ? "completed" : "failed",
+      finishedAt: nowIso(),
+      actualCount: profile ? 1 : 0,
+      error: profileTask.error || null,
+    });
+    if (profileTask.status !== "succeeded") {
+      profileFailure = profileTask.error || {
+        code: "PROFILE_INFO_FAILED",
+        message: "账号主页信息读取失败",
+      };
+      executionInterruption = profileCollectionExecutionInterruption(
+        profileFailure,
+        {stage: "profile_info"},
+      );
+      if (executionInterruption) stage.status = "paused";
+      limitations.push(
+        executionInterruption
+          ? executionInterruption.message
+          : "账号主页信息读取失败，作品采集仍继续执行",
+      );
+    }
+  }
+
+  const inventoryStage = profileCollectionStage(
+    parent,
+    executionLog,
+    plan,
+    "profile_inventory",
+    {
+      message: `正在扫描账号${profileCollectionContentLabel(plan.intent.contentType)}`,
+      totalCount: plan.execution.scanLimit,
+      currentUrl: profileUrl,
+    },
+  );
+  const allEntryMap = new Map();
+  const matchingEntryMap = new Map();
+  const scanBatchLog = [];
+  for (
+    let batchIndex = 0;
+    batchIndex < plan.execution.scanBatches.length && !executionInterruption;
+    batchIndex += 1
+  ) {
+    if (parent.status === "cancelled") return;
+    const batchLimit = plan.execution.scanBatches[batchIndex];
+    const attempts = [];
+    let scanTask = null;
+    for (
+      let attemptIndex = 0;
+      attemptIndex <= plan.execution.failureRetryPasses;
+      attemptIndex += 1
+    ) {
+      const isRetry = attemptIndex > 0;
+      profileCollectionStage(parent, executionLog, plan, "profile_inventory", {
+        message: isRetry
+          ? `正在重试账号作品清单第 ${batchIndex + 1} 批（第 ${attemptIndex}/${plan.execution.failureRetryPasses} 轮）`
+          : `正在扫描账号作品清单（第 ${batchIndex + 1}/${plan.execution.scanBatches.length} 批，最多 ${batchLimit} 条）`,
+        processedCount: allEntryMap.size,
+        totalCount: plan.execution.scanLimit,
+        currentUrl: profileUrl,
+      });
+      scanTask = addChildTask(
+        parent,
+        startSingleCapture("profile_posts", {
+          profileUrl,
+          platform,
+          featureKey: "capture.blogger",
+          limit: batchLimit,
+          options: {
+            detailCapture: false,
+            riskAuthorization: profileCollectionRiskAuthorization(
+              plan,
+              "list",
+              batchIndex,
+              batchLimit,
+              isRetry ? `list-retry-${attemptIndex}` : "list",
+            ),
+          },
+        }),
+      );
+      await scanTask.completion;
+      if (parent.status === "cancelled") return;
+      const attemptError = scanTask.error || scanTask.result?.error || null;
+      const classification =
+        scanTask.status === "succeeded"
+          ? null
+          : classifyProfileCollectionFailure(attemptError);
+      attempts.push({
+        attempt: attemptIndex + 1,
+        retryPass: attemptIndex,
+        status: scanTask.status === "succeeded" ? "completed" : "failed",
+        classification,
+        error: attemptError,
+      });
+      if (
+        scanTask.status === "succeeded" ||
+        !isRetryableProfileCollectionFailure(classification)
+      ) {
+        break;
+      }
+    }
+    const batchResult = scanTask?.result;
+    const batchError = scanTask?.error || scanTask?.result?.error || null;
+    const batchFailureClassification =
+      scanTask?.status === "succeeded"
+        ? null
+        : classifyProfileCollectionFailure(batchError);
+    const batchLog = {
+      batchIndex: batchIndex + 1,
+      requestedCount: batchLimit,
+      status: scanTask?.status === "succeeded" ? "completed" : "failed",
+      actualCount: 0,
+      newCount: 0,
+      attempts,
+      retryPassesAttempted: Math.max(0, attempts.length - 1),
+      recoveredAfterRetry:
+        attempts.length > 1 && scanTask?.status === "succeeded",
+      error: batchError,
+      failureClassification: batchFailureClassification,
+    };
+    scanBatchLog.push(batchLog);
+    if (scanTask?.status !== "succeeded") {
+      const scanInterruption = profileCollectionExecutionInterruption(
+        batchError,
+        {
+          stage: "profile_inventory",
+          batchIndex: batchIndex + 1,
+        },
+      );
+      if (scanInterruption) {
+        executionInterruption = scanInterruption;
+      }
+      limitations.push(
+        scanInterruption
+          ? scanInterruption.message
+          : `基础列表第 ${batchIndex + 1} 批失败（${batchLog.failureClassification}），这不属于数量上限；已保留前面批次结果`,
+      );
+      if (!scanInterruption && allEntryMap.size === 0) {
+        Object.assign(inventoryStage, {
+          status: "failed",
+          finishedAt: nowIso(),
+          batches: scanBatchLog,
+          error: batchError,
+        });
+        finishTask(parent, {
+          status: "failed",
+          result: {
+            ok: false,
+            workflow: "profile_collection",
+            planId: plan.planId,
+            userGoal: plan.userGoal,
+            executionLog,
+            limitations,
+            failureClassification: batchLog.failureClassification,
+          },
+          error: batchError || {
+            code: "PROFILE_COLLECTION_SCAN_FAILED",
+            message: "账号作品清单扫描失败",
+          },
+        });
+        return;
+      }
+      break;
+    }
+    const allBatchEntries = profileCollectionRecordEntries(batchResult, {
+      ...plan,
+      intent: {...plan.intent, contentType: "all"},
+    });
+    const matchingBatchEntries = profileCollectionRecordEntries(
+      batchResult,
+      plan,
+    );
+    batchLog.actualCount = allBatchEntries.length;
+    batchLog.newCount = mergeProfileCollectionEntries(
+      allEntryMap,
+      allBatchEntries,
+    );
+    mergeProfileCollectionEntries(matchingEntryMap, matchingBatchEntries);
+    if (
+      allEntryMap.size >= plan.execution.scanLimit ||
+      batchLog.newCount === 0
+    ) {
+      batchLog.endReason =
+        allEntryMap.size >= plan.execution.scanLimit
+          ? "requested_scope_reached"
+          : "no_new_records";
+      break;
+    }
+  }
+
+  const allEntries = [...allEntryMap.values()].slice(
+    0,
+    plan.execution.scanLimit,
+  );
+  const matchingEntries = [...matchingEntryMap.values()];
+  const selectedEntries = matchingEntries
+    .filter((entry) => entry.recordId)
+    .slice(0, plan.execution.executionItemLimit);
+  Object.assign(inventoryStage, {
+    status: executionInterruption
+      ? "paused"
+      : scanBatchLog.some((item) => item.status === "failed")
+        ? "partial"
+        : "completed",
+    finishedAt: nowIso(),
+    actualCount: allEntries.length,
+    requestedCount: plan.execution.scanLimit,
+    batches: scanBatchLog,
+  });
+  if (
+    allEntries.length < plan.execution.scanLimit &&
+    !scanBatchLog.some((item) => item.status === "failed") &&
+    !executionInterruption
+  ) {
+    limitations.push(
+      `计划上限为 ${plan.execution.scanLimit} 条，主页本次实际返回 ${allEntries.length} 条；这表示主页已到末尾、去重后无新记录或页面未完全加载，不表示触发数量上限`,
+    );
+  }
+
+  if (plan.intent.contentType !== "all" && !executionInterruption) {
+    const filterStage = profileCollectionStage(
+      parent,
+      executionLog,
+      plan,
+      "content_filter",
+      {message: `正在筛选${profileCollectionContentLabel(plan.intent.contentType)}`},
+    );
+    Object.assign(filterStage, {
+      status: "completed",
+      finishedAt: nowIso(),
+      inputCount: allEntries.length,
+      actualCount: matchingEntries.length,
+    });
+  }
+  if (matchingEntries.length > selectedEntries.length) {
+    limitations.push(
+      `匹配到 ${matchingEntries.length} 条${profileCollectionContentLabel(plan.intent.contentType)}，本方案按确认边界处理前 ${selectedEntries.length} 条`,
+    );
+  }
+
+  if (
+    plan.execution.requiresDetail &&
+    selectedEntries.length > 0 &&
+    !executionInterruption
+  ) {
+    const detailStage = profileCollectionStage(
+      parent,
+      executionLog,
+      plan,
+      "detail_enhancement",
+      {
+        message: `正在补采 ${selectedEntries.length} 条作品详情`,
+        totalCount: selectedEntries.length,
+      },
+    );
+    const recordIds = selectedEntries.map((entry) => entry.recordId);
+    const detailBatchResults = [];
+    const detailBatchCount = Math.ceil(
+      recordIds.length / MAX_DEEP_COLLECT_LIMIT,
+    );
+    const runDetailBatch = async ({
+      batchRecordIds,
+      batchIndex,
+      totalBatches,
+      phase = "primary",
+      retryPass = 0,
+    }) => {
+      const isRetry = phase === "retry";
+      for (const recordId of batchRecordIds) {
+        detailAttemptedRecordIds.add(recordId);
+      }
+      profileCollectionStage(parent, executionLog, plan, "detail_enhancement", {
+        message: isRetry
+          ? `正在重试详情失败项（第 ${retryPass}/${plan.execution.failureRetryPasses} 轮，第 ${batchIndex + 1}/${totalBatches} 批，${batchRecordIds.length} 条）`
+          : `正在补采作品详情（第 ${batchIndex + 1}/${totalBatches} 批，${batchRecordIds.length} 条）`,
+        processedCount: Number(detailResult?.successCount || 0),
+        totalCount: selectedEntries.length,
+      });
+      const detailTask = addChildTask(
+        parent,
+        startSingleCapture("enhance_records", {
+          platform,
+          featureKey: "capture.enhancement",
+          limit: batchRecordIds.length,
+          options: {
+            recordIds: batchRecordIds,
+            includeComments: plan.execution.includeComments,
+            commentsMaxDetectedItems: plan.execution.commentsPerItemLimit,
+            includeBloggerMetrics: plan.execution.includeBloggerMetrics,
+            confirmation: {
+              confirmed: true,
+              source: "mediaclaw_confirm_profile_collection",
+              planId: plan.planId,
+            },
+            riskAuthorization: profileCollectionRiskAuthorization(
+              plan,
+              "enhancement",
+              batchIndex,
+              batchRecordIds.length,
+              isRetry
+                ? `enhancement-retry-${retryPass}`
+                : "enhancement",
+            ),
+          },
+        }),
+      );
+      await detailTask.completion;
+      if (parent.status === "cancelled") return false;
+      detailBatchResults.push({
+        batchIndex: batchIndex + 1,
+        requestedCount: batchRecordIds.length,
+        recordIds: batchRecordIds,
+        phase,
+        retryPass,
+        status: detailTask.status,
+        result: detailTask.result,
+        error: detailTask.error || detailTask.result?.error || null,
+      });
+      detailResult = combineProfileCollectionDetailResults(detailBatchResults);
+      const taskInterruption = profileCollectionExecutionInterruption(
+        detailTask.error || detailTask.result?.error || {},
+        {
+          stage: "detail_enhancement",
+          batchIndex: batchIndex + 1,
+          recordId: batchRecordIds[0] || "",
+        },
+      );
+      const itemInterruption = (detailResult.itemFailures || [])
+        .filter((item) => batchRecordIds.includes(item.recordId))
+        .map((item) =>
+          profileCollectionExecutionInterruption(item.error, {
+            stage: "detail_enhancement",
+            batchIndex: batchIndex + 1,
+            recordId: item.recordId,
+          }),
+        )
+        .find(Boolean);
+      executionInterruption =
+        executionInterruption || taskInterruption || itemInterruption || null;
+      if (executionInterruption) {
+        limitations.push(executionInterruption.message);
+      }
+      return true;
+    };
+    for (
+      let batchIndex = 0;
+      batchIndex < detailBatchCount;
+      batchIndex += 1
+    ) {
+      if (parent.status === "cancelled") return;
+      const batchRecordIds = recordIds.slice(
+        batchIndex * MAX_DEEP_COLLECT_LIMIT,
+        (batchIndex + 1) * MAX_DEEP_COLLECT_LIMIT,
+      );
+      const completed = await runDetailBatch({
+        batchRecordIds,
+        batchIndex,
+        totalBatches: detailBatchCount,
+      });
+      if (!completed) return;
+      if (executionInterruption) break;
+    }
+    for (
+      let retryPass = 1;
+      retryPass <= plan.execution.failureRetryPasses && !executionInterruption;
+      retryPass += 1
+    ) {
+      const retryRecordIds = (detailResult?.itemFailures || [])
+        .filter((item) =>
+          isRetryableProfileCollectionFailure(item.classification),
+        )
+        .map((item) => item.recordId)
+        .filter(Boolean);
+      if (retryRecordIds.length === 0) break;
+      const retryBatchCount = Math.ceil(
+        retryRecordIds.length / MAX_DEEP_COLLECT_LIMIT,
+      );
+      for (
+        let batchIndex = 0;
+        batchIndex < retryBatchCount;
+        batchIndex += 1
+      ) {
+        if (parent.status === "cancelled") return;
+        const batchRecordIds = retryRecordIds.slice(
+          batchIndex * MAX_DEEP_COLLECT_LIMIT,
+          (batchIndex + 1) * MAX_DEEP_COLLECT_LIMIT,
+        );
+        const completed = await runDetailBatch({
+          batchRecordIds,
+          batchIndex,
+          totalBatches: retryBatchCount,
+          phase: "retry",
+          retryPass,
+        });
+        if (!completed) return;
+        if (executionInterruption) break;
+      }
+    }
+    if (detailResult.failedBatches.length > 0) {
+      limitations.push(
+        `${detailResult.failedBatches.length} 个详情批次未完成；已按页面加载/解析、权限或风险确认分别标注，不会归因于作品总量上限`,
+      );
+    }
+    if (detailResult.failedCount > 0) {
+      limitations.push(
+        `${detailResult.failedCount} 条详情记录未完成；单条页面加载或解析失败不属于数量上限，失败项已单独保留`,
+      );
+    }
+    Object.assign(detailStage, {
+      status: executionInterruption
+        ? "paused"
+        : detailResult.failedBatches.length === 0 &&
+            detailResult.failedCount === 0
+          ? "completed"
+          : detailResult.successCount > 0
+            ? "partial"
+            : "failed",
+      finishedAt: nowIso(),
+      requestedCount: selectedEntries.length,
+      actualCount: Number(detailResult?.successCount || 0),
+      failedCount: Number(detailResult?.failedCount || 0),
+      retrySummary: {
+        configuredPasses: plan.execution.failureRetryPasses,
+        attemptedPasses: Number(detailResult?.retryPassesAttempted || 0),
+        retryBatchCount: Number(detailResult?.retryBatchCount || 0),
+        recoveredCount: Number(detailResult?.recoveredCount || 0),
+        unresolvedCount: Number(detailResult?.failedCount || 0),
+      },
+      batches: detailBatchResults.map((item) => ({
+        batchIndex: item.batchIndex,
+        phase: item.phase,
+        retryPass: item.retryPass,
+        requestedCount: item.requestedCount,
+        status:
+          item.status !== "succeeded"
+            ? "failed"
+            : Number(item.result?.failedCount || 0) > 0
+              ? "partial"
+              : "completed",
+        actualCount: Number(item.result?.successCount || 0),
+        failedCount: Number(item.result?.failedCount || 0),
+        failureClassification:
+          item.status !== "succeeded"
+            ? classifyProfileCollectionFailure(item.error)
+            : Number(item.result?.failedCount || 0) > 0
+              ? classifyProfileCollectionFailure(
+                  profileCollectionDetailEntryError(
+                    item.result?.results?.find(
+                      (entry) => entry?.ok === false,
+                    ),
+                  ),
+                )
+              : null,
+        error: item.error,
+      })),
+      error: detailResult.failedBatches[0]?.error || null,
+    });
+  }
+
+  const transcriptRecordIds = (
+    selectedEntries
+      .filter((entry) => isProfileCollectionVideoEntry(entry, platform))
+      .map((entry) => entry.recordId)
+      .filter((recordId) =>
+        !plan.execution.requiresDetail ||
+        !detailResult ||
+        detailResult.recordIds.includes(recordId),
+      )
+  ).slice(0, plan.execution.transcriptQuoteLimit);
+  if (
+    plan.execution.requestsTranscript &&
+    transcriptRecordIds.length > 0 &&
+    !executionInterruption
+  ) {
+    const quoteStage = profileCollectionStage(
+      parent,
+      executionLog,
+      plan,
+      "transcript_quote",
+      {
+        message: `正在为 ${transcriptRecordIds.length} 条视频生成逐字稿报价`,
+        totalCount: transcriptRecordIds.length,
+      },
+    );
+    const quoteTask = addChildTask(
+      parent,
+      startSingleCapture("extract_video_transcript", {
+        platform,
+        featureKey: "extract.video_transcript",
+        options: {
+          meteredAction: "quote",
+          recordIds: transcriptRecordIds,
+        },
+      }),
+    );
+    await quoteTask.completion;
+    if (parent.status === "cancelled") return;
+    transcriptQuote = quoteTask.result;
+    Object.assign(quoteStage, {
+      status: quoteTask.status === "succeeded" ? "completed" : "failed",
+      finishedAt: nowIso(),
+      actualCount: Array.isArray(transcriptQuote?.recordIds)
+        ? transcriptQuote.recordIds.length
+        : 0,
+      error: quoteTask.error || transcriptQuote?.error || null,
+    });
+  }
+
+  const auditStage = profileCollectionStage(
+    parent,
+    executionLog,
+    plan,
+    "coverage_audit",
+    {message: "正在核对计划与实际采集覆盖"},
+  );
+  const detailRequestedCount = plan.execution.requiresDetail
+    ? Math.min(
+        matchingEntries.length,
+        plan.execution.executionItemLimit,
+      )
+    : 0;
+  const detailAttemptedCount = plan.execution.requiresDetail
+    ? detailAttemptedRecordIds.size
+    : 0;
+  const detailSuccessCount = plan.execution.requiresDetail
+    ? Number(detailResult?.successCount || 0)
+    : 0;
+  const detailIncomplete =
+    plan.execution.requiresDetail &&
+    detailRequestedCount > 0 &&
+    detailSuccessCount < detailRequestedCount;
+  const scanIncomplete = scanBatchLog.some(
+    (item) => item.status === "failed",
+  );
+  const transcriptQuoteFailed =
+    plan.execution.requestsTranscript &&
+    (transcriptRecordIds.length === 0 || !transcriptQuote?.quoteId);
+  const profileIncomplete = plan.execution.includeProfile && !profile;
+  Object.assign(auditStage, {
+    status: executionInterruption ? "paused" : "completed",
+    finishedAt: nowIso(),
+    actualCount: matchingEntries.length,
+  });
+
+  const resultRecords =
+    Array.isArray(detailResult?.records) && detailResult.records.length > 0
+      ? detailResult.records
+      : selectedEntries.map((entry) => entry.record).filter(Boolean);
+  const workflowPartial =
+    Boolean(executionInterruption) ||
+    profileIncomplete ||
+    scanIncomplete ||
+    detailIncomplete ||
+    transcriptQuoteFailed;
+  const goalStatus = executionInterruption
+    ? "paused_for_user_action"
+    : workflowPartial
+      ? "partial"
+      : plan.execution.requestsTranscript && transcriptQuote?.quoteId
+        ? "awaiting_transcript_confirmation"
+        : "completed";
+  const targetRecordIds = selectedEntries
+    .map((entry) => entry.recordId)
+    .filter(Boolean);
+  const deliveredRecords = archiveEnabled
+    ? resultRecords.slice(0, MAX_PROFILE_ARCHIVE_RESULT_PREVIEW)
+    : resultRecords;
+  const retrySummary = {
+    configuredPasses: plan.execution.failureRetryPasses,
+    scan: {
+      attemptedPasses: scanBatchLog.reduce(
+        (sum, item) => sum + Number(item.retryPassesAttempted || 0),
+        0,
+      ),
+      recoveredBatchCount: scanBatchLog.filter(
+        (item) => item.recoveredAfterRetry,
+      ).length,
+      unresolvedBatchCount: scanBatchLog.filter(
+        (item) => item.status === "failed",
+      ).length,
+    },
+    detail: {
+      attemptedPasses: Number(detailResult?.retryPassesAttempted || 0),
+      retryBatchCount: Number(detailResult?.retryBatchCount || 0),
+      recoveredRecordCount: Number(detailResult?.recoveredCount || 0),
+      unresolvedRecordCount: Number(detailResult?.failedCount || 0),
+    },
+  };
+  const archive = archiveEnabled
+    ? {
+        archiveJobId: parent.taskId,
+        status: goalStatus,
+        storage: plan.archive.storage,
+        taskRetentionDays: plan.archive.taskRetentionDays,
+        recordsStoredInDataPool: true,
+        storedRecordCount: targetRecordIds.length,
+        detailCompleteCount: detailSuccessCount,
+        detailIncompleteCount: Math.max(
+          0,
+          detailRequestedCount - detailSuccessCount,
+        ),
+        recordIdPreview: targetRecordIds.slice(
+          0,
+          MAX_PROFILE_ARCHIVE_RESULT_PREVIEW,
+        ),
+        resultDelivery: plan.archive.resultDelivery,
+        previewCount: deliveredRecords.length,
+        fullRecordQuery: plan.archive.fullRecordQuery,
+        fullRecordRead: plan.archive.fullRecordRead,
+        taskStatusQuery: {
+          tool: "mediaclaw_task_status",
+          arguments: {taskId: parent.taskId},
+        },
+        retrySummary,
+      }
+    : null;
+  finishTask(parent, {
+    status: executionInterruption ? "input_required" : "succeeded",
+    result: {
+      ok: !workflowPartial,
+      workflow: "profile_collection",
+      planId: plan.planId,
+      userGoal: plan.userGoal,
+      goalStatus,
+      archiveJobId: archiveEnabled ? parent.taskId : null,
+      intent: plan.intent,
+      requestedData: plan.requestedData,
+      coverage: {
+        profileRequested: plan.execution.includeProfile,
+        profileCaptured: Boolean(profile),
+        requestedScanCount: plan.execution.scanLimit,
+        actualScannedCount: allEntries.length,
+        scanBatchCount: scanBatchLog.length,
+        scanFailedBatchCount: scanBatchLog.filter(
+          (item) => item.status === "failed",
+        ).length,
+        matchedCount: matchingEntries.length,
+        selectedCount: selectedEntries.length,
+        detailRequestedCount,
+        detailAttemptedCount,
+        detailSuccessCount,
+        detailFailedCount: Number(detailResult?.failedCount || 0),
+        detailUnattemptedCount: Math.max(
+          0,
+          detailRequestedCount - detailAttemptedCount,
+        ),
+        detailBatchCount: Number(detailResult?.batchCount || 0),
+        detailPrimaryBatchCount: Number(
+          detailResult?.primaryBatchCount || 0,
+        ),
+        detailRetryBatchCount: Number(detailResult?.retryBatchCount || 0),
+      },
+      analysisPerformed: archiveEnabled
+        ? [
+            "按已确认的数据目标归档账号作品",
+            "核对计划范围、数据池记录和详情覆盖",
+            "分类重试可恢复故障并保留最终失败项",
+          ]
+        : [
+            "按已确认的数据目标筛选内容类型",
+            "核对计划范围与实际匹配数量",
+            "汇总详情成功、失败和未执行范围",
+          ],
+      retrySummary,
+      executionLog,
+      failureSummary: {
+        profile: profileFailure
+          ? {
+              classification: classifyProfileCollectionFailure(profileFailure),
+              error: profileFailure,
+            }
+          : null,
+        scanBatches: scanBatchLog
+          .filter((item) => item.status === "failed")
+          .map((item) => ({
+            batchIndex: item.batchIndex,
+            classification: item.failureClassification,
+            error: item.error,
+          })),
+        detailBatches: detailResult?.failedBatches || [],
+        detailItems: detailResult?.itemFailures || [],
+        unclassifiedDetailFailureCount:
+          Number(detailResult?.unclassifiedFailedCount || 0),
+        quantityLimitFailureCount: [
+          ...scanBatchLog
+            .filter((item) => item.status === "failed")
+            .map((item) => item.failureClassification),
+          ...(detailResult?.failedBatches || []).map(
+            (item) => item.classification,
+          ),
+          ...(detailResult?.itemFailures || []).map(
+            (item) => item.classification,
+          ),
+        ].filter((classification) => classification === "batch_planning_error")
+          .length,
+      },
+      profile,
+      records: deliveredRecords,
+      archive,
+      transcriptQuote,
+      executionInterruption,
+      nextAction: executionInterruption
+        ? {
+            required: true,
+            action:
+              executionInterruption.reason === "platform_cooldown"
+                ? "wait_for_platform_cooldown"
+                : executionInterruption.reason === "verification_required"
+                  ? "complete_browser_verification"
+                  : "restore_browser_login",
+            title: executionInterruption.title,
+            message: executionInterruption.message,
+            nextAllowedAt: executionInterruption.nextAllowedAt,
+            continuation: executionInterruption.continuation,
+            preservesCompletedRecords:
+              executionInterruption.preservesCompletedRecords,
+            doesNotMeanUnsupported:
+              executionInterruption.doesNotMeanUnsupported,
+          }
+        : null,
+      nextConfirmation:
+        transcriptQuote?.quoteId
+          ? {
+              required: true,
+              action: "confirm_video_transcript",
+              quoteId: transcriptQuote.quoteId,
+              message: "逐字稿尚未执行；请先向用户展示报价，取得明确同意后再确认",
+            }
+          : null,
+      limitations,
+    },
+    error: null,
+    message:
+      executionInterruption
+        ? executionInterruption.message
+        : goalStatus === "awaiting_transcript_confirmation"
+        ? `已完成 ${matchingEntries.length} 条匹配记录的采集准备，逐字稿等待报价确认`
+        : goalStatus === "partial"
+          ? `已保留部分结果：扫描 ${allEntries.length}/${plan.execution.scanLimit} 条，匹配 ${matchingEntries.length} 条，详情成功 ${detailSuccessCount}/${detailRequestedCount} 条；失败原因已单独分类`
+        : `已扫描 ${allEntries.length} 条作品，匹配 ${matchingEntries.length} 条，完成 ${detailSuccessCount || selectedEntries.length} 条目标记录`,
+  });
+}
+
+function startProfileCollectionWorkflow(plan) {
+  const archiveEnabled = plan.archive?.enabled === true;
+  const task = createTask({
+    kind: "workflow",
+    taskId: archiveEnabled ? createId("archive") : "",
+    input: {
+      planId: plan.planId,
+      userGoal: plan.userGoal,
+      operationMode: plan.intent.operationMode,
+      profileUrl: plan.intent.profileUrl,
+      platform: plan.intent.platform,
+    },
+    ttlMs: archiveEnabled ? PROFILE_ARCHIVE_JOB_TTL_MS : TASK_TTL_MS,
+  });
+  plan.usedAt = nowIso();
+  void runProfileCollectionWorkflow(task, plan);
   return task;
 }
 
@@ -2860,7 +5061,11 @@ async function cancelTask(taskId) {
   if (!task) {
     return {ok: false, error: {code: "TASK_NOT_FOUND", message: "任务不存在"}};
   }
-  if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+  if (
+    ["succeeded", "failed", "cancelled", "input_required"].includes(
+      task.status,
+    )
+  ) {
     return {ok: true, canceled: false, task: taskSnapshot(task)};
   }
   if (
@@ -2914,7 +5119,11 @@ async function cancelTask(taskId) {
       pumpQueue();
       return {ok: true, canceled: true, task: taskSnapshot(task)};
     }
-    if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+    if (
+      ["succeeded", "failed", "cancelled", "input_required"].includes(
+        task.status,
+      )
+    ) {
       return {
         ok: task.status === "cancelled",
         canceled: task.status === "cancelled",
@@ -3032,7 +5241,7 @@ const tools = [
   {
     name: "mediaclaw_list_assets",
     description:
-      "统一列出 MediaClaw 资产。用户要求模仿、仿写或按某人/某账号风格创作时，无需用户声明已保存：先查询 local.studio 的 style_profile，本地未命中再查询 remote.workbench。返回稳定 assetId，随后必须读取完整对象。浏览器本地数据池和本地 Studio 数据无限读取；remote.workbench 需要有效会员。",
+      "统一列出 MediaClaw 资产。用户要求模仿、仿写或按某人/某账号风格创作时，无需用户声明已保存：先查询 local.studio 的 style_profile，本地未命中再查询 remote.workbench。全量账号归档使用 local.data_pool + capture_record，并按返回方案的 profileUrl、platform、recordType、contentType filters 与 cursor 分页。返回稳定 assetId，随后必须读取完整对象。浏览器本地数据池和本地 Studio 数据无限读取；remote.workbench 需要有效会员。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -3064,12 +5273,63 @@ const tools = [
   {
     name: "mediaclaw_get_asset",
     description:
-      "按 mediaclaw_list_assets 返回的稳定 assetId 读取完整资产；不裁剪插件已经保存的字段。",
+      "按 mediaclaw_list_assets 返回的稳定 assetId 读取资产。local.data_pool 默认返回 manifest 和所选语义分区，底层仍是一条完整缓存记录；大型数组和长文本通过统一 page 参数分页或分段，不会重新采集、打开作品页或扣积分。先读 manifest，再按任务选择 identity/content/creator/metrics/media/comments/extractedContent/context；只有无损调试才使用 view=raw。读取失败或超时不代表本地未命中，禁止自动改用采集工具。local.studio 与 remote.workbench 暂保持完整对象读取。",
     execution: captureExecution,
     inputSchema: {
       type: "object",
       properties: {
         assetId: {type: "string"},
+        view: {
+          type: "string",
+          enum: ["sections", "raw"],
+          default: "sections",
+          description: "sections 为 Agent 默认读取视图；raw 仅用于无损调试。",
+        },
+        sections: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: [
+              "identity",
+              "content",
+              "creator",
+              "metrics",
+              "media",
+              "comments",
+              "extractedContent",
+              "context",
+            ],
+          },
+          uniqueItems: true,
+          description: "需要读取的资产语义分区；省略时返回 identity 和完整 manifest。",
+        },
+        page: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              enum: [
+                "media.imageUrls",
+                "media.videoUrls",
+                "media.audioUrls",
+                "comments.items",
+                "comments.mergedText",
+                "comments.leads",
+                "extractedContent.imageText.text",
+                "extractedContent.imageText.pages",
+                "extractedContent.transcript.text",
+                "extractedContent.transcript.sentenceText",
+                "extractedContent.transcript.sentences",
+                "context.items",
+              ],
+            },
+            cursor: {type: "string", default: "0"},
+            limit: {type: "integer", minimum: 1, maximum: 50000},
+          },
+          required: ["path"],
+          additionalProperties: false,
+          description: "大型数组或长文本的通用分页参数；数组实际单页最多 500 项，文本最多 50000 字符。",
+        },
         async: {type: "boolean", default: false},
       },
       required: ["assetId"],
@@ -3087,6 +5347,12 @@ const tools = [
         url: {type: "string"},
         platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
         includeComments: {type: "boolean", default: false},
+        commentsPerItemLimit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 500,
+          default: 30,
+        },
         includeBloggerMetrics: {type: "boolean", default: false},
         idempotencyKey: {type: "string"},
         async: {type: "boolean", default: false},
@@ -3129,6 +5395,115 @@ const tools = [
         async: {type: "boolean", default: false},
       },
       required: ["profileUrl"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_prepare_profile_collection",
+    description:
+      "根据已经澄清的用户用途和数据目标制定账号采集方案，但不启动浏览器、不采集数据。‘全部采下来／完整导出／爬这个账号／每篇详情都要’必须映射为 full_collection，不套用 50/80 条研究建议终点。工具会按用途建议样本量，同时保留用户明确要求的总量，把超过单批或连续建议额度的目标拆成可审计批次，并返回普通／黄色／红色三级确认：多批、超过用途建议量或 21～100 个详情页为黄色；超过 1000 条列表、超过 100 个详情页、预计评论超过 5000 条或近期同平台发生限频／登录／验证码为红色。风险提示不会静默缩小用户范围，也不会把 80/300 等默认值误报成平台总量能力。调用前必须先明确主页、用途、内容类型、范围和字段；如果‘视频链接’等表达可能指作品页链接或媒体源地址，应先向用户澄清。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        userGoal: {
+          type: "string",
+          description: "保留用户已经确认的数据目标，用于执行审计和防止目标被默认能力降级。",
+        },
+        profileUrl: {type: "string", description: "账号主页链接"},
+        platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
+        purpose: {
+          type: "string",
+          enum: [
+            "full_collection",
+            "inventory_export",
+            "account_analysis",
+            "representative_research",
+          ],
+          description:
+            "用户用途：完整归档、清单导出、账号分析或代表作品机制研究。用途决定建议量，但不会覆盖用户明确选择的范围。",
+        },
+        contentType: {
+          type: "string",
+          enum: ["all", "video", "image"],
+          description: "用户要全部作品、视频作品还是图文作品。",
+        },
+        coverage: {
+          type: "string",
+          enum: ["all_available", "latest"],
+          description: "采集主页当前可加载范围，或只采最近指定数量。",
+        },
+        maxItems: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_PROFILE_COLLECTION_PLAN_ITEMS,
+          description:
+            "本次确认的总量上限，不是单批数量。工具会自动拆成基础列表每批最多 300、详情增强每批最多 100；完整采集必须提供已知总量或明确授权上限。",
+        },
+        failureRetryPasses: {
+          type: "integer",
+          minimum: 0,
+          maximum: MAX_PROFILE_ARCHIVE_RETRY_PASSES,
+          description:
+            "页面加载或解析失败后的整项任务重试轮数；完整归档默认 1，最多 2。无效链接、权限、验证码和用户取消不重试。",
+        },
+        commentsPerItemLimit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 500,
+          description:
+            "仅在 requestedFields 包含 comments 时生效；默认每篇 30 条，最高每篇 500 条。",
+        },
+        requestedFields: {
+          type: "array",
+          minItems: 1,
+          uniqueItems: true,
+          items: {
+            type: "string",
+            enum: [
+              "account_profile",
+              "title",
+              "post_page_url",
+              "cover",
+              "publish_time",
+              "engagement_metrics",
+              "content_text",
+              "media_urls",
+              "comments",
+              "blogger_metrics",
+              "video_transcript",
+            ],
+          },
+          description:
+            "用户明确要拿到的数据。‘全部作品详情’通常包含标题、作品页链接、封面、发布时间、互动、正文和媒体地址；评论、博主指标和逐字稿只有用户明确要求时才加入。",
+        },
+      },
+      required: [
+        "userGoal",
+        "profileUrl",
+        "purpose",
+        "contentType",
+        "coverage",
+        "requestedFields",
+      ],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_confirm_profile_collection",
+    description:
+      "只在用户已经看到 mediaclaw_prepare_profile_collection 返回的完整方案和范围并明确同意后调用。仅接受未过期、当前设备拥有且未使用的一次性 planId；执行时不能修改目标、字段或数量。一次确认覆盖已展示的分批和页面加载／解析类故障重试。完整归档返回 archiveJobId、最多 20 条预览和本地数据池分页读取方案；单条失败不阻断其余记录。登录、验证码或平台冷却不自动重试，也不包装成‘插件做不了’，而是返回 input_required、已完成覆盖和恢复动作。所有模式都返回逐阶段进度、实际覆盖、执行日志、失败项和后续确认事项，避免黑盒采集。",
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        planId: {type: "string"},
+        async: {
+          type: "boolean",
+          default: false,
+          description: "长任务可设为 true，立即返回任务句柄并用 task_status 查看进度。",
+        },
+      },
+      required: ["planId"],
       additionalProperties: false,
     },
   },
@@ -3552,6 +5927,16 @@ const tools = [
           description: "如 single_note、keyword_notes、blogger_notes、comments",
         },
         status: {type: "string"},
+        profileUrl: {
+          type: "string",
+          description: "只返回归属于该账号主页的作品记录，用于全量归档分页读取。",
+        },
+        contentType: {
+          type: "string",
+          enum: ["all", "video", "image"],
+          default: "all",
+          description: "按全部作品、视频作品或图文作品筛选归档记录。",
+        },
         keyword: {type: "string", description: "匹配标题、正文、作者或链接"},
         offset: {type: "integer", minimum: 0, default: 0},
         limit: {type: "integer", minimum: 1, maximum: 100, default: 50},
@@ -3717,7 +6102,7 @@ const tools = [
   },
   {
     name: "mediaclaw_task_status",
-    description: "读取异步采集任务的进度和结果。",
+    description: "读取异步 MediaClaw 任务（包括本地资产读取、提取和采集）的进度与结果。",
     inputSchema: {
       type: "object",
       properties: {taskId: {type: "string"}},
@@ -3771,7 +6156,16 @@ async function executeCaptureTool(name, args) {
     return startSingleCapture(mode, {
       ...args,
       limit: 1,
-      options: {operation: "get", assetId: args.assetId},
+      options: {
+        operation: "get",
+        assetId: args.assetId,
+        view: args.view || "sections",
+        sections: Array.isArray(args.sections) ? args.sections : [],
+        page:
+          args.page && typeof args.page === "object"
+            ? args.page
+            : {},
+      },
     });
   }
   if (name === "mediaclaw_capture_note") {
@@ -3780,6 +6174,10 @@ async function executeCaptureTool(name, args) {
       featureKey: "capture.single_note",
       options: {
         includeComments: args.includeComments === true,
+        commentsMaxDetectedItems: Math.min(
+          500,
+          Math.max(1, Math.floor(Number(args.commentsPerItemLimit) || 30)),
+        ),
         includeBloggerMetrics: args.includeBloggerMetrics === true,
       },
     });
@@ -3809,6 +6207,10 @@ async function executeCaptureTool(name, args) {
       options: {
         recordIds: args.recordIds,
         includeComments: args.includeComments === true,
+        commentsMaxDetectedItems: Math.min(
+          500,
+          Math.max(1, Math.floor(Number(args.commentsPerItemLimit) || 30)),
+        ),
         includeBloggerMetrics: args.includeBloggerMetrics === true,
         confirmation: {confirmed: args.confirmed === true},
       },
@@ -3906,6 +6308,8 @@ async function executeCaptureTool(name, args) {
         platform: args.platform || "",
         recordType: args.recordType || "",
         status: args.status || "",
+        profileUrl: args.profileUrl || "",
+        contentType: args.contentType || "all",
         keyword: args.keyword || "",
         offset: args.offset,
         limit: args.limit,
@@ -4027,6 +6431,66 @@ async function handleToolCall(params = {}) {
       message,
     });
   }
+  if (name === "mediaclaw_prepare_profile_collection") {
+    try {
+      const plan = createProfileCollectionPlan(args, adapter);
+      return toolResult({
+        ok: true,
+        status: "confirmation_required",
+        collectionStarted: false,
+        plan,
+      });
+    } catch (error) {
+      return toolResult(
+        {
+          ok: false,
+          error: {
+            code: "INVALID_PROFILE_COLLECTION_INTENT",
+            message: error instanceof Error ? error.message : "账号采集目标无效",
+          },
+        },
+        {isError: true},
+      );
+    }
+  }
+  if (name === "mediaclaw_confirm_profile_collection") {
+    const resolved = resolveProfileCollectionPlan(args.planId, adapter);
+    if (!resolved.ok) {
+      return toolResult(resolved, {isError: true});
+    }
+    if (!extensionPeer || !adapterSession(adapter)) {
+      return toolResult(
+        {
+          ok: false,
+          error: {
+            code: extensionPeer ? "PAIRING_REQUIRED" : "EXTENSION_NOT_CONNECTED",
+            message: extensionPeer
+              ? "设备尚未获用户批准。采集方案尚未使用，完成配对后可继续确认。"
+              : "MediaClaw 插件尚未连接。采集方案尚未使用，连接后可继续确认。",
+          },
+        },
+        {isError: true},
+      );
+    }
+    const task = startProfileCollectionWorkflow(resolved.plan);
+    if (args?.async === true) {
+      return toolResult({
+        ok: true,
+        planId: resolved.plan.planId,
+        taskId: task.taskId,
+        archiveJobId:
+          resolved.plan.archive?.enabled === true ? task.taskId : null,
+        task: taskSnapshot(task),
+      });
+    }
+    if (params?.task) {
+      return {task: taskSnapshot(task)};
+    }
+    await waitForTask(task);
+    return toolResult(getTaskPublicResult(task), {
+      isError: task.status === "failed",
+    });
+  }
   if (name === "mediaclaw_task_status") {
     const task = tasks.get(String(args.taskId || ""));
     return task && adapterOwnsTask(adapter, task)
@@ -4110,6 +6574,7 @@ async function readJsonRequest(request) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
+    size += Buffer.byteLength(chunk);
     if (size > BRIDGE_RPC_BODY_LIMIT_BYTES) {
       throw new Error("bridge RPC request body is too large");
     }
@@ -4230,7 +6695,11 @@ async function handleBrokerMcp(adapter, payload = {}) {
       : {error: {code: -32001, message: result.error.message}};
   }
   if (method === "tasks/result") {
-    if (!["succeeded", "failed", "cancelled"].includes(task.status)) {
+    if (
+      !["succeeded", "failed", "cancelled", "input_required"].includes(
+        task.status,
+      )
+    ) {
       return {error: {code: -32002, message: "Task is not complete"}};
     }
     return toolResult(getTaskPublicResult(task), {
@@ -4369,3 +6838,9 @@ const adapterSweepTimer = setInterval(() => {
   }
 }, ADAPTER_SWEEP_INTERVAL_MS);
 adapterSweepTimer.unref?.();
+
+const taskWatchdogTimer = setInterval(() => {
+  expireStaleLocalAssetQueries();
+  expireUnacknowledgedCaptureTask();
+}, TASK_WATCHDOG_INTERVAL_MS);
+taskWatchdogTimer.unref?.();
