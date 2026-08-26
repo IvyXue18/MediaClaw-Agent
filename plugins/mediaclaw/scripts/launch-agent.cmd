@@ -1,11 +1,4 @@
-#!/bin/sh
-@goto windows 2>/dev/null || :
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec "$SCRIPT_DIR/launch-agent" "$@"
-exit 1
-
-: <<'WINDOWS_BATCH'
-:windows
+:; SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"; exec "$SCRIPT_DIR/launch-agent" "$@"
 @echo off
 setlocal
 
@@ -68,4 +61,3 @@ echo MediaClaw Agent 官方组件已校验，正在建立本机连接。 1>&2
 set "MEDIACLAW_AGENT_STANDALONE=1"
 "%BINARY%" %*
 exit /b %ERRORLEVEL%
-WINDOWS_BATCH
