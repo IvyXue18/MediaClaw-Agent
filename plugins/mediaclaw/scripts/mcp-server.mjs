@@ -10,9 +10,23 @@ import {
   createAgentUpdateChecker,
   createAgentUpdateOrchestrator,
 } from "./agent-update.mjs";
+import {
+  agentHostDeviceDisplayName,
+  detectAgentHostKey,
+  isSupportedAgentHost,
+  normalizeAgentHostKey,
+  SUPPORTED_AGENT_HOST_KEYS,
+} from "./agent-hosts.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-adapter";
-const SERVER_VERSION = MCP_CONTRACT.serverVersion;
+const configuredRuntimeVersion = String(
+  process.env.MEDIACLAW_AGENT_RUNTIME_VERSION || "",
+).trim();
+const SERVER_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(
+  configuredRuntimeVersion,
+)
+  ? configuredRuntimeVersion
+  : MCP_CONTRACT.serverVersion;
 const logoPath = globalThis.Bun
   ? (await import("../assets/logo.png", {with: {type: "file"}})).default
   : fileURLToPath(new URL("../assets/logo.png", import.meta.url));
@@ -33,36 +47,8 @@ const instanceId = `adapter_${crypto.randomUUID()}`;
 const brokerPath = fileURLToPath(new URL("./broker-server.mjs", import.meta.url));
 const standaloneRuntime = process.env.MEDIACLAW_AGENT_STANDALONE === "1";
 
-function normalizeHostKey(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
-  if (
-    ["claude", "claude-code", "claude-desktop", "claude-cowork"].includes(
-      normalized,
-    )
-  ) {
-    return "claude";
-  }
-  return normalized;
-}
-
 function detectHostKey() {
-  const explicit = normalizeHostKey(process.env.MEDIACLAW_AGENT_HOST);
-  if (explicit) return explicit;
-  if (process.env.CLAUDECODE || process.env.CLAUDE_CODE_ENTRYPOINT) {
-    return "claude";
-  }
-  if (process.env.WORKBUDDY_HOME || process.env.WORKBUDDY_HOST) {
-    return "workbuddy";
-  }
-  if (process.env.CODEBUDDY_PLUGIN_ROOT || process.env.CODEBUDDY_CONFIG_DIR) {
-    return "workbuddy";
-  }
-  return "codex";
+  return detectAgentHostKey(process.env);
 }
 
 function detectAgentChannel() {
@@ -78,16 +64,15 @@ function detectAgentChannel() {
 function hostDisplayName(hostKey) {
   const explicit = String(process.env.MEDIACLAW_AGENT_DEVICE_NAME || "").trim();
   if (explicit) return explicit;
-  if (hostKey === "codex") return "MediaClaw Agent (Codex)";
-  if (hostKey === "claude") return "MediaClaw Agent (Claude)";
-  if (hostKey === "workbuddy") return "MediaClaw Agent (WorkBuddy)";
-  return `MediaClaw Agent (${hostKey})`;
+  return agentHostDeviceDisplayName(hostKey);
 }
 
-const hostKey = detectHostKey();
+const hostKey = normalizeAgentHostKey(detectHostKey());
 const agentChannel = detectAgentChannel();
-if (!["codex", "workbuddy"].includes(hostKey)) {
-  throw new Error("MediaClaw Agent V0.3 only supports Codex and WorkBuddy");
+if (!isSupportedAgentHost(hostKey)) {
+  throw new Error(
+    `MediaClaw Agent only supports: ${SUPPORTED_AGENT_HOST_KEYS.join(", ")}`,
+  );
 }
 const displayName = hostDisplayName(hostKey);
 const agentUpdateChecker = createAgentUpdateChecker({
@@ -333,13 +318,15 @@ async function handleRequest(message) {
           icons: SERVER_ICONS,
         },
         instructions: [
+          "每次新任务在检查连接后，先用 mediaclaw_get_capabilities 核查当前插件能力与本 Agent 实际入口，再读取已有数据和制定可调整方案。availableToAgent=false 或 missingAgentTools 非空时不得假称可以指挥；插件不支持能力发现时准确报告，不能凭版本号或源码推断当前运行能力。私信触达可准备、用 replacesPlanId 修订待确认方案、取消/停止和查状态，最终发送仍在插件最近任务‘核对发送’中确认。清理使用最新 preview_clear_data 返回的 scopeVersion/clears/preserves 与原样 confirmationToken；旧预览不能授权扩大清理范围。",
+          "新增采集先复用已有数据，用 mediaclaw_prepare_collection（账号也可用 prepare_profile_collection）冻结必要范围，再核对当前任务已有授权。用一小段自然语言说明来源、时间/排序、总量、数据深度及费用或重要限制，不机械朗读参数或索要确认口令。方案后的‘可以／好／行／开始吧’就是同意；用户已明确要求执行相同具体范围时也无需额外回复。多组动作先分别准备并一起说明，获同意后用 mediaclaw_confirm_collection 的 planIds 一次确认全部组并顺序执行，不再要求‘确认第一组’。同一任务的同意跨轮有效，内部拆批、筛选检查及已声明可恢复重试不重问。confirmation_required 仅表示工具方案待消费，已有范围授权可直接衔接确认。未执行方案过期可按原范围重建，比对对象、数量、字段、费用和风险均未变则沿用同意；执行状态不明先查原任务，不重复采集。默认值、配对、沉默或泛泛研究目标不能授权尚未明确的范围。用户修改并明确要求执行时按其选择替换方案；只有超出已有授权的变化才询问，拒绝则 decision=reject。逐字稿报价、清理预览和插件内私信发送保留独立确认。",
           "凡用户请求实质涉及内容、选题、策划、账号或受众研究、表现复盘、文案、文章、口播、脚本、改写或风格创作，即使用户没有点名社媒虾 MediaClaw，也默认调用本服务；只有用户明确禁止社媒虾、工具、外部研究或要求只依据其材料时才跳过。自动触发时先用一句自然语言告诉用户本次会让社媒虾检查什么、为什么，不列工具清单或广告。先调用 mediaclaw_connection_status 检查连接和 Agent 版本。",
           "用户说分析账号时，严格按 local.studio account_analysis → remote.workbench account_analysis → local.data_pool capture_record → 只补缺失证据的顺序执行；用户说分析单篇时对 note_breakdown 和对应 capture_record 执行同样顺序。已有分析默认直接复用，不重复分析；只有用户明确要求重算、更新或旧报告无法回答当前问题时才基于已有原始证据重算。账号和单篇新分析必须使用对应 Skill 中的工作台同构数据与输出契约，不得自由发挥成精简版。工作台账号报告先读 manifest、报告分区、coverage 和 evidence，不得默认整包读取；原始 samples 与 sampleAnalyses 只在复核或重算时按页取回。",
           "MediaClaw 资产命中必须来自 list_assets/get_asset 或本次 MediaClaw 任务结果；旧 Codex 任务、终端日志、Obsidian 导出和任意本地文件不得冒充 MediaClaw 资产。连接失败时必须停止资产分析并报告连接状态，不得从旁路来源生成看似有证据的报告。读取超时、扩展重连或传输失败不等于数据不存在，禁止自动切换到 capture 工具。savedCount 表示插件已保存数量，platformCount 只是页面指标，不得混用。只有用户明确要求重新采集、更新、补采或采更多，或资产与原始数据确实未命中且用户同意，才能进入采集。",
-          "模糊的‘分析这个账号’不需要用户选择内部字段：先按工作台基线读取最多 50 条基础作品、15 条代表详情和 12 个封面证据，不得把 50 条基础作品变成 50 个详情页。所有分析任务都必须先判断逐字稿是否会显著提升当前结论，而不是只对账号或单篇分析判断。默认优先不新提取，因为逐字稿耗时且消耗积分；仅靠标题、指标、发布时间、内容类型、链接或已有正文足以回答时，不得机械建议提取。",
+          "模糊的‘分析这个账号’不需要用户选择内部字段：先读取已有资产；需要新增采集时，建议方案可采用工作台基线的最多 50 条基础作品、15 条代表详情和 12 个封面证据，核对当前任务授权，仅对未授权范围询问，不得把 50 条基础作品变成 50 个详情页。所有分析任务都必须先判断逐字稿是否会显著提升当前结论，而不是只对账号或单篇分析判断。默认优先不新提取，因为逐字稿耗时且消耗积分；仅靠标题、指标、发布时间、内容类型、链接或已有正文足以回答时，不得机械建议提取。",
           "逐字稿采用双向触发：用户可主动说逐字稿、视频文案、口播文字、视频说了什么或字幕文字版；当任务涉及实际口播内容、开场钩子、论证结构、语言表达、叙事节奏或脚本仿写，且现有证据不足时，Agent 也必须主动说明当前证据能回答什么、逐字稿会新增什么，并只为最少且足够的代表视频生成报价。已有逐字稿直接读取且不收费；新提取只对缺失项收费，必须展示逐条积分、总积分、余额和有效期，取得用户明确确认后才执行。用户拒绝或暂不提取时，应基于现有证据继续分析并清楚标注边界。‘帮我写视频文案’属于生成请求，不得仅凭这句话误判为提取；只有用户是在索要原视频所说内容时才视为主动提取请求。",
-          "目标明确后先调用 mediaclaw_prepare_profile_collection，完整展示方案；只有用户明确同意后才能用原样 planId 调用 mediaclaw_confirm_profile_collection。只要用户提到模仿、仿写、像某人一样写或按某人/某账号风格创作，必须先查询 local.studio 的 style_profile，本地未命中再查 remote.workbench，并读取完整真实档案；不得根据账号名猜测。",
-          "若状态查询称未连接而用户展示浏览器已显示当前宿主连接，先短暂自动复查。agentUpdate.status=update_available 时必须取得明确授权并通过 mediaclaw_manage_agent_update 自动安装；用户已经说‘升级 Agent／升级社媒虾／升级到最新版’时这句话就是授权，不得再次确认，也不得向用户展示命令。返回 installed_restart_required 后必须报告 installedVersion，明确要求完全退出并重新打开状态中指定的 Codex／WorkBuddy、回到原对话发送‘继续’；不得在旧进程中创建新任务。重开后只有状态为 activated 且 activeVersion 等于目标版本，才宣布升级完成并续接原任务。社媒虾浏览器插件负责真实读取与采集，当前 Agent 负责按 Skill 分析和生成。",
+          "目标明确后先调用 mediaclaw_prepare_profile_collection，简要说明范围与实际风险；当前任务已明确同意该范围就用原样 planId 调用 mediaclaw_confirm_profile_collection，仅对未授权部分询问。只要用户提到模仿、仿写、像某人一样写或按某人/某账号风格创作，必须先查询 local.studio 的 style_profile，本地未命中再查 remote.workbench，并读取完整真实档案；不得根据账号名猜测。",
+          "若状态查询称未连接而用户展示浏览器已显示当前宿主连接，先短暂自动复查。agentUpdate.status=update_available 时必须取得明确授权并通过 mediaclaw_manage_agent_update 自动安装；用户已经说‘升级 Agent／升级社媒虾／升级到最新版’时这句话就是授权，不得再次确认，也不得向用户展示命令。agentUpdate.status=manual_update_available 时只说明需要重新执行 MediaClaw 提供的本地安装提示，不得误用其他宿主的升级命令。返回 installed_restart_required 后必须报告 installedVersion，明确要求完全退出并重新打开状态中指定的宿主、回到原对话发送‘继续’；不得在旧进程中创建新任务。重开后只有状态为 activated 且 activeVersion 等于目标版本，才宣布升级完成并续接原任务。社媒虾浏览器插件负责真实读取与采集，当前 Agent 负责按 Skill 分析和生成。",
         ].join(""),
       });
       return;
@@ -450,10 +437,14 @@ process.stdin.on("end", () => {
   void stop().finally(() => process.exit(0));
 });
 process.on("SIGTERM", () => {
-  void stop().finally(() => process.exit(0));
+  void stop().finally(() =>
+    process.exit(process.env.MEDIACLAW_AGENT_SUPERVISED === "1" ? 143 : 0),
+  );
 });
 process.on("SIGINT", () => {
-  void stop().finally(() => process.exit(0));
+  void stop().finally(() =>
+    process.exit(process.env.MEDIACLAW_AGENT_SUPERVISED === "1" ? 130 : 0),
+  );
 });
 
 await registerAdapter().catch(reportRegistrationError);

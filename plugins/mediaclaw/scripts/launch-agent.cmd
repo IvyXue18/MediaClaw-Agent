@@ -9,7 +9,7 @@ exit 1
 @echo off
 setlocal
 
-set "RELEASE_VERSION=v0.3.1"
+set "RELEASE_VERSION=v0.3.2"
 set "REPOSITORY=IvyXue18/MediaClaw-Agent"
 set "ASSET=mediaclaw-agent-windows-x64.exe"
 if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "ASSET=mediaclaw-agent-windows-arm64.exe"

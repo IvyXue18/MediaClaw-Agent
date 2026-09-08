@@ -71,7 +71,7 @@ test("an unacknowledged extension task expires and releases the next task", asyn
   const extension = await connectExtension(port, registration.device.deviceId);
   t.after(() => extension.socket.close());
 
-  const first = await callTool(
+  const first = await callApprovedCollection(
     port,
     registration.token,
     "mediaclaw_capture_search_basic",
@@ -82,7 +82,7 @@ test("an unacknowledged extension task expires and releases the next task", asyn
     (message) => message.type === "task.start" && message.taskId === firstTaskId,
   );
 
-  const second = await callTool(
+  const second = await callApprovedCollection(
     port,
     registration.token,
     "mediaclaw_capture_search_basic",
@@ -203,6 +203,104 @@ async function stopChild(child) {
   await exited;
 }
 
+test("restart releases all unfinished children of stopped workflows and preserves completed evidence", async (t) => {
+  const port = 21000 + Math.floor(Math.random() * 80);
+  const stateDirectory = await mkdtemp(path.join(tmpdir(), "mediaclaw-workflow-states-"));
+  const statePath = path.join(stateDirectory, "tasks-v1.json");
+  const now = new Date().toISOString();
+  const terminal = ["succeeded", "failed", "cancelled", "input_required"];
+  const unfinished = ["queued", "running", "waiting_for_extension", "cancel_pending"];
+  const snapshots = [];
+  for (const kind of ["workflow", "batch"]) {
+    for (const status of [...unfinished, ...terminal]) {
+      const taskId = `${kind}-${status}`;
+      const childTaskIds = [...unfinished, ...terminal].map((childStatus) => `${taskId}:${childStatus}`);
+      snapshots.push({taskId, kind, status, childTaskIds, updatedAt: now, result: {preserved: taskId}});
+      for (const childStatus of [...unfinished, ...terminal]) {
+        const childId = `${taskId}:${childStatus}`;
+        snapshots.push({taskId: childId, kind: "capture", status: childStatus, childTaskIds: [],
+          captureTask: {mode: "search_results", options: {}}, updatedAt: now, result: {preserved: childId}});
+      }
+    }
+  }
+  snapshots.push({taskId: "old-running", kind: "capture", status: "running", childTaskIds: [],
+    captureTask: {mode: "search_results", options: {}}, updatedAt: new Date(Date.now() - 30 * 86400000).toISOString()});
+  await writeFile(statePath, JSON.stringify({version: 1, tasks: snapshots}), "utf8");
+  const broker = await startBroker({port, stateDirectory});
+  t.after(async () => { await stopChild(broker); await rm(stateDirectory, {recursive: true, force: true}); });
+  const restored = JSON.parse(await readFile(statePath, "utf8"));
+  const tasks = new Map(restored.tasks.map((task) => [task.taskId, task]));
+  for (const original of snapshots) {
+    const task = tasks.get(original.taskId);
+    assert.ok(task, original.taskId);
+    if (original.taskId === "old-running") {
+      assert.equal(task.status, "waiting_for_extension", "TTL must not remove unfinished work");
+      continue;
+    }
+    assert.deepEqual(task.result, original.result, original.taskId);
+    if (terminal.includes(original.status)) {
+      assert.equal(task.status, original.status, original.taskId);
+    } else {
+      assert.equal(task.status, "failed", original.taskId);
+      assert.equal(task.error.code, original.kind === "capture" ? "ORCHESTRATION_CHILD_RELEASED" : "ORCHESTRATION_RESTARTED", original.taskId);
+    }
+  }
+});
+
+test("SIGTERM flushes the acknowledged result and ignores late progress on completed work", async (t) => {
+  const port = 21100 + Math.floor(Math.random() * 80);
+  const stateDirectory = await mkdtemp(path.join(tmpdir(), "mediaclaw-shutdown-flush-"));
+  const broker = await startBroker({port, stateDirectory});
+  t.after(async () => { await stopChild(broker); await rm(stateDirectory, {recursive: true, force: true}); });
+  const registration = await registerAdapter(port);
+  const extension = await connectExtension(port, registration.device.deviceId);
+  t.after(() => extension.socket.close());
+  const submitted = await callApprovedCollection(port, registration.token, "mediaclaw_capture_search_basic", {keyword: "保存最终结果", limit: 1, async: true});
+  const taskId = submitted.structuredContent.taskId;
+  const started = await extension.waitFor((message) => message.type === "task.start" && message.taskId === taskId);
+  extension.socket.send(JSON.stringify({type: "task.result", taskId, deviceId: started.deviceId,
+    response: {ok: true, data: {records: [{basic: {noteId: "flush-evidence", title: "完整结果"}}]}}}));
+  await extension.waitFor((message) => message.type === "task.result.ack" && message.taskId === taskId);
+  extension.socket.send(JSON.stringify({type: "task.progress", taskId, deviceId: started.deviceId, progress: {stage: "capture", message: "late progress"}}));
+  // A second result acknowledgement establishes that the prior progress frame
+  // has been processed, without using an HTTP call that itself flushes state.
+  extension.socket.send(JSON.stringify({type: "task.result", taskId, deviceId: started.deviceId, response: {ok: true}}));
+  const deadline = Date.now() + 3000;
+  while (extension.messagesOfType("task.result.ack").filter((message) => message.taskId === taskId).length < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(extension.messagesOfType("task.result.ack").filter((message) => message.taskId === taskId).length, 2);
+  await stopChild(broker);
+  assert.equal(broker.exitCode, 0);
+  const stored = JSON.parse(await readFile(path.join(stateDirectory, "tasks-v1.json"), "utf8"));
+  const task = stored.tasks.find((task) => task.taskId === taskId);
+  assert.equal(task.status, "succeeded");
+  assert.equal(task.result.records[0].id, "flush-evidence");
+  assert.notEqual(task.message, "late progress");
+});
+
+test("shutdown persists active work without waiting for a synchronous MCP result", async (t) => {
+  const port = 21200 + Math.floor(Math.random() * 80);
+  const stateDirectory = await mkdtemp(path.join(tmpdir(), "mediaclaw-shutdown-active-"));
+  const broker = await startBroker({port, stateDirectory});
+  t.after(async () => { await stopChild(broker); await rm(stateDirectory, {recursive: true, force: true}); });
+  const registration = await registerAdapter(port);
+  const extension = await connectExtension(port, registration.device.deviceId);
+  t.after(() => extension.socket.close());
+  const pending = callApprovedCollection(port, registration.token, "mediaclaw_capture_search_basic", {keyword: "退出保留任务", limit: 1, async: false}).catch(() => null);
+  const started = await extension.waitFor((message) => message.type === "task.start");
+  let timeout;
+  try {
+    await Promise.race([stopChild(broker), new Promise((_, reject) => { timeout = setTimeout(() => { broker.kill("SIGKILL"); reject(new Error("shutdown waited for the unfinished MCP response")); }, 3000); })]);
+  } finally {
+    clearTimeout(timeout);
+  }
+  await pending;
+  assert.equal(broker.exitCode, 0);
+  const stored = JSON.parse(await readFile(path.join(stateDirectory, "tasks-v1.json"), "utf8"));
+  assert.equal(stored.tasks.find((task) => task.taskId === started.taskId).status, "waiting_for_extension");
+});
+
 async function post(port, pathName, payload) {
   const response = await fetch(`http://127.0.0.1:${port}${pathName}`, {
     method: "POST",
@@ -232,6 +330,26 @@ async function callTool(port, token, name, args = {}) {
   });
 }
 
+// Lifecycle cases begin from a capture the fixture user explicitly approves.
+// Read-only and cancellation requests never pass through this helper.
+async function callApprovedCollection(port, token, name, args = {}) {
+  const pending = await callTool(port, token, name, args);
+  assert.equal(pending.structuredContent?.ok, true, JSON.stringify(pending));
+  assert.equal(pending.structuredContent.status, "confirmation_required");
+  assert.equal(pending.structuredContent.collectionStarted, false);
+  assert.equal(pending.structuredContent.taskId, undefined);
+  assert.equal(pending.structuredContent.task, undefined);
+  assert.equal(pending.structuredContent.plan.status, "awaiting_confirmation");
+  assert.equal(typeof pending.structuredContent.plan.planId, "string");
+  assert.ok(pending.structuredContent.plan.planId.length > 0);
+  // Simulate the user's separate approval of this exact returned plan.
+  return await callTool(port, token, "mediaclaw_confirm_collection", {
+    planId: pending.structuredContent.plan.planId,
+    decision: "approve",
+    ...(args.async !== undefined ? {async: args.async} : {}),
+  });
+}
+
 async function connectExtension(
   port,
   deviceId,
@@ -256,6 +374,9 @@ async function connectExtension(
   });
   const inbox = {
     socket,
+    messagesOfType(type) {
+      return messages.filter((message) => message.type === type);
+    },
     waitFor(predicate, timeoutMs = 5_000) {
       const existing = messages.find(predicate);
       if (existing) return Promise.resolve(existing);
@@ -432,7 +553,7 @@ test("running cancellation stays working until the browser confirms success", as
   const extension = await connectExtension(port, registration.device.deviceId);
   t.after(() => extension.socket.close());
 
-  const started = await callTool(
+  const started = await callApprovedCollection(
     port,
     registration.token,
     "mediaclaw_capture_search_basic",
@@ -483,7 +604,7 @@ test("cancel rejection and timeout never create a false cancelled terminal state
   t.after(() => extension.socket.close());
 
   async function start(keyword) {
-    const response = await callTool(
+    const response = await callApprovedCollection(
       port,
       registration.token,
       "mediaclaw_capture_search_basic",
@@ -531,7 +652,7 @@ test("an in-flight task survives a Broker process restart and resumes with the s
   });
   const firstRegistration = await registerAdapter(port);
   const firstExtension = await connectExtension(port, firstRegistration.device.deviceId);
-  const started = await callTool(
+  const started = await callApprovedCollection(
     port,
     firstRegistration.token,
     "mediaclaw_capture_search_basic",
@@ -578,7 +699,7 @@ test("an in-flight task survives a Broker process restart and resumes with the s
   assert.equal(completed.structuredContent.task.status, "completed");
   assert.equal(completed.structuredContent.result.records.length, 1);
 
-  const idempotent = await callTool(
+  const idempotent = await callApprovedCollection(
     port,
     secondRegistration.token,
     "mediaclaw_capture_search_basic",
@@ -597,7 +718,7 @@ test("a restored in-flight task is never reported cancelled without browser conf
   });
   const firstRegistration = await registerAdapter(port);
   const firstExtension = await connectExtension(port, firstRegistration.device.deviceId);
-  const started = await callTool(
+  const started = await callApprovedCollection(
     port,
     firstRegistration.token,
     "mediaclaw_capture_search_basic",
@@ -651,4 +772,105 @@ test("a restored in-flight task is never reported cancelled without browser conf
   const cancelled = await cancelRequest;
   assert.equal(cancelled.structuredContent.canceled, true);
   assert.equal(cancelled.structuredContent.task.status, "cancelled");
+});
+
+
+test("legacy captures without approval cannot resume or block a confirmed task after restart", async (t) => {
+  const port = 25000 + Math.floor(Math.random() * 1000);
+  const stateDirectory = await mkdtemp(path.join(tmpdir(), "mediaclaw-legacy-consent-"));
+  const statePath = path.join(stateDirectory, "tasks-v1.json");
+  let broker = await startBroker({port, stateDirectory});
+  t.after(async () => {
+    await stopChild(broker);
+    await rm(stateDirectory, {recursive: true, force: true});
+  });
+  const firstRegistration = await registerAdapter(port);
+  const firstExtension = await connectExtension(port, firstRegistration.device.deviceId);
+  t.after(() => firstExtension.socket.close());
+
+  const approved = await callApprovedCollection(
+    port,
+    firstRegistration.token,
+    "mediaclaw_capture_search_basic",
+    {keyword: "已确认的恢复任务", limit: 1, async: true},
+  );
+  const approvedTaskId = approved.structuredContent.taskId;
+  await firstExtension.waitFor(
+    (message) => message.type === "task.start" && message.taskId === approvedTaskId,
+  );
+  firstExtension.socket.close();
+  await stopChild(broker);
+
+  const saved = JSON.parse(await readFile(statePath, "utf8"));
+  const approvedSnapshot = saved.tasks.find((task) => task.taskId === approvedTaskId);
+  assert.ok(approvedSnapshot.collectionConsent.planId);
+  assert.equal(approvedSnapshot.collectionConsent.ownerDeviceId, firstRegistration.device.deviceId);
+
+  // Model pre-gate queued and running snapshots without ever starting real work.
+  // Put both before the legitimately approved task to exercise queue advancement.
+  const {collectionConsent, ...legacyTemplate} = approvedSnapshot;
+  const legacySnapshots = ["queued", "running"].map((status) => {
+    const taskId = `capture-legacy-unconfirmed-${status}`;
+    return {
+      ...legacyTemplate,
+      taskId,
+      status,
+      idempotencyKey: "",
+      input: {keyword: `旧版无确认 ${status}`, limit: 1},
+      captureTask: {
+        ...legacyTemplate.captureTask,
+        taskId,
+        keyword: `旧版无确认 ${status}`,
+      },
+    };
+  });
+  await writeFile(statePath, JSON.stringify({
+    ...saved,
+    tasks: [...legacySnapshots, approvedSnapshot],
+  }), "utf8");
+
+  broker = await startBroker({port, stateDirectory});
+  const registration = await registerAdapter(port);
+  assert.equal(registration.device.deviceId, firstRegistration.device.deviceId);
+  const extension = await connectExtension(port, registration.device.deviceId);
+  t.after(() => extension.socket.close());
+  const resumed = await extension.waitFor(
+    (message) => message.type === "task.start" && message.taskId === approvedTaskId,
+  );
+
+  for (const legacy of legacySnapshots) {
+    const response = await callTool(port, registration.token, "mediaclaw_task_status", {
+      taskId: legacy.taskId,
+    });
+    assert.equal(response.structuredContent.task.status, "input_required");
+    assert.equal(response.structuredContent.error.code, "COLLECTION_CONFIRMATION_REQUIRED");
+    assert.match(response.structuredContent.task.statusMessage, /未启动.*等待用户确认/);
+  }
+  assert.deepEqual(
+    extension.messagesOfType("task.start").map((message) => message.taskId),
+    [approvedTaskId],
+  );
+
+  extension.socket.send(JSON.stringify({
+    type: "task.result",
+    taskId: approvedTaskId,
+    deviceId: resumed.deviceId,
+    task: resumed.task,
+    response: {
+      ok: true,
+      data: {records: [{basic: {noteId: "approved-one", title: "仅执行已确认任务"}}]},
+    },
+  }));
+  await extension.waitFor(
+    (message) => message.type === "task.result.ack" && message.taskId === approvedTaskId,
+  );
+  const completed = await callTool(port, registration.token, "mediaclaw_task_status", {
+    taskId: approvedTaskId,
+  });
+  assert.equal(completed.structuredContent.task.status, "completed");
+  assert.equal(completed.structuredContent.result.records[0].title, "仅执行已确认任务");
+  assert.deepEqual(
+    extension.messagesOfType("task.start").map((message) => message.taskId),
+    [approvedTaskId],
+  );
 });

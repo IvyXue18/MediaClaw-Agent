@@ -6,16 +6,33 @@ import path from "node:path";
 import {AsyncLocalStorage} from "node:async_hooks";
 import METHOD_REGISTRY from "../contracts/methods-v1.json" with {type: "json"};
 import MCP_CONTRACT from "../contracts/mcp-v1.json" with {type: "json"};
-import {compareVersions} from "./agent-update.mjs";
+import {AGENT_UPDATE_TOOL, compareVersions} from "./agent-update.mjs";
 import {createLoopbackWebSocketServer} from "./websocket-server.mjs";
+import {
+  createTaskStateWriter,
+  findBlockingTaskParent,
+  pruneTaskHistory,
+  TERMINAL_TASK_STATUSES,
+} from "./broker-task-state.mjs";
 import {
   buildDeviceProofPayload,
   loadOrCreateDeviceIdentity,
   resolveStateDirectory,
 } from "./device-identity.mjs";
+import {
+  agentHostDeviceDisplayName,
+  normalizeAgentHostKey,
+} from "./agent-hosts.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-broker";
-const SERVER_VERSION = MCP_CONTRACT.serverVersion;
+const configuredRuntimeVersion = String(
+  process.env.MEDIACLAW_AGENT_RUNTIME_VERSION || "",
+).trim();
+const SERVER_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(
+  configuredRuntimeVersion,
+)
+  ? configuredRuntimeVersion
+  : MCP_CONTRACT.serverVersion;
 const PROTOCOL_VERSION = MCP_CONTRACT.protocolVersion;
 const DEFAULT_PORT = Number(process.env.MEDIACLAW_AGENT_PORT || 17373);
 const DEFAULT_SCAN_LIMIT = 80;
@@ -238,8 +255,41 @@ const idempotentTaskIds = new Map();
 const resultTransfers = new Map();
 const pendingTaskCancellations = new Map();
 const profileCollectionPlans = new Map();
+// A plan is a proposal, never permission. Only the explicit confirmation tool
+// can consume it and establish the internal execution context used by children.
+const collectionPlans = new Map();
+const COLLECTION_PLAN_TTL_MS = Math.max(100, Number(
+  process.env.MEDIACLAW_COLLECTION_PLAN_TTL_MS || 15 * 60_000,
+));
+const COLLECTION_TOOL_NAMES = new Set([
+  "mediaclaw_capture_note", "mediaclaw_capture_search_basic",
+  "mediaclaw_capture_profile_basic", "mediaclaw_enhance_records",
+  "mediaclaw_scan_keyword", "mediaclaw_expand_keywords",
+  "mediaclaw_research_keyword_topics", "mediaclaw_research_longtail_keywords",
+  "mediaclaw_scan_account", "mediaclaw_capture_account_profile",
+  "mediaclaw_research_account_hits", "mediaclaw_research_benchmark_accounts",
+  "mediaclaw_capture_content", "mediaclaw_research_single_note",
+  "mediaclaw_deep_collect", "mediaclaw_capture_comments",
+  "mediaclaw_capture_comments_full", "mediaclaw_extract_image_text",
+]);
 const TASK_STATE_PATH = path.join(BROKER_STATE_DIRECTORY, "tasks-v1.json");
-let taskStateWrite = Promise.resolve();
+const taskStateWriter = createTaskStateWriter({
+  readSnapshot: () => JSON.stringify({
+    version: 1,
+    tasks: [...tasks.values()].map(serializableTask),
+  }),
+  async writeSnapshot(payload) {
+    await fs.mkdir(BROKER_STATE_DIRECTORY, {recursive: true, mode: 0o700});
+    const temporaryPath = `${TASK_STATE_PATH}.${process.pid}.tmp`;
+    await fs.writeFile(temporaryPath, payload, {mode: 0o600});
+    await fs.rename(temporaryPath, TASK_STATE_PATH);
+  },
+  onError(error) {
+    process.stderr.write(`[mediaclaw] cannot persist Agent task state: ${error instanceof Error ? error.message : String(error)}\n`);
+  },
+});
+let brokerStopping = false;
+let brokerShutdown = null;
 const extensionPeers = new Set();
 let extensionPeer = null;
 let extensionInfo = null;
@@ -302,27 +352,11 @@ function buildConnectionOnboarding({connected = false, awaitingPairing = false} 
 }
 
 function normalizeHostKey(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
-  if (
-    ["claude", "claude-code", "claude-desktop", "claude-cowork"].includes(
-      normalized,
-    )
-  ) {
-    return "claude";
-  }
-  return normalized || "agent";
+  return normalizeAgentHostKey(value) || "agent";
 }
 
 function defaultHostDisplayName(hostKey) {
-  if (hostKey === "codex") return "MediaClaw Agent (Codex)";
-  if (hostKey === "claude") return "MediaClaw Agent (Claude)";
-  if (hostKey === "workbuddy") return "MediaClaw Agent (WorkBuddy)";
-  return `MediaClaw Agent (${hostKey})`;
+  return agentHostDeviceDisplayName(hostKey);
 }
 
 function publicDevice(adapter) {
@@ -600,10 +634,10 @@ function normalizeText(value, max = 1000) {
 
 function normalizeProfileCollectionPlatform(value, profileUrl = "") {
   const requested = normalizeText(value, 80).toLowerCase();
+  const inferred = collectionUrlPlatform(profileUrl);
+  if (requested && inferred && requested !== inferred) throw new Error("方案平台与主页链接不一致，请修改方案");
   if (requested) return normalizePlatform(requested);
-  const url = normalizeText(profileUrl);
-  if (/douyin\.com/i.test(url)) return "douyin";
-  if (/xiaohongshu\.com|xhslink\.com/i.test(url)) return "xiaohongshu";
+  if (inferred) return inferred;
   throw new Error("无法从主页链接识别平台，请先明确是小红书还是抖音");
 }
 
@@ -790,7 +824,7 @@ function isProfileCollectionVideoEntry(entry = {}, platform = "") {
 function publicProfileCollectionPlan(plan = {}) {
   return {
     planId: plan.planId,
-    status: plan.usedAt ? "confirmed" : "awaiting_confirmation",
+    status: plan.rejectedAt ? "rejected" : plan.supersededAt ? "replaced" : plan.usedAt ? "confirmed" : "awaiting_confirmation",
     createdAt: plan.createdAt,
     expiresAt: plan.expiresAt,
     userGoal: plan.userGoal,
@@ -811,6 +845,8 @@ function publicProfileCollectionPlan(plan = {}) {
       startsCollection: false,
       nextTool: "mediaclaw_confirm_profile_collection",
       confirmationArgument: {planId: plan.planId},
+      rejectionArgument: {planId: plan.planId, decision: "reject"},
+      instruction: "用自然语言说明范围；仅在当前对话尚未授权该范围时等待用户同意。‘可以／好／开始吧’均可表达同意，不要求确认口令。同一任务已同意的范围、批次及已声明重试不重复询问；范围变化通过 replacesPlanId 重新制定方案，并只确认尚未授权的变化。",
       prompt: plan.confirmationPrompt,
     },
   };
@@ -1373,6 +1409,8 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
     limitations.length > 0 ? `限制：${limitations.join("；")}。` : "",
     "确认后才会开始采集；确认代表接受上述分批范围和风险，不代表放弃失败记录与覆盖报告。",
   ].filter(Boolean).join("");
+  replaceCollectionPlan(input.replacesPlanId, adapter);
+  plan.ownerInstanceId = requestContext.getStore()?.instanceId || "";
   profileCollectionPlans.set(plan.planId, plan);
   return publicProfileCollectionPlan(plan);
 }
@@ -1407,6 +1445,11 @@ function resolveProfileCollectionPlan(planId, adapter = null) {
       error: {code: "PROFILE_COLLECTION_PLAN_ALREADY_USED", message: "采集方案已经确认执行，不能重复使用"},
     };
   }
+  try {
+    resolveCollectionPlan(normalizedPlanId, adapter);
+  } catch (error) {
+    return {ok: false, error: {code: error.code, message: error.message}};
+  }
   return {ok: true, plan};
 }
 
@@ -1416,6 +1459,300 @@ function taskProtocolStatus(status) {
   if (status === "failed") return "failed";
   if (status === "input_required") return "input_required";
   return "working";
+}
+
+function collectionPlanError(code, message) {
+  return Object.assign(new Error(message), {code});
+}
+
+// Use the advertised schema to freeze defaults as well as explicit values.
+// Unknown fields (including synthetic confirmation/permission flags) fail closed.
+function collectionArguments(schema, value, label = "arguments") {
+  if (value === undefined && Object.hasOwn(schema, "default")) {
+    value = structuredClone(schema.default);
+  }
+  if (value === undefined) return undefined;
+  if (schema.enum && !schema.enum.includes(value)) throw new Error(`${label} 不在允许范围内`);
+  if (schema.type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} 必须是对象`);
+    const properties = schema.properties || {};
+    for (const key of Object.keys(value)) {
+      if (!Object.hasOwn(properties, key) && schema.additionalProperties !== true) throw new Error(`${label}.${key} 不受支持，不能修改确认方案`);
+    }
+    const output = schema.additionalProperties === true ? structuredClone(value) : {};
+    for (const [key, child] of Object.entries(properties)) {
+      const result = collectionArguments(child, Object.hasOwn(value, key) ? value[key] : undefined, `${label}.${key}`);
+      if (result !== undefined) output[key] = result;
+    }
+    for (const key of schema.required || []) {
+      if (output[key] === undefined) throw new Error(`${label}.${key} 必填`);
+    }
+    return output;
+  }
+  if (schema.type === "array") {
+    if (!Array.isArray(value)) throw new Error(`${label} 必须是数组`);
+    if (value.length < (schema.minItems ?? 0) || value.length > (schema.maxItems ?? Infinity)) throw new Error(`${label} 数量超出范围，请重新制定方案`);
+    return value.map((item, index) => collectionArguments(schema.items || {}, item, `${label}[${index}]`));
+  }
+  if (schema.type === "string") {
+    if (typeof value !== "string") throw new Error(`${label} 必须是文本`);
+    if (!value.trim() || value.length < (schema.minLength ?? 0) || value.length > (schema.maxLength ?? 50_000)) throw new Error(`${label} 文本为空或过长`);
+  } else if (schema.type === "integer" || schema.type === "number") {
+    if (typeof value !== "number" || !Number.isFinite(value) || (schema.type === "integer" && !Number.isInteger(value))) throw new Error(`${label} 必须是有效数字`);
+    if (value < (schema.minimum ?? -Infinity) || value > (schema.maximum ?? Infinity)) throw new Error(`${label} 数量超出范围，请重新制定方案`);
+  } else if (schema.type === "boolean" && typeof value !== "boolean") {
+    throw new Error(`${label} 必须是布尔值`);
+  }
+  return value;
+}
+
+function collectionUrlPlatform(url) {
+  const hostname = new URL(url).hostname.toLowerCase();
+  const belongsTo = (domain) => hostname === domain || hostname.endsWith(`.${domain}`);
+  if (belongsTo("douyin.com") || belongsTo("iesdouyin.com")) return "douyin";
+  if (belongsTo("xiaohongshu.com") || belongsTo("xhslink.com")) return "xiaohongshu";
+  return null;
+}
+
+function prepareCollectionArguments(toolName, input) {
+  const definition = tools.find((tool) => tool.name === toolName);
+  if (!COLLECTION_TOOL_NAMES.has(toolName) || !definition) throw new Error("请选择受支持的采集工具；只读、付费确认和发送工具不能作为采集步骤");
+  const args = collectionArguments(definition.inputSchema, input || {});
+  delete args.async;
+  // Old clients may still send this flag. It never confers permission.
+  delete args.confirmed;
+  for (const key of ["keyword", "seedKeyword"]) {
+    if (args[key] !== undefined) {
+      if (args[key].trim().length > 200) throw new Error(`${key} 最多 200 字符`);
+      args[key] = args[key].trim();
+    }
+  }
+  for (const key of ["url", "profileUrl"]) {
+    if (args[key]) args[key] = args[key].trim();
+  }
+  if (args.urls) args.urls = [...new Set(args.urls.map((url) => url.trim()))];
+  const urls = [args.url, args.profileUrl, ...(args.urls || [])].filter(Boolean);
+  for (const url of urls) {
+    if (url.length > 1000) throw new Error("来源链接超过执行支持的 1000 字符，请提供完整的短链接；不能静默截断已确认来源");
+    if (!["http:", "https:"].includes(new URL(url).protocol)) throw new Error("采集来源必须是有效的网页链接");
+  }
+  if (Object.hasOwn(definition.inputSchema.properties, "platform")) {
+    const urlPlatforms = new Set(urls.map(collectionUrlPlatform).filter(Boolean));
+    if (urlPlatforms.size > 1) throw new Error("本方案包含不同平台链接，请按平台分别制定并确认方案");
+    const inferred = [...urlPlatforms][0];
+    if (input?.platform && inferred && input.platform !== inferred) throw new Error("方案平台与来源链接不一致，请修改方案");
+    args.platform = normalizePlatform(input?.platform || inferred || args.platform);
+  }
+  if (Object.hasOwn(definition.inputSchema.properties, "timeRange")) {
+    buildKeywordCaptureOptions(args); // Validate platform/filter combinations before proposing anything.
+  }
+  if (toolName === "mediaclaw_research_account_hits") {
+    args.recentPostLimit = Math.min(args.scanLimit, args.recentPostLimit);
+    args.resultLimit = Math.min(args.recentPostLimit, args.resultLimit);
+  }
+  if (toolName === "mediaclaw_research_single_note" && ["recommend", "not_needed"].includes(args.analysisTranscriptDecision) && !args.analysisTranscriptReason) {
+    throw collectionPlanError("TRANSCRIPT_DECISION_REASON_REQUIRED", "请先说明逐字稿必要性判断理由");
+  }
+  return args;
+}
+
+function collectionScope(toolName, args) {
+  const search = Object.hasOwn(args, "timeRange");
+  const expansion = toolName.includes("longtail") || toolName === "mediaclaw_expand_keywords";
+  const profile = Boolean(args.profileUrl);
+  const commentsOnly = ["mediaclaw_capture_comments", "mediaclaw_capture_comments_full"].includes(toolName);
+  const ocrOnly = toolName === "mediaclaw_extract_image_text";
+  const noteResearch = toolName === "mediaclaw_research_single_note";
+  const detail = !search && !expansion && !profile && !commentsOnly && !ocrOnly;
+  const targetCount = args.urls ? new Set(args.urls).size : args.recordIds ? new Set(args.recordIds).size : 1;
+  const includeComments = commentsOnly || args.includeComments === true;
+  const commentsPerItem = includeComments ? (commentsOnly ? args.limit : args.commentLimit ?? args.commentsPerItemLimit ?? 30) : 0;
+  const fields = commentsOnly
+    ? ["评论文字", "评论用户", "评论互动指标", "评论来源"]
+    : ocrOnly ? ["指定记录的图片文字"]
+    : expansion ? ["平台搜索联想词", "去重后的词列表"]
+    : toolName === "mediaclaw_capture_account_profile" ? ["账号名", "简介", "粉丝数", "获赞收藏", "主页链接"]
+    : ["标题", "作品链接", "封面", "作者", "页面可读取的发布时间与互动指标"];
+  if (detail) fields.push("正文", "页面可读取的媒体源地址");
+  if (includeComments && !commentsOnly) fields.push(`每篇最多 ${commentsPerItem} 条评论`);
+  if (args.includeBloggerMetrics) fields.push("博主指标");
+  const imageText = ocrOnly || (noteResearch && args.includeMediaText === true);
+  if (imageText && !ocrOnly) fields.push("图文配图的图片文字");
+  const transcriptQuote = noteResearch && args.analysisTranscriptDecision !== "not_needed";
+  const scope = {
+    platform: ocrOnly || args.recordIds ? "已保存记录所属平台" : args.platform,
+    source: expansion ? "搜索联想词" : search ? "关键词搜索结果" : profile ? "账号主页" : ocrOnly ? "已保存配图" : commentsOnly ? "单篇评论" : "作品详情",
+    targets: args.urls || args.recordIds || [args.keyword || args.seedKeyword || args.profileUrl || args.url || args.recordId],
+    basicItemLimit: (search || profile) && toolName !== "mediaclaw_capture_account_profile" ? (args.scanLimit ?? args.limit) : 0,
+    detailPageLimit: detail ? targetCount : 0,
+    profilePageLimit: toolName === "mediaclaw_research_benchmark_accounts" ? args.candidateLimit : profile ? 1 : args.includeBloggerMetrics ? targetCount : 0,
+    commentItemLimit: commentsPerItem * targetCount,
+    commentsPerItemLimit: commentsPerItem,
+    imageText,
+    imageTextMode: !imageText ? "not_requested" : args.force === true || args.forceMediaExtraction === true ? "force" : "reuse_or_extract",
+    transcript: transcriptQuote ? "仅检查已有逐字稿或生成报价；新增提取仍须单独确认报价" : "不新增提取",
+    fields,
+    filters: search ? Object.fromEntries(Object.keys(SEARCH_FILTER_SCHEMA_PROPERTIES).map((key) => [key, args[key]])) : null,
+  };
+  const actions = [];
+  if (expansion) actions.push(`打开搜索页，对种子词及 a～z 后缀执行 ${DEFAULT_KEYWORD_EXPANSION_QUERY_LIMIT} 次联想查询`);
+  if (search) actions.push(`打开关键词搜索页，应用方案筛选，最多读取 ${scope.basicItemLimit} 条基础结果`);
+  if (profile) actions.push(scope.basicItemLimit ? `打开指定账号主页，最多读取 ${scope.basicItemLimit} 条作品基础列表` : "打开指定账号主页读取画像数据");
+  if (toolName === "mediaclaw_research_benchmark_accounts") actions.push(`按搜索结果聚合候选，最多打开 ${args.candidateLimit} 个候选账号主页补采画像`);
+  if (detail) actions.push(`打开指定的最多 ${targetCount} 个作品详情页`);
+  if (includeComments) actions.push(`读取指定作品评论，每篇最多 ${commentsPerItem} 条，总计最多 ${scope.commentItemLimit} 条`);
+  if (imageText) actions.push(scope.imageTextMode === "force"
+    ? "对本方案所含配图强制重新提取图片文字，不复用已有 OCR，并保存结果"
+    : "复用已有图片文字，缺失时对本方案所含配图执行 OCR 并保存结果");
+  if (args.includeBloggerMetrics) actions.push("补充本方案作品作者的主页指标");
+  if (transcriptQuote) actions.push("视频逐字稿只检查复用或报价，等待单独付费确认");
+  scope.browserActions = actions;
+  if (scope.filters) {
+    const labels = {
+      timeRange: {any: "不限时间", "1d": "近一天", "7d": "近一周", "6m": "近半年"},
+      sortBy: {default: "综合排序", latest: "最新发布", likes: "最多点赞", comments: "最多评论", collects: "最多收藏"},
+      contentType: {all: "全部类型", video: "视频", image: "图文"},
+      videoDuration: {all: "不限时长", under_1m: "一分钟以内", between_1m_5m: "一至五分钟", over_5m: "五分钟以上"},
+      searchScope: {all: "不限搜索范围", seen: "看过", unseen: "未看过", followed: "已关注"},
+      locationScope: {all: "不限位置", city: "同城", nearby: "附近"},
+    };
+    scope.filterSummary = Object.entries(scope.filters).map(([key, value]) => labels[key][value]).join("、");
+  }
+  return scope;
+}
+
+function resolveCollectionPlan(planId, adapter) {
+  const plan = collectionPlans.get(planId) || profileCollectionPlans.get(planId);
+  if (!plan) throw collectionPlanError("COLLECTION_PLAN_NOT_FOUND", "方案不存在或已失效，请重新制定并展示方案");
+  if (plan.ownerDeviceId !== profileCollectionPlanOwner(adapter) || (plan.ownerInstanceId && plan.ownerInstanceId !== requestContext.getStore()?.instanceId)) throw collectionPlanError("COLLECTION_PLAN_OWNER_MISMATCH", "方案不属于当前设备或对话连接");
+  if (plan.rejectedAt) throw collectionPlanError("COLLECTION_PLAN_REJECTED", "用户已拒绝该方案，不能执行");
+  if (plan.supersededAt) throw collectionPlanError("COLLECTION_PLAN_REPLACED", "方案已被替换，请展示并确认新方案");
+  if (plan.usedAt) throw collectionPlanError("COLLECTION_PLAN_ALREADY_USED", "该方案已使用，不能重复执行");
+  if (plan.expiresAtMs <= Date.now()) throw collectionPlanError("COLLECTION_PLAN_EXPIRED", "方案已过期，请重新制定并确认");
+  return plan;
+}
+
+function replaceCollectionPlan(replacesPlanId, adapter) {
+  if (!replacesPlanId) return;
+  const previous = resolveCollectionPlan(replacesPlanId, adapter);
+  previous.supersededAt = nowIso();
+}
+
+function createCollectionPlan({userGoal, toolName, arguments: input = {}, replacesPlanId}, adapter) {
+  if (toolName === "mediaclaw_prepare_profile_collection") {
+    return createProfileCollectionPlan({...input, userGoal: userGoal || input.userGoal, replacesPlanId}, adapter);
+  }
+  const args = prepareCollectionArguments(toolName, input);
+  const scope = collectionScope(toolName, args);
+  const title = tools.find((tool) => tool.name === toolName).annotations.title;
+  const now = Date.now();
+  for (const [id, plan] of collectionPlans) {
+    if (plan.expiresAtMs <= now) collectionPlans.delete(id);
+  }
+  if (collectionPlans.size >= 1000) throw new Error("待确认方案过多，请先处理已有方案");
+  // Do not invalidate an old plan until the replacement is fully valid.
+  replaceCollectionPlan(replacesPlanId, adapter);
+  const plan = {
+    planId: createId("collection_plan"),
+    ownerDeviceId: profileCollectionPlanOwner(adapter),
+    ownerInstanceId: requestContext.getStore()?.instanceId || "",
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + COLLECTION_PLAN_TTL_MS).toISOString(),
+    expiresAtMs: now + COLLECTION_PLAN_TTL_MS,
+    userGoal: normalizeText(userGoal || title, 1200),
+    toolName,
+    arguments: structuredClone(args),
+    scope,
+    confirmationPrompt: `建议执行：${title}。平台：${scope.platform === "xiaohongshu" ? "小红书" : scope.platform === "douyin" ? "抖音" : scope.platform}。来源：${scope.targets.join("、")}。${scope.filterSummary ? `筛选：${scope.filterSummary}。` : ""}${scope.browserActions.join("；")}。获取：${scope.fields.join("、")}。请确认是否按此方案执行；未收到你的明确同意前不会开始。`,
+  };
+  collectionPlans.set(plan.planId, plan);
+  return {
+    planId: plan.planId,
+    status: "awaiting_confirmation",
+    createdAt: plan.createdAt,
+    expiresAt: plan.expiresAt,
+    userGoal: plan.userGoal,
+    toolName,
+    arguments: structuredClone(args),
+    scope,
+    limitations: ["实际数量受页面加载与平台限制影响；不足时报告实际覆盖，不自动扩大时间、数量或补采范围", "分析目标和默认参数只用于建议方案，不等于用户已经授权采集", scope.transcript],
+    confirmation: {
+      required: true,
+      startsCollection: false,
+      nextTool: "mediaclaw_confirm_collection",
+      confirmationArgument: {planId: plan.planId, decision: "approve"},
+      rejectionArgument: {planId: plan.planId, decision: "reject"},
+      prompt: plan.confirmationPrompt,
+      instruction: "简要说明范围；仅在当前对话尚未授权该范围时等待用户同意，不要求固定确认口令。已明确同意的范围可直接确认；多组方案一起展示后用 planIds 一次确认，不逐组重问。confirmation_required 只表示技术方案尚待消费，不代表用户尚未授权。范围变化通过 replacesPlanId 重新制定，并只确认尚未授权的变化。",
+    },
+  };
+}
+
+function captureNeedsCollectionConsent(captureTask) {
+  return ["current_note", "search_results", "profile_posts", "profile_info", "comments", "enhance_records", "extract_image_text"].includes(captureTask?.mode);
+}
+
+async function startConfirmedCollectionPlan(plan) {
+  const collectionConsent = {planId: plan.planId, ownerDeviceId: plan.ownerDeviceId, confirmedAt: plan.usedAt};
+  return requestContext.run({...requestContext.getStore(), collectionConsent}, async () => {
+    if (!plan.toolName) return startProfileCollectionWorkflow(plan);
+    const executionArgs = structuredClone(plan.arguments);
+    if (executionArgs.idempotencyKey) {
+      const {idempotencyKey, ...scopeArgs} = executionArgs;
+      executionArgs.idempotencyKey = `${idempotencyKey.slice(0, 160)}:${crypto.createHash("sha256").update(JSON.stringify([plan.toolName, scopeArgs])).digest("hex").slice(0, 32)}`;
+    }
+    if (plan.toolName === "mediaclaw_enhance_records") executionArgs.confirmed = true;
+    return executeCaptureTool(plan.toolName, executionArgs);
+  });
+}
+
+// Reserve every approved plan before starting the first child. Waiting for an
+// earlier group must not expire or require another approval for the later ones.
+function startCollectionPlanBatch(plans) {
+  const parent = createTask({kind: "workflow", input: {planIds: plans.map((plan) => plan.planId)}});
+  void (async () => {
+    const results = [];
+    const summary = () => ({
+      results,
+      totalCount: plans.length,
+      completedCount: results.filter((item) => item.status === "succeeded").length,
+      remainingPlanIds: plans.slice(results.length).map((plan) => plan.planId),
+    });
+    try {
+      updateTask(parent, {status: "running", message: `正在执行已确认的 ${plans.length} 组采集`});
+      for (const [index, plan] of plans.entries()) {
+        if (["cancelled", "cancel_pending"].includes(parent.status)) return;
+        const child = addChildTask(parent, await startConfirmedCollectionPlan(plan));
+        updateTask(parent, {
+          progress: {processedCount: index, totalCount: plans.length},
+          message: `正在执行第 ${index + 1}/${plans.length} 组，全部范围已确认`,
+        });
+        await child.completion;
+        results.push({planId: plan.planId, taskId: child.taskId, status: child.status});
+        // Never turn a stopped, failed or input-required child into another
+        // browser action. Completed data remains reachable by child task ID.
+        if (child.status !== "succeeded" || child.result?.ok === false) {
+          finishTask(parent, {
+            status: child.status === "input_required" ? "input_required" : child.status === "cancelled" ? "cancelled" : "failed",
+            result: {ok: false, ...summary(), nextAction: child.result?.nextAction || null},
+            error: child.error || {code: "COLLECTION_GROUP_STOPPED", message: child.message || "本组采集未完成"},
+            message: `第 ${index + 1} 组未完成，已保留结果并停止后续组`,
+          });
+          return;
+        }
+      }
+      finishTask(parent, {
+        status: "succeeded", result: {ok: true, ...summary()}, error: null,
+        message: `已完成全部 ${plans.length} 组采集；按各组 taskId 读取结果`,
+      });
+    } catch (error) {
+      finishTask(parent, {
+        status: "failed", result: {ok: false, ...summary()},
+        error: {code: error.code || "COLLECTION_BATCH_FAILED", message: error.message},
+      });
+    }
+  })();
+  return parent;
 }
 
 function taskSnapshot(task) {
@@ -1440,6 +1777,7 @@ function serializableTask(task) {
     idempotencyKey: task.idempotencyKey || "",
     captureTask: task.captureTask,
     owner: task.owner,
+    collectionConsent: task.collectionConsent || null,
     progress: task.progress,
     result: task.result,
     error: task.error,
@@ -1454,26 +1792,16 @@ function serializableTask(task) {
 }
 
 function scheduleTaskStatePersist() {
-  const payload = JSON.stringify({
-    version: 1,
-    tasks: [...tasks.values()].map(serializableTask),
+  return taskStateWriter.schedule();
+}
+
+function pruneExpiredTaskHistory(nowMs = Date.now()) {
+  const removed = pruneTaskHistory({
+    tasks, idempotentTaskIds, nowMs, defaultTtlMs: TASK_TTL_MS,
+    protectedTaskIds: [activeExtensionTaskId, ...pendingTaskCancellations.keys(), ...resultTransfers.keys()],
   });
-  taskStateWrite = taskStateWrite
-    .catch(() => null)
-    .then(async () => {
-      await fs.mkdir(BROKER_STATE_DIRECTORY, {recursive: true, mode: 0o700});
-      const temporaryPath = `${TASK_STATE_PATH}.${process.pid}.tmp`;
-      await fs.writeFile(temporaryPath, payload, {mode: 0o600});
-      await fs.rename(temporaryPath, TASK_STATE_PATH);
-    })
-    .catch((error) => {
-      process.stderr.write(
-        `[mediaclaw] cannot persist Agent task state: ${
-          error instanceof Error ? error.message : String(error)
-        }\n`,
-      );
-    });
-  return taskStateWrite;
+  if (removed.length) void scheduleTaskStatePersist();
+  return removed;
 }
 
 function isLocalAssetReadTask(taskOrCaptureTask = {}) {
@@ -1550,13 +1878,10 @@ async function restoreTaskState() {
     snapshots
       .filter(
         (snapshot) =>
-          ["batch", "workflow"].includes(snapshot?.kind) &&
-          ["running", "cancel_pending", "waiting_for_extension"].includes(
-            snapshot?.status,
-          ),
+          ["batch", "workflow"].includes(snapshot?.kind),
       )
       .flatMap((snapshot) =>
-        Array.isArray(snapshot?.childTaskIds) ? snapshot.childTaskIds : [],
+        [...(Array.isArray(snapshot?.childTaskIds) ? snapshot.childTaskIds : []), snapshot.currentChildTaskId],
       )
       .map((taskId) => normalizeText(taskId, 160))
       .filter(Boolean),
@@ -1571,8 +1896,7 @@ async function restoreTaskState() {
     );
     if (
       !taskId ||
-      !Number.isFinite(updatedAtMs) ||
-      updatedAtMs < Date.now() - ttlMs
+      !Number.isFinite(updatedAtMs)
     ) {
       continue;
     }
@@ -1585,6 +1909,7 @@ async function restoreTaskState() {
       "cancel_pending",
       "waiting_for_extension",
     ].includes(snapshot.status);
+    const wasUnfinished = ["queued", "running", "cancel_pending", "waiting_for_extension"].includes(snapshot.status);
     const legacyLocalAssetRead = isLegacyActiveLocalAssetReadTask(snapshot);
     const activeLocalAssetQuery =
       isLocalAssetQueryTask(snapshot) &&
@@ -1608,9 +1933,9 @@ async function restoreTaskState() {
     const invalidRestoredLocalAssetQuery =
       legacyLocalAssetRead || expiredLocalAssetQuery;
     const unrestorableWorkflow =
-      wasInFlight && ["batch", "workflow"].includes(snapshot.kind);
+      wasUnfinished && ["batch", "workflow"].includes(snapshot.kind);
     const orphanedWorkflowChild =
-      wasInFlight && unrestorableWorkflowChildIds.has(taskId);
+      wasUnfinished && unrestorableWorkflowChildIds.has(taskId);
     const invalidRestoredTask =
       invalidRestoredLocalAssetQuery ||
       unrestorableWorkflow ||
@@ -1619,6 +1944,7 @@ async function restoreTaskState() {
       ...snapshot,
       taskId,
       ttlMs,
+      updatedAt: invalidRestoredTask ? new Date(restoredAtMs).toISOString() : snapshot.updatedAt,
       status: invalidRestoredTask
         ? "failed"
         : wasInFlight
@@ -1674,8 +2000,10 @@ async function restoreTaskState() {
       resolveCompletion(task);
     }
   }
+  if (pruneExpiredTaskHistory(restoredAtMs).length) restoredStateChanged = true;
   if (restoredStateChanged) {
-    await scheduleTaskStatePersist();
+    void scheduleTaskStatePersist();
+    await taskStateWriter.flush();
   }
 }
 
@@ -1723,6 +2051,7 @@ function createTask({
     input,
     idempotencyKey,
     captureTask,
+    collectionConsent: requestContext.getStore()?.collectionConsent || null,
     owner: owner
       ? {
           hostKey: owner.hostKey,
@@ -1831,15 +2160,19 @@ function buildCaptureTask(mode, input = {}) {
     "workbench_assets",
   ].includes(mode);
   const isDataPoolQuery = mode === "data_pool_query";
+  const isMaintenance = mode === "data_pool_maintenance";
   const isImageExtraction = mode === "extract_image_text";
   const isVideoExtraction = mode === "extract_video_transcript";
   const isEnhancement = mode === "enhance_records";
+  const isOutreach = mode === "outreach";
   const isLocalOnly =
     isStyleLibrary ||
     isAssetQuery ||
     isDataPoolQuery ||
+    isMaintenance ||
     isImageExtraction ||
-    isVideoExtraction;
+    isVideoExtraction ||
+    isOutreach;
   const localResultOnly = isLocalOnly || isEnhancement;
   const options = {
     ...(input.options && typeof input.options === "object"
@@ -1866,12 +2199,14 @@ function buildCaptureTask(mode, input = {}) {
           ? "asset.studio_local"
         : mode === "workbench_assets"
           ? "asset.workbench"
-        : isDataPoolQuery
+        : isDataPoolQuery || isMaintenance
           ? "asset.data_pool"
           : isVideoExtraction
             ? "extract.video_transcript"
         : isImageExtraction
           ? "extract.image_text"
+        : isOutreach
+          ? "outreach.private_message"
             : undefined),
     platform: normalizePlatform(input.platform),
     mode,
@@ -2328,6 +2663,36 @@ function attachPaywall(result = {}, response = {}) {
 }
 
 function compactCaptureResponse(response = {}, captureTask = {}) {
+  if (captureTask.mode === "data_pool_maintenance") {
+    const raw = findObjectByKey(response, "rawCaptureResult") || {};
+    const payload = raw.data && typeof raw.data === "object" ? raw.data : {};
+    return {
+      ...payload,
+      ok: response?.ok !== false && raw.ok !== false && payload.ok === true,
+      taskId: captureTask.taskId || "",
+      mode: "data_pool_maintenance",
+      error: response?.error || raw.error || payload.error ||
+        (payload.ok !== true ? {code: "CLEAR_RESULT_MISSING", message: "插件未返回完整清理预览或结果，请重新核查，不得猜测清理范围"} : null),
+    };
+  }
+  if (captureTask.mode === "outreach") {
+    const payload = response?.data && typeof response.data === "object"
+      ? response.data
+      : {};
+    return {
+      ...payload,
+      ok: response?.ok !== false && payload?.ok !== false,
+      taskId: captureTask.taskId || "",
+      mode: captureTask.mode,
+      operation: captureTask?.options?.operation || "",
+      confirmationRequired:
+        response?.confirmationRequired === true ||
+        payload?.confirmationRequired === true ||
+        payload?.plan?.status === "awaiting_confirmation",
+      sendingStarted: false,
+      error: response?.error || payload?.error || null,
+    };
+  }
   if (captureTask.mode === "paired_devices") {
     const rawCaptureResult = findObjectByKey(response, "rawCaptureResult") || {};
     return {
@@ -2455,6 +2820,44 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
       !Array.isArray(rawCaptureResult.data)
         ? rawCaptureResult.data
         : {};
+    if (captureTask.options?.operation === "capabilities") {
+      if (payload.schemaVersion !== 1 || !payload.registryVersion || !Array.isArray(payload.capabilities)) {
+        return {
+          ok: false,
+          taskId: captureTask.taskId || "",
+          mode: "data_pool_query",
+          operation: "capabilities",
+          error: response?.error || rawCaptureResult?.error || {
+            code: "CAPABILITY_DISCOVERY_UNSUPPORTED",
+            message: "当前插件未返回能力清单，请更新插件后重新核查；不能把连接成功或版本号当成能力已对齐",
+          },
+        };
+      }
+      // The update entry belongs to the STDIO Adapter and is appended to its
+      // tools/list response; it is part of the same public Agent tool surface.
+      const availableTools = new Set([...tools.map((tool) => tool.name), AGENT_UPDATE_TOOL.name]);
+      return {
+        ...payload,
+        ok: response?.ok !== false && rawCaptureResult?.ok !== false,
+        taskId: captureTask.taskId || "",
+        mode: "data_pool_query",
+        operation: "capabilities",
+        agentVersion: SERVER_VERSION,
+        capabilities: payload.capabilities.map((capability) => {
+          const requiredTools = Array.isArray(capability.tools) ? capability.tools : [];
+          const missingAgentTools = requiredTools.filter((name) => !availableTools.has(name));
+          return {
+            ...capability,
+            missingAgentTools,
+            availableToAgent: capability.status === "active" &&
+              ["direct", "orchestrated", "extension_confirmation", "shared"].includes(capability.agentSupport) &&
+              requiredTools.length > 0 && missingAgentTools.length === 0,
+          };
+        }),
+        instruction: "只按当前实际可用能力制定方案；可用不代表用户已授权。先读已有数据，简要说明必要范围并核对当前任务已有授权；已同意就继续，未授权才询问。插件内最终发送确认、清理预览及逐字稿报价各自保留。",
+        error: response?.error || rawCaptureResult?.error || null,
+      };
+    }
     return {
       ok: response?.ok !== false && rawCaptureResult?.ok !== false,
       taskId: captureTask.taskId || "",
@@ -2549,14 +2952,31 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
 }
 
 function pumpQueue() {
-  if (!extensionPeer || activeExtensionTaskId) return;
-  const next = [...tasks.values()].find(
+  if (brokerStopping || !extensionPeer || activeExtensionTaskId) return;
+  let next;
+  while ((next = [...tasks.values()].find(
     (task) =>
       task.kind === "capture" &&
       deviceSessions.has(task.owner?.deviceId) &&
       (task.status === "queued" || task.status === "waiting_for_extension"),
-  );
+  ))) {
+    if (!findBlockingTaskParent(tasks, next.taskId)) break;
+    finishTask(next, {
+      status: "failed", result: next.result,
+      error: {code: "ORCHESTRATION_CHILD_RELEASED", message: "所属多阶段任务已终止或正在取消，未开始的子任务不再执行"},
+    });
+  }
   if (!next) return;
+  if (captureNeedsCollectionConsent(next.captureTask) &&
+      (!next.collectionConsent?.planId || next.collectionConsent.ownerDeviceId !== next.owner?.deviceId)) {
+    finishTask(next, {
+      status: "input_required",
+      error: {code: "COLLECTION_CONFIRMATION_REQUIRED", message: "该采集缺少已确认方案；请核对当前任务授权并使用方案确认工具，尚未授权才询问用户"},
+      message: "采集未启动，等待用户确认具体方案",
+    });
+    pumpQueue();
+    return;
+  }
   activeExtensionTaskId = next.taskId;
   next.captureTask.taskId = next.taskId;
   updateTask(next, {
@@ -3004,6 +3424,7 @@ function handleExtensionMessage(message = {}, peer = null) {
   }
 
   if (message.type === "task.progress") {
+    if (TERMINAL_TASK_STATUSES.has(task.status)) return;
     updateTask(task, {
       status: "running",
       progress: message.progress || null,
@@ -3156,6 +3577,7 @@ async function runDeepBatch(parent, input = {}) {
         includeComments: input.includeComments === true,
         includeBloggerMetrics: input.includeBloggerMetrics === true,
         confirmation: {confirmed: true, source: "mediaclaw_deep_collect"},
+        commentsMaxDetectedItems: input.commentsPerItemLimit || 30,
       },
     });
     parent.childTaskIds.push(child.taskId);
@@ -5896,16 +6318,88 @@ const SEARCH_FILTER_SCHEMA_PROPERTIES = Object.freeze({
 });
 
 const captureExecution = undefined;
+
+function toolAnnotations(
+  title,
+  {
+    readOnlyHint = false,
+    destructiveHint = false,
+    idempotentHint = false,
+    openWorldHint = false,
+  } = {},
+) {
+  return Object.freeze({
+    title,
+    readOnlyHint,
+    destructiveHint,
+    idempotentHint,
+    openWorldHint,
+  });
+}
+
 const tools = [
+  {
+    name: "mediaclaw_get_capabilities",
+    description: "读取当前已连接插件的能力清单，并与本 Agent 实际工具核对。每次新任务在检查连接后先调用，区分可直接指挥、由Agent编排、需插件最终确认和插件独有能力。返回插件实际版本、能力注册表版本、Agent版本及缺少的入口；只读，不打开作品页面、不采集或清理。旧插件不支持时明确报告，不能猜测支持。随后复用已有资产，核对当前任务授权，仅对未授权范围询问。",
+    annotations: toolAnnotations("核查插件与 Agent 能力", {readOnlyHint: true, idempotentHint: true}),
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {async: {type: "boolean", default: false}},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_prepare_collection",
+    description: "制定固定范围的采集方案，不打开浏览器、不采集数据。根据用户目标选择 toolName 和 arguments；多关键词等已知动作先分别准备，一起简要展示来源、总量、筛选和数据深度，再用 planIds 一次确认。当前对话已明确授权相同范围时直接衔接确认工具，不要求新的回复或固定口令。只有尚未授权的建议范围才需询问；默认参数本身不构成授权。更改待执行方案使用 replacesPlanId。",
+    annotations: toolAnnotations("制定采集方案"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        userGoal: {type: "string", minLength: 1, maxLength: 1200},
+        toolName: {type: "string", enum: [...COLLECTION_TOOL_NAMES, "mediaclaw_prepare_profile_collection"]},
+        arguments: {type: "object", additionalProperties: true, default: {}, description: "目标采集工具的参数；只读、发送、付费确认工具不能作为采集步骤"},
+        replacesPlanId: {type: "string", description: "用户修改范围时，替换并作废尚未执行的旧方案"},
+      },
+      required: ["userGoal", "toolName", "arguments"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_confirm_collection",
+    description: "将用户在当前对话中对具体范围的明确同意落实为执行；‘可以／好／开始吧’均可，不要求口令。使用 planId 确认单个方案，或 planIds 一次确认全部已展示且获同意的组，按顺序执行，不逐组重问。用户已明确要求执行同样范围时无需再等一条回复。approve 仅执行保存的方案一次，reject 不执行。默认值、沉默或泛泛研究目标不能代替范围授权；用户只同意部分时仅传该部分。参数不能夹带范围变化。付费逐字稿、私信发送和清理保留各自确认。",
+    annotations: toolAnnotations("确认或拒绝采集方案", {openWorldHint: true, idempotentHint: true}),
+    inputSchema: {
+      type: "object",
+      properties: {
+        planId: {type: "string"},
+        planIds: {type: "array", items: {type: "string"}, minItems: 1, maxItems: 1000, uniqueItems: true, description: "同一次同意覆盖的方案 ID；与 planId 二选一，全部校验通过后一次确认并顺序执行"},
+        decision: {type: "string", enum: ["approve", "reject"]},
+        async: {type: "boolean", default: false},
+      },
+      required: ["decision"],
+      oneOf: [{required: ["planId"]}, {required: ["planIds"]}],
+      additionalProperties: false,
+    },
+  },
   {
     name: "mediaclaw_connection_status",
     description:
       "检查 MediaClaw 浏览器插件是否已开启并连接。开始采集前先调用。",
+    annotations: toolAnnotations("检查 MediaClaw 连接", {
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    }),
     inputSchema: {type: "object", properties: {}, additionalProperties: false},
   },
   {
     name: "mediaclaw_list_paired_devices",
     description: "列出当前插件已批准且未撤销的本机 Agent 设备。",
+    annotations: toolAnnotations("列出已配对设备", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -5917,6 +6411,10 @@ const tools = [
     name: "mediaclaw_list_assets",
     description:
       "统一列出 MediaClaw 资产。用户说‘分析这个账号’时，必须依次查询 local.studio、remote.workbench 的 account_analysis；都没有时再查询 local.data_pool 的 capture_record，只有原始数据也没有或证据覆盖不足时才制定补采方案。用户说‘分析这篇’时对 note_breakdown 与对应 capture_record 执行同样顺序。已有分析默认直接复用，不重复分析；只有用户明确要求重新分析、更新或旧报告不能回答当前问题时才读取原始证据重算。模仿或仿写则先查 local.studio 的 style_profile，本地未命中再查 remote.workbench。全量账号归档使用 local.data_pool + capture_record，并按返回方案的 profileUrl、platform、recordType、contentType filters 与 cursor 分页。返回稳定 assetId，随后必须读取完整对象。浏览器本地数据池和本地 Studio 数据无限读取；remote.workbench 需要有效会员。",
+    annotations: toolAnnotations("列出 MediaClaw 资产", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -5949,6 +6447,10 @@ const tools = [
     name: "mediaclaw_get_asset",
     description:
       "按 mediaclaw_list_assets 返回的稳定 assetId 读取资产。local.data_pool 与 remote.workbench 的账号分析默认只返回 manifest 和 identity，避免完整评论、逐字稿、工作台报告或原始样本一次性堵塞 Agent 上下文；再按任务选择语义分区，并沿 page.nextCursor 读取大型数组。工作台账号报告可读取 reportOverview/reportStrategy/reportExpression/reportFrameworks/reportIdeation/stylePack/evidence/sampleAnalyses/samples/coverage，其中 samples 是后端保存的原始分析样本。读取不会重新采集、打开作品页或扣积分；只有无损调试才使用 view=raw。读取失败或超时不代表本地未命中，禁止自动改用采集工具。",
+    annotations: toolAnnotations("读取 MediaClaw 资产", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6048,6 +6550,7 @@ const tools = [
     name: "mediaclaw_capture_note",
     description:
       "仅在 local.studio、remote.workbench 都没有匹配 note_breakdown，且 local.data_pool 也没有匹配 capture_record 或证据确有缺口时，调用插件现有的单条笔记完整采集能力。单条路径可按插件现状附带评论和博主指标，不增加 Agent 专属限制。分析必须采用工作台单篇契约，不得另写精简版框架。",
+    annotations: toolAnnotations("采集单篇内容", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6073,6 +6576,7 @@ const tools = [
     name: "mediaclaw_capture_search_basic",
     description:
       "调用插件的搜索页基础列表采集，明确禁止隐式打开详情页。Agent 应把自然语言意图转成标准筛选参数：‘最近’通常为 7d，‘最新’使用 latest 排序，‘趋势’通常为 6m；用户明确范围时严格照办。插件会按平台校验并真实点击全部筛选维度，包括中性值，以清除页面遗留筛选；任何请求条件未确认应用时停止采集。",
+    annotations: toolAnnotations("采集搜索结果", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6092,6 +6596,7 @@ const tools = [
     name: "mediaclaw_capture_profile_basic",
     description:
       "调用插件的账号作品基础列表采集，明确禁止隐式打开详情页。",
+    annotations: toolAnnotations("采集账号作品列表", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6110,9 +6615,11 @@ const tools = [
     name: "mediaclaw_prepare_profile_collection",
     description:
       "仅在账号分析报告与已采集账号作品都无法满足当前分析时，根据已经澄清的用户用途和数据缺口制定账号采集方案；不启动浏览器、不采集数据。purpose=account_analysis 会自动补齐工作台同构的基础作品、15 条高/典型/低表现代表详情和最多 12 个封面证据；逐字稿不是机械默认项。若用户没有主动要求逐字稿，Agent 必须先用 analysisTranscriptDecision 和 analysisTranscriptReason 判断它是否会显著提升当前问题：默认优先 not_needed；只有分析口播、叙事、语言、节奏或视频内容机制等必须依赖真实口播时才 recommend，并对最多 8 条最小代表样本报价。用户也可以主动要求逐字稿，或用‘视频文案／口播文字／视频说了什么／字幕文字版’等同义表达触发。逐字稿只生成报价，必须展示逐条积分、总积分、余额和有效期并取得明确确认后才提取。detailMaxItems 与 transcriptMaxItems 可覆盖代表层数量，但不会把 50 条基础作品误变成 50 个详情页。‘全部采下来／完整导出／爬这个账号／每篇详情都要’必须映射为 full_collection，不套用研究建议终点。工具会保留用户明确要求的总量，把超过单批或连续建议额度的目标拆成可审计批次，并返回普通／黄色／红色三级确认。风险提示不会静默缩小用户范围。",
+    annotations: toolAnnotations("制定账号采集方案"),
     inputSchema: {
       type: "object",
       properties: {
+        replacesPlanId: {type: "string", description: "范围变化时替换并作废旧方案"},
         userGoal: {
           type: "string",
           description: "保留用户已经确认的数据目标，用于执行审计和防止目标被默认能力降级。",
@@ -6224,11 +6731,16 @@ const tools = [
     name: "mediaclaw_confirm_profile_collection",
     description:
       "只在用户已经看到 mediaclaw_prepare_profile_collection 返回的完整方案和范围并明确同意后调用。仅接受未过期、当前设备拥有且未使用的一次性 planId；执行时不能修改目标、字段或数量。一次确认覆盖已展示的分批和页面加载／解析类故障重试。完整归档返回 archiveJobId、最多 20 条预览和本地数据池分页读取方案；单条失败不阻断其余记录。登录、验证码或平台冷却不自动重试，也不包装成‘插件做不了’，而是返回 input_required、已完成覆盖和恢复动作。所有模式都返回逐阶段进度、实际覆盖、执行日志、失败项和后续确认事项，避免黑盒采集。",
+    annotations: toolAnnotations("执行账号采集方案", {
+      idempotentHint: true,
+      openWorldHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
       properties: {
         planId: {type: "string"},
+        decision: {type: "string", enum: ["approve", "reject"], default: "approve"},
         async: {
           type: "boolean",
           default: false,
@@ -6243,6 +6755,7 @@ const tools = [
     name: "mediaclaw_enhance_records",
     description:
       "会员能力：调用插件现有批量详情补采 owner，对数据池 recordIds 补采正文、媒体及可选评论/博主指标。执行前必须由用户明确确认范围。",
+    annotations: toolAnnotations("补采记录详情", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6254,15 +6767,16 @@ const tools = [
           items: {type: "string"},
         },
         includeComments: {type: "boolean", default: false},
+        commentsPerItemLimit: {type: "integer", minimum: 1, maximum: 500, default: 30},
         includeBloggerMetrics: {type: "boolean", default: false},
         confirmed: {
           type: "boolean",
-          description: "仅在用户已经确认本次批量范围后传 true",
+          description: "旧客户端兼容字段，传 true 也只返回待确认方案；执行必须使用一次性 planId 确认",
         },
         idempotencyKey: {type: "string"},
         async: {type: "boolean", default: false},
       },
-      required: ["recordIds", "confirmed"],
+      required: ["recordIds"],
       additionalProperties: false,
     },
   },
@@ -6270,6 +6784,7 @@ const tools = [
     name: "mediaclaw_scan_keyword",
     description:
       "按关键词快速扫描内容。默认 80 条，只采封面、链接、作者、点赞等基础字段，不逐篇打开详情。",
+    annotations: toolAnnotations("扫描关键词内容", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6296,6 +6811,7 @@ const tools = [
     name: "mediaclaw_expand_keywords",
     description:
       "从小红书或抖音搜索页获取一个种子词的联想扩展词。只采集和去重，不调用后端 AI。",
+    annotations: toolAnnotations("扩展搜索关键词", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6316,6 +6832,7 @@ const tools = [
     name: "mediaclaw_research_keyword_topics",
     description:
       "为选题趋势分析准备基础列表数据：默认采集最近半年按点赞排序的 80 条结果，不隐式打开详情页。返回客观指标和按需增强建议，最终分析由 Agent 完成。",
+    annotations: toolAnnotations("研究关键词选题", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6346,6 +6863,7 @@ const tools = [
     name: "mediaclaw_research_longtail_keywords",
     description:
       "为长尾需求分析准备扩展词数据，返回去重结果、覆盖信息和默认方法 ID；不调用后端 AI。",
+    annotations: toolAnnotations("研究长尾关键词", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6366,6 +6884,7 @@ const tools = [
     name: "mediaclaw_scan_account",
     description:
       "快速扫描一个账号的作品列表，默认 80 条基础字段。它只采集作品，不读取已保存的账号风格分析。",
+    annotations: toolAnnotations("扫描账号作品", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6387,6 +6906,7 @@ const tools = [
     name: "mediaclaw_capture_account_profile",
     description:
       "采集一个账号的主页画像原子数据，包括账号名、简介、粉丝、获赞收藏和主页链接；不分析账号风格。",
+    annotations: toolAnnotations("采集账号主页", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6407,6 +6927,7 @@ const tools = [
     name: "mediaclaw_research_account_hits",
     description:
       "查找某个博主近期作品中的高表现内容。先按发布时间或主页展示顺序确定近期样本，再按互动表现排序；不执行账号风格分析。",
+    annotations: toolAnnotations("研究账号高表现内容", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6447,6 +6968,7 @@ const tools = [
     name: "mediaclaw_research_benchmark_accounts",
     description:
       "从关键词高表现内容中聚合作者，补采候选主页画像，返回对标账号候选、客观指标和分析方法 ID；不调用后端 AI。",
+    annotations: toolAnnotations("研究对标账号", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6484,6 +7006,10 @@ const tools = [
     name: "mediaclaw_list_style_profiles",
     description:
       "列出 MediaClaw 工作台中已经分析并保存的账号风格档案，返回账号名、profileId、样本量和更新时间等摘要。",
+    annotations: toolAnnotations("列出风格档案", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6502,6 +7028,10 @@ const tools = [
     name: "mediaclaw_get_style_profile",
     description:
       "兼容旧流程：按账号标识读取已保存的完整风格分析。新流程遇到“模仿/仿写/按某人风格”时，应先用 mediaclaw_list_assets 查询 local.studio，未命中再查 remote.workbench，并用 mediaclaw_get_asset 读取完整档案。找不到或重名时禁止猜测风格。",
+    annotations: toolAnnotations("读取风格档案", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6525,6 +7055,7 @@ const tools = [
     name: "mediaclaw_capture_content",
     description:
       "采集一篇具体内容的详情。仅在用户给出链接或快速扫描后决定深挖时使用。",
+    annotations: toolAnnotations("采集内容详情", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6536,6 +7067,7 @@ const tools = [
           default: "xiaohongshu",
         },
         includeComments: {type: "boolean", default: false},
+        commentsPerItemLimit: {type: "integer", minimum: 1, maximum: 500, default: 30},
         includeBloggerMetrics: {type: "boolean", default: false},
         async: {type: "boolean", default: false},
       },
@@ -6547,6 +7079,7 @@ const tools = [
     name: "mediaclaw_research_single_note",
     description:
       "为单篇分析准备完整详情和可选评论；图片 OCR 复用插件能力。调用前必须判断逐字稿是否会显著提升任务，并传入 analysisTranscriptDecision：默认优先 not_needed；用户主动索要原视频的逐字稿／视频文案／口播文字／视频说了什么／字幕文字版时用 user_requested；只有口播、叙事、语言、论证、节奏或脚本机制分析确需原文时才 recommend。user_requested 或 recommend 会先检查已有逐字稿：已有时直接读取且不收费，缺失时返回真实报价与 quoteId，仍需用户明确确认；not_needed 不报价、不提取。‘帮我写视频文案’属于生成请求，不得误判为提取。",
+    annotations: toolAnnotations("研究单篇内容", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6592,6 +7125,7 @@ const tools = [
     name: "mediaclaw_deep_collect",
     description:
       "套餐能力：按顺序深采 15～20 条代表内容的完整详情，可附加评论和博主指标。未激活、过期或冻结时会返回结构化付费墙。",
+    annotations: toolAnnotations("深度采集代表内容", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6608,6 +7142,7 @@ const tools = [
           default: "xiaohongshu",
         },
         includeComments: {type: "boolean", default: false},
+        commentsPerItemLimit: {type: "integer", minimum: 1, maximum: 500, default: 30},
         includeBloggerMetrics: {type: "boolean", default: false},
         async: {type: "boolean", default: false},
       },
@@ -6618,6 +7153,7 @@ const tools = [
   {
     name: "mediaclaw_capture_comments",
     description: "调用插件现有的单篇评论采集能力。单篇不设会员数量权益墙；为降低账号风控风险，单轮安全上限为 500 条，连续任务还会受插件累计预算和冷却保护。",
+    annotations: toolAnnotations("采集单篇评论", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6640,6 +7176,7 @@ const tools = [
     name: "mediaclaw_capture_comments_full",
     description:
       "兼容旧调用的单篇评论采集别名；不再单独要求会员，建议新调用使用 mediaclaw_capture_comments。",
+    annotations: toolAnnotations("采集完整评论", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6658,9 +7195,93 @@ const tools = [
     },
   },
   {
+    name: "mediaclaw_list_comment_outreach_candidates",
+    description:
+      "读取插件数据池中的评论触达候选。返回全部已采集评论，筛选命中只是标签；不会打开主页或发送私信。",
+    annotations: toolAnnotations("列出评论触达候选", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        recordId: {type: "string", description: "可选；只读取一条数据池记录中的评论"},
+        filter: {
+          type: "string",
+          enum: ["all", "matched", "contactable"],
+          default: "all",
+        },
+        async: {type: "boolean", default: false},
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_prepare_comment_outreach",
+    description:
+      "为选中的评论候选生成私信触达批次和固定话术预览。按所选范围交给插件去重、分组并校验当前发送额度，不另设 Agent 收件人数上限。用户修改收件人或话术时传 replacesPlanId，原待确认方案原子作废；已开始的任务不能静默替换，请按用户要求明确终止。此工具绝不会开始发送；用户仍须在插件最近任务中核对最终收件人、发送账号与话术并点击最终确认。",
+    annotations: toolAnnotations("准备评论触达方案"),
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        candidateIds: {
+          type: "array",
+          minItems: 1,
+          items: {type: "string"},
+        },
+        message: {type: "string", minLength: 1, maxLength: 500},
+        replacesPlanId: {type: "string", description: "用户修改方案时要作废的旧待确认计划；执行中计划不可替换"},
+        idempotencyKey: {type: "string"},
+        async: {type: "boolean", default: false},
+      },
+      required: ["candidateIds", "message"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_cancel_comment_outreach",
+    description:
+      "用户明确拒绝、取消或要求停止指定触达计划时调用。待确认方案会失效并释放收件人；执行中任务停止剩余用户，已触发发送的当前项先核实结果。不会发送、重试或撤回已发消息；不能用 mediaclaw_cancel_task 代替触达计划取消。",
+    annotations: toolAnnotations("取消或停止评论触达", {destructiveHint: true, idempotentHint: true}),
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        planId: {type: "string"},
+        async: {type: "boolean", default: false},
+      },
+      required: ["planId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_get_comment_outreach_status",
+    description:
+      "读取评论触达的最近批次或指定 planId 的执行状态；只读，不会确认或发送。",
+    annotations: toolAnnotations("读取评论触达状态", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        planId: {type: "string"},
+        async: {type: "boolean", default: false},
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "mediaclaw_query_data_pool",
     description:
       "分页查询浏览器插件中长期保存的 MediaClaw 数据池，只返回记录摘要。它不同于 mediaclaw_query_dataset，后者只查当前 MCP 进程任务。",
+    annotations: toolAnnotations("查询 MediaClaw 数据池", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6695,7 +7316,8 @@ const tools = [
   {
     name: "mediaclaw_preview_clear_data",
     description:
-      "预览清空插件采集数据的影响，返回记录、评论、逐字稿数量、预计释放空间和一次性 confirmationToken；只预览，不删除。必须先向用户展示结果并取得明确确认。",
+      "预览与插件‘清理本地数据’相同的最新范围：数据池及提取文本、采集进度、同步历史、本地监控执行缓存、已结束触达明细、诊断、已结束任务和可回收结果缓存；返回当前范围版本、删除/保留项目、数量、存储估计与一次性 confirmationToken，只预览不删除。必须完整展示实际返回范围并等待用户新回复确认；旧版预览不能授权新版扩大范围。",
+    annotations: toolAnnotations("预览清空采集数据"),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6708,7 +7330,11 @@ const tools = [
   {
     name: "mediaclaw_confirm_clear_data",
     description:
-      "使用 mediaclaw_preview_clear_data 返回的未过期 confirmationToken 清空插件采集数据和采集进度。仅在用户看到预览并明确确认后调用；保留登录、设置、同步目标和 Studio 数据。",
+      "仅在用户看过最新清理预览并随后明确同意时，用原样 confirmationToken 清理预览范围。复用插件统一清理逻辑，保留登录、设置、同步目标、Studio、监控配置与云端历史、触达限额与发送核验凭据、配对及仍需恢复的记录；不清浏览器Cookie或云端数据。范围或数据变化须重新预览并等待确认；运行中任务会阻止清理，不能强制绕过。",
+    annotations: toolAnnotations("确认清空采集数据", {
+      destructiveHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6724,6 +7350,10 @@ const tools = [
     name: "mediaclaw_get_data_pool_record",
     description:
       "按 recordId 读取 MediaClaw 数据池中的一条完整记录，供后续 OCR、逐字稿或自定义分析使用。",
+    annotations: toolAnnotations("读取数据池记录", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6739,6 +7369,10 @@ const tools = [
     name: "mediaclaw_get_video_transcript",
     description:
       "按 recordId 轻量读取插件已经保存的视频逐字稿，不重新提取、不重复扣积分。默认返回 12000 字符；hasMore=true 时必须继续使用 nextOffset 读取，直到完整取回。",
+    annotations: toolAnnotations("读取视频逐字稿", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6767,6 +7401,7 @@ const tools = [
     name: "mediaclaw_extract_image_text",
     description:
       "对数据池记录中的配图执行 OCR，并把结果写回原记录。重复调用默认复用已有结果。",
+    annotations: toolAnnotations("提取图片文字", {destructiveHint: true}),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6783,6 +7418,7 @@ const tools = [
     name: "mediaclaw_quote_video_transcript",
     description:
       "为 1～20 条数据池视频记录生成逐字稿积分报价。返回逐条预计积分、总额、余额、quoteId 和有效期，不扣积分。",
+    annotations: toolAnnotations("生成逐字稿报价"),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6804,6 +7440,10 @@ const tools = [
     name: "mediaclaw_confirm_video_transcript",
     description:
       "使用未过期且未使用的 quoteId 确认逐字稿。只有用户明确同意报价后才能调用；quoteId 不可复用。",
+    annotations: toolAnnotations("确认提取视频逐字稿", {
+      destructiveHint: true,
+      idempotentHint: true,
+    }),
     execution: captureExecution,
     inputSchema: {
       type: "object",
@@ -6820,6 +7460,10 @@ const tools = [
     name: "mediaclaw_query_dataset",
     description:
       "分页读取当前桥接进程内已完成采集或研究任务的数据，可按互动量或时间排序。",
+    annotations: toolAnnotations("查询任务数据集", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     inputSchema: {
       type: "object",
       properties: {
@@ -6850,6 +7494,10 @@ const tools = [
   {
     name: "mediaclaw_task_status",
     description: "读取异步 MediaClaw 任务（包括本地资产读取、提取和采集）的进度与结果。",
+    annotations: toolAnnotations("读取任务状态", {
+      readOnlyHint: true,
+      idempotentHint: true,
+    }),
     inputSchema: {
       type: "object",
       properties: {taskId: {type: "string"}},
@@ -6860,6 +7508,10 @@ const tools = [
   {
     name: "mediaclaw_cancel_task",
     description: "取消仍在运行或等待中的采集任务。",
+    annotations: toolAnnotations("取消采集任务", {
+      destructiveHint: true,
+      idempotentHint: true,
+    }),
     inputSchema: {
       type: "object",
       properties: {taskId: {type: "string"}},
@@ -6869,7 +7521,18 @@ const tools = [
   },
 ];
 
+for (const tool of tools) {
+  if (!COLLECTION_TOOL_NAMES.has(tool.name)) continue;
+  tool.description = "此入口只准备固定范围的方案，不启动采集；async、task 或 confirmed=true 不构成授权。返回 confirmation_required 后核对当前对话：具体范围已获用户同意则直接调用 mediaclaw_confirm_collection，多组用 planIds 一次确认；尚未获同意时才简要展示并询问，不要求固定口令或逐组重复确认。原操作说明：" + tool.description;
+}
+
 async function executeCaptureTool(name, args) {
+  if (name === "mediaclaw_get_capabilities") {
+    return startSingleCapture("data_pool_query", {
+      async: args.async === true,
+      options: {operation: "capabilities"},
+    });
+  }
   if (name === "mediaclaw_list_paired_devices") {
     return startSingleCapture("paired_devices", {...args, limit: 8});
   }
@@ -7023,6 +7686,7 @@ async function executeCaptureTool(name, args) {
       featureKey: "capture.single_note",
       options: {
         includeComments: args.includeComments === true,
+        commentsMaxDetectedItems: args.commentsPerItemLimit || 30,
         includeBloggerMetrics: args.includeBloggerMetrics === true,
       },
     });
@@ -7045,6 +7709,46 @@ async function executeCaptureTool(name, args) {
         500,
         Math.max(1, Math.floor(Number(args.limit) || 60)),
       ),
+    });
+  }
+  if (name === "mediaclaw_list_comment_outreach_candidates") {
+    return startSingleCapture("outreach", {
+      ...args,
+      options: {
+        operation: "list_candidates",
+        recordId: args.recordId || "",
+        filter: args.filter || "all",
+      },
+    });
+  }
+  if (name === "mediaclaw_prepare_comment_outreach") {
+    const scopeKey = args.idempotencyKey
+      ? `${String(args.idempotencyKey).slice(0, 140)}:outreach:${crypto.createHash("sha256").update(JSON.stringify([args.candidateIds, args.message, args.replacesPlanId || ""])).digest("hex").slice(0, 32)}`
+      : undefined;
+    return startSingleCapture("outreach", {
+      ...args,
+      idempotencyKey: scopeKey,
+      options: {
+        operation: "prepare",
+        candidateIds: args.candidateIds,
+        message: args.message,
+        replacesPlanId: args.replacesPlanId || "",
+      },
+    });
+  }
+  if (name === "mediaclaw_cancel_comment_outreach") {
+    return startSingleCapture("outreach", {
+      ...args,
+      options: {operation: "cancel", planId: args.planId},
+    });
+  }
+  if (name === "mediaclaw_get_comment_outreach_status") {
+    return startSingleCapture("outreach", {
+      ...args,
+      options: {
+        operation: "status",
+        planId: args.planId || "",
+      },
     });
   }
   if (name === "mediaclaw_query_data_pool") {
@@ -7149,6 +7853,46 @@ async function handleToolCall(params = {}) {
   const name = String(params.name || "");
   const args = params.arguments || {};
 
+  if (name === "mediaclaw_prepare_collection" || COLLECTION_TOOL_NAMES.has(name)) {
+    try {
+      const input = name === "mediaclaw_prepare_collection"
+        ? collectionArguments(tools.find((tool) => tool.name === name).inputSchema, args)
+        : {toolName: name, arguments: args};
+      const plan = createCollectionPlan(input, adapter);
+      return toolResult({ok: true, status: "confirmation_required", collectionStarted: false, plan});
+    } catch (error) {
+      return toolResult({ok: false, collectionStarted: false, error: {code: error.code || "INVALID_COLLECTION_PLAN", message: error.message}}, {isError: true});
+    }
+  }
+  if (name === "mediaclaw_confirm_collection") {
+    try {
+      const confirmation = collectionArguments(tools.find((tool) => tool.name === name).inputSchema, args);
+      if (Boolean(confirmation.planId) === Boolean(confirmation.planIds)) throw new Error("planId 与 planIds 必须且只能提供一个");
+      const planIds = confirmation.planIds || [confirmation.planId];
+      if (new Set(planIds).size !== planIds.length) throw new Error("planIds 不能重复");
+      // Validate all IDs and ownership before consuming any of them.
+      const plans = planIds.map((planId) => resolveCollectionPlan(planId, adapter));
+      if (confirmation.decision === "reject") {
+        for (const plan of plans) plan.rejectedAt = nowIso();
+        return toolResult({ok: true, status: "rejected", ...(confirmation.planIds ? {planIds} : {planId: confirmation.planId}), collectionStarted: false});
+      }
+      if (!extensionPeer || !adapterSession(adapter)) throw collectionPlanError("EXTENSION_NOT_CONNECTED", "插件连接或设备配对未就绪，方案尚未执行");
+      const confirmedAt = nowIso();
+      for (const plan of plans) plan.usedAt = confirmedAt;
+      const task = plans.length === 1 ? await startConfirmedCollectionPlan(plans[0]) : startCollectionPlanBatch(plans);
+      if (confirmation.async) return toolResult({ok: true, ...(confirmation.planIds ? {planIds} : {planId: confirmation.planId}), taskId: task.taskId, task: taskSnapshot(task)});
+      if (params.task) return {task: taskSnapshot(task)};
+      try {
+        await waitForTask(task);
+      } catch (error) {
+        return toolResult({ok: true, ...getTaskPublicResult(task), message: error.message, nextTool: "mediaclaw_task_status"});
+      }
+      return toolResult(getTaskPublicResult(task), {isError: task.status === "failed"});
+    } catch (error) {
+      return toolResult({ok: false, error: {code: error.code || "INVALID_COLLECTION_CONFIRMATION", message: error.message}}, {isError: true});
+    }
+  }
+
   if (name === "mediaclaw_connection_status") {
     const session = adapterSession(adapter);
     const connected = Boolean(extensionPeer && session);
@@ -7203,9 +7947,18 @@ async function handleToolCall(params = {}) {
     }
   }
   if (name === "mediaclaw_confirm_profile_collection") {
+    try {
+      collectionArguments(tools.find((tool) => tool.name === name).inputSchema, args);
+    } catch (error) {
+      return toolResult({ok: false, error: {code: "INVALID_COLLECTION_CONFIRMATION", message: error.message}}, {isError: true});
+    }
     const resolved = resolveProfileCollectionPlan(args.planId, adapter);
     if (!resolved.ok) {
       return toolResult(resolved, {isError: true});
+    }
+    if (args.decision === "reject") {
+      resolved.plan.rejectedAt = nowIso();
+      return toolResult({ok: true, status: "rejected", planId: resolved.plan.planId, collectionStarted: false});
     }
     if (!extensionPeer || !adapterSession(adapter)) {
       return toolResult(
@@ -7221,7 +7974,8 @@ async function handleToolCall(params = {}) {
         {isError: true},
       );
     }
-    const task = startProfileCollectionWorkflow(resolved.plan);
+    const collectionConsent = {planId: resolved.plan.planId, ownerDeviceId: resolved.plan.ownerDeviceId, confirmedAt: nowIso()};
+    const task = requestContext.run({...requestContext.getStore(), collectionConsent}, () => startProfileCollectionWorkflow(resolved.plan));
     if (args?.async === true) {
       return toolResult({
         ok: true,
@@ -7406,7 +8160,7 @@ function scheduleBrokerUpgrade(adapterVersion) {
     for (const peer of extensionPeers) {
       peer.close(1012, "MediaClaw Agent is loading a newer Broker");
     }
-    void websocketServer.close().finally(() => process.exit(0));
+    void stopBroker();
   }, 100);
   timer.unref?.();
 }
@@ -7465,6 +8219,10 @@ async function handleBridgeHttpRequest(request, response) {
   if (request.method !== "POST") {
     return false;
   }
+  if (brokerStopping) {
+    sendJson(response, 503, {ok: false, error: {code: "BROKER_STOPPING", message: "Broker is restarting"}});
+    return true;
+  }
   const payload = await readJsonRequest(request);
   if (request.url === "/v1/adapters/register") {
     const registration = await registerAdapter(payload);
@@ -7491,7 +8249,7 @@ async function handleBridgeHttpRequest(request, response) {
     let result;
     try {
       result = await requestContext.run(
-        {adapter},
+        {adapter, instanceId: adapterTokens.get(payload.token)?.instanceId || ""},
         () => handleBrokerMcp(adapter, payload),
       );
     } catch (error) {
@@ -7502,7 +8260,7 @@ async function handleBridgeHttpRequest(request, response) {
         },
       };
     }
-    await scheduleTaskStatePersist();
+    await taskStateWriter.flush();
     sendJson(response, 200, result);
     return true;
   }
@@ -7583,7 +8341,7 @@ const adapterSweepTimer = setInterval(() => {
     mostRecentAdapterAt > 0 &&
     Date.now() - mostRecentAdapterAt >= BROKER_IDLE_TIMEOUT_MS
   ) {
-    void websocketServer.close().finally(() => process.exit(0));
+    void stopBroker();
   }
 }, ADAPTER_SWEEP_INTERVAL_MS);
 adapterSweepTimer.unref?.();
@@ -7591,5 +8349,32 @@ adapterSweepTimer.unref?.();
 const taskWatchdogTimer = setInterval(() => {
   expireStaleLocalAssetQueries();
   expireUnacknowledgedCaptureTask();
+  pruneExpiredTaskHistory();
 }, TASK_WATCHDOG_INTERVAL_MS);
 taskWatchdogTimer.unref?.();
+
+function stopBroker() {
+  if (brokerShutdown) return brokerShutdown;
+  brokerStopping = true;
+  clearInterval(adapterSweepTimer);
+  clearInterval(taskWatchdogTimer);
+  brokerShutdown = (async () => {
+    for (const peer of [...extensionPeers]) {
+      peer.close(1012, "MediaClaw Agent Broker is stopping");
+      handleExtensionClose(peer);
+    }
+    // A synchronous MCP request may still be waiting on an unfinished task.
+    // Stop listening, but do not wait for those HTTP responses before exit.
+    void websocketServer.close().catch((error) => {
+      process.stderr.write(`[mediaclaw] cannot close Broker listener: ${error.message}\n`);
+    });
+    // Closing peers can change running tasks to waiting_for_extension; persist
+    // those final transitions before SIGTERM, idle exit, or an Agent upgrade.
+    const persisted = await taskStateWriter.flush();
+    process.exit(persisted ? 0 : 1);
+  })();
+  return brokerShutdown;
+}
+
+process.once("SIGTERM", () => { void stopBroker(); });
+process.once("SIGINT", () => { void stopBroker(); });

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mediaclaw": {
+      "command": "./scripts/launch-agent-local.cmd",
+      "cwd": ".",
+      "env": {
+        "MEDIACLAW_AGENT_HOST": "doubao-work",
+        "MEDIACLAW_AGENT_DEVICE_NAME": "MediaClaw Agent (豆包工作)",
+        "MEDIACLAW_AGENT_CHANNEL": "local"
+      }
+    }
+  }
+}

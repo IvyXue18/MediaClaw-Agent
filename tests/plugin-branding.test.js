@@ -11,6 +11,24 @@ function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(pluginRoot, relativePath), "utf8"));
 }
 
+test("candidate package, contract, host manifests and runtime launchers share one version", () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"));
+  const lock = JSON.parse(fs.readFileSync(path.join(projectRoot, "package-lock.json"), "utf8"));
+  const marketplace = JSON.parse(fs.readFileSync(path.join(projectRoot, ".codebuddy-plugin/marketplace.json"), "utf8"));
+  const version = packageJson.version;
+  for (const actual of [
+    lock.version, lock.packages[""].version,
+    readJson(".codex-plugin/plugin.json").version,
+    readJson(".codebuddy-plugin/plugin.json").version,
+    readJson("contracts/mcp-v1.json").serverVersion,
+    marketplace.plugins[0].version,
+  ]) assert.equal(actual, version);
+  for (const launcher of ["launch-agent", "launch-agent.cmd"]) {
+    const source = fs.readFileSync(path.join(pluginRoot, "scripts", launcher), "utf8");
+    assert.equal(source.match(/RELEASE_VERSION="?v([^"\r\n]+)/)?.[1], version, launcher);
+  }
+});
+
 test("MediaClaw host surfaces share the canonical MC logo", () => {
   const codexPlugin = readJson(".codex-plugin/plugin.json");
   const workbuddySkillMeta = readJson(
@@ -23,11 +41,15 @@ test("MediaClaw host surfaces share the canonical MC logo", () => {
   assert.equal(workbuddySkillMeta.iconSource, "https://mediaclaw.app/logo.png");
 });
 
-test("V0.3 only publishes Codex and WorkBuddy entry points", () => {
+test("published host entry points exclude unfinished Claude support", () => {
   assert.equal(fs.existsSync(path.join(projectRoot, ".claude-plugin")), false);
   assert.equal(fs.existsSync(path.join(pluginRoot, ".claude-plugin")), false);
   assert.equal(fs.existsSync(path.join(pluginRoot, ".mcp.claude.json")), false);
   assert.equal(fs.existsSync(path.join(pluginRoot, "manifest.json")), false);
+  assert.equal(
+    fs.existsSync(path.join(pluginRoot, ".mcp.doubao-work.json")),
+    true,
+  );
 });
 
 test("all supported Agent hosts inherit the broad default MediaClaw trigger", () => {

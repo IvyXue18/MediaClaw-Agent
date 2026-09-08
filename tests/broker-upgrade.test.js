@@ -40,6 +40,8 @@ test("a newer Adapter makes an older shared Broker exit for replacement", async 
         ...process.env,
         MEDIACLAW_AGENT_PORT: String(port),
         MEDIACLAW_AGENT_STATE_DIR: stateDirectory,
+        // Exercise a real older runtime independently of the candidate version.
+        MEDIACLAW_AGENT_RUNTIME_VERSION: "0.3.1",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },

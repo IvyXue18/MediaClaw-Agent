@@ -3,6 +3,11 @@ import {spawn} from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {resolveStateDirectory} from "./device-identity.mjs";
+import {
+  agentHostDisplayName,
+  agentHostSupportsAutomaticUpdate,
+  normalizeAgentHostKey,
+} from "./agent-hosts.mjs";
 
 const DEFAULT_RELEASES_URL =
   "https://api.github.com/repos/IvyXue18/MediaClaw-Agent/releases?per_page=5";
@@ -49,6 +54,13 @@ export const AGENT_UPDATE_TOOL = {
   name: "mediaclaw_manage_agent_update",
   description:
     "仅在用户已经明确同意或拒绝当前 agentUpdate 后调用。拒绝不会改动安装；同意后由 Adapter 自动安装并验版。插件文件更新必须等宿主重新打开、新版 Adapter 真实启动后才算激活。",
+  annotations: {
+    title: "管理 MediaClaw Agent 更新",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
   inputSchema: {
     type: "object",
     properties: {
@@ -132,20 +144,23 @@ function updateCommandPlan(hostKey) {
       },
     };
   }
-  return {
-    commands: [
-      {
+  if (hostKey === "codex") {
+    return {
+      commands: [
+        {
+          file: "codex",
+          fallbackFiles: CODEX_CLI_FALLBACKS,
+          args: ["plugin", "marketplace", "upgrade", MARKETPLACE_NAME],
+        },
+      ],
+      verify: {
         file: "codex",
         fallbackFiles: CODEX_CLI_FALLBACKS,
-        args: ["plugin", "marketplace", "upgrade", MARKETPLACE_NAME],
+        args: ["plugin", "list"],
       },
-    ],
-    verify: {
-      file: "codex",
-      fallbackFiles: CODEX_CLI_FALLBACKS,
-      args: ["plugin", "list"],
-    },
-  };
+    };
+  }
+  return null;
 }
 
 function updateExecution(hostKey) {
@@ -158,12 +173,7 @@ function updateExecution(hostKey) {
 }
 
 function normalizedHostKey(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
+  return normalizeAgentHostKey(value);
 }
 
 export function createAgentUpdateStateStore({
@@ -225,7 +235,26 @@ function buildUpdateState({currentVersion, latestVersion, hostKey, checkedAt}) {
       blocking: false,
     };
   }
-  const hostDisplayName = hostKey === "workbuddy" ? "WorkBuddy" : "Codex";
+  const hostDisplayName = agentHostDisplayName(hostKey);
+  if (!agentHostSupportsAutomaticUpdate(hostKey)) {
+    return {
+      status: "manual_update_available",
+      currentVersion,
+      latestVersion,
+      checkedAt,
+      blocking: false,
+      approvalRequired: false,
+      message: `发现 MediaClaw Agent ${latestVersion}。${hostDisplayName} 当前使用本地接入包，请重新执行 MediaClaw 提供的安装提示完成更新。`,
+      releaseUrl: `https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v${latestVersion}`,
+      userGuidance: {
+        stage: "manual_reinstall_required",
+        host: hostKey,
+        hostDisplayName,
+        currentVersion,
+        targetVersion: latestVersion,
+      },
+    };
+  }
   return {
     status: "update_available",
     currentVersion,
@@ -499,7 +528,7 @@ export function createAgentUpdateOrchestrator({
   let durableStatePromise = null;
   let activatedState = null;
 
-  const hostDisplayName = hostKey === "workbuddy" ? "WorkBuddy" : "Codex";
+  const hostDisplayName = agentHostDisplayName(hostKey);
 
   function restartGuidance(installedVersion) {
     return {
@@ -658,6 +687,15 @@ export function createAgentUpdateOrchestrator({
     pendingApply = (async () => {
       dismissed = false;
       const plan = updateCommandPlan(hostKey);
+      if (!plan) {
+        return {
+          ok: false,
+          error: {
+            code: "AUTOMATIC_UPDATE_UNSUPPORTED",
+            message: `${hostDisplayName} 当前不支持由 Adapter 自动更新接入包`,
+          },
+        };
+      }
       for (let index = 0; index < plan.commands.length; index += 1) {
         const command = plan.commands[index];
         const result = normalizeCommandResult(await commandRunner(command));

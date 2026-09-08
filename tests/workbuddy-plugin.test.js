@@ -78,8 +78,10 @@ test("the marketplace ships native launchers for POSIX and Windows hosts", () =>
   const scripts = path.join(projectRoot, "plugins", "mediaclaw", "scripts");
   const posixLauncher = path.join(scripts, "launch-agent");
   const windowsLauncher = path.join(scripts, "launch-agent.cmd");
+  const localLauncher = path.join(scripts, "launch-agent-local.cmd");
   assert.equal(fs.existsSync(posixLauncher), true);
   assert.equal(fs.existsSync(windowsLauncher), true);
+  assert.equal(fs.existsSync(localLauncher), true);
   assert.match(fs.readFileSync(posixLauncher, "utf8"), /PLUGIN_DATA/);
   assert.match(fs.readFileSync(posixLauncher, "utf8"), /Linux-aarch64/);
   assert.match(fs.readFileSync(posixLauncher, "utf8"), /linux-arm64-musl/);
@@ -89,5 +91,10 @@ test("the marketplace ships native launchers for POSIX and Windows hosts", () =>
     fs.readFileSync(windowsLauncher, "utf8"),
     /^#!\/bin\/sh\n@goto windows 2>NUL\n/,
     "the shared .cmd launcher must remain directly executable on POSIX and jump over POSIX lines on Windows",
+  );
+  assert.match(
+    fs.readFileSync(localLauncher, "utf8"),
+    /^#!\/bin\/sh\n@goto windows 2>NUL\n/,
+    "the local source launcher must remain directly executable on POSIX and Windows",
   );
 });

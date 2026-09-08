@@ -5,6 +5,7 @@ import {connect} from "node:net";
 import {tmpdir} from "node:os";
 import path from "node:path";
 import test from "node:test";
+import MCP_CONTRACT from "../plugins/mediaclaw/contracts/mcp-v1.json" with {type: "json"};
 
 function createLineReader(stream) {
   let buffer = "";
@@ -58,6 +59,43 @@ function createLineReader(stream) {
       });
     },
   };
+}
+
+// Successful capture fixtures explicitly simulate the human approving the displayed
+// plan. This is opt-in at each call site; validation and read-only calls stay raw.
+async function sendCollectionAfterFixtureApproval(child, reader, request) {
+  const planRequestId = `${request.id}:collection-plan`;
+  child.stdin.write(
+    `${JSON.stringify({...request, id: planRequestId})}\n`,
+  );
+  const planned = await reader.waitFor((message) => message.id === planRequestId);
+  const pending = planned.result?.structuredContent;
+  assert.equal(pending?.ok, true, JSON.stringify(planned));
+  assert.equal(pending.status, "confirmation_required");
+  assert.equal(pending.collectionStarted, false);
+  assert.equal(pending.taskId, undefined);
+  assert.equal(pending.task, undefined);
+  assert.equal(pending.plan.status, "awaiting_confirmation");
+  assert.equal(typeof pending.plan.planId, "string");
+  assert.ok(pending.plan.planId.length > 0);
+
+  // The fixture supplies a new user approval only after receiving the plan.
+  child.stdin.write(
+    `${JSON.stringify({
+      ...request,
+      params: {
+        ...(request.params.task ? {task: request.params.task} : {}),
+        name: "mediaclaw_confirm_collection",
+        arguments: {
+          planId: pending.plan.planId,
+          decision: "approve",
+          ...(request.params.arguments?.async !== undefined
+            ? {async: request.params.arguments.async}
+            : {}),
+        },
+      },
+    })}\n`,
+  );
 }
 
 function waitForText(stream, pattern, timeoutMs = 5000) {
@@ -173,6 +211,9 @@ function expectRejectedWebSocketOrigin(port) {
 }
 
 test("Codex MCP bridge exposes paired async tasks and complete plugin records", async (t) => {
+  const currentVersion = MCP_CONTRACT.serverVersion;
+  const [major, minor, patch] = currentVersion.split("-")[0].split(".").map(Number);
+  const futureVersion = `${major}.${minor}.${patch + 1}`;
   const port = 18000 + Math.floor(Math.random() * 1000);
   const serverPath = path.resolve(
     "plugins/mediaclaw/scripts/mcp-server.mjs",
@@ -186,9 +227,9 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   await writeFile(
     fakeCodexPath,
-    process.platform === "win32"
-      ? "@echo off\r\nif \"%1 %2\"==\"plugin list\" (echo mediaclaw@mediaclaw-agent  installed, enabled  0.3.2  C:\\fake) else (echo upgraded)\r\n"
-      : "#!/bin/sh\nif [ \"$1 $2\" = \"plugin list\" ]; then\n  echo 'mediaclaw@mediaclaw-agent  installed, enabled  0.3.2  /tmp/fake'\nelse\n  echo 'upgraded'\nfi\n",
+    (process.platform === "win32"
+      ? "@echo off\r\nif \"%1 %2\"==\"plugin list\" (echo mediaclaw@mediaclaw-agent  installed, enabled  NEXT_AGENT_VERSION  C:\\fake) else (echo upgraded)\r\n"
+      : "#!/bin/sh\nif [ \"$1 $2\" = \"plugin list\" ]; then\n  echo 'mediaclaw@mediaclaw-agent  installed, enabled  NEXT_AGENT_VERSION  /tmp/fake'\nelse\n  echo 'upgraded'\nfi\n").replaceAll("NEXT_AGENT_VERSION", futureVersion),
     "utf8",
   );
   if (process.platform !== "win32") await chmod(fakeCodexPath, 0o755);
@@ -202,7 +243,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       MEDIACLAW_AGENT_ADAPTER_SWEEP_MS: "100",
       MEDIACLAW_AGENT_BROKER_IDLE_MS: "500",
       MEDIACLAW_AGENT_UPDATE_MANIFEST_URL:
-        "data:application/json,%5B%7B%22tag_name%22%3A%22v0.3.2%22%2C%22draft%22%3Afalse%7D%5D",
+        `data:application/json,${encodeURIComponent(JSON.stringify([{tag_name: `v${futureVersion}`, draft: false}]))}`,
       PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH || ""}`,
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -271,11 +312,11 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.currentVersion,
-    "0.3.1",
+    currentVersion,
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.latestVersion,
-    "0.3.2",
+    futureVersion,
   );
   assert.equal(
     connectionStatus.result.structuredContent.agentUpdate.approvalRequired,
@@ -348,6 +389,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   let resolveHandshake;
   let collectionPlanTaskStarts = 0;
   let assetReadTaskStarts = 0;
+  const outreachOperations = [];
   let transientDetailAttempts = 0;
   let transientScanAttempts = 0;
   let permanentDetailAttempts = 0;
@@ -406,6 +448,35 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     // Real extension work is asynchronous. Yield once so the Broker can finish
     // registering the task before the simulated extension returns its result.
     await new Promise((resolve) => setTimeout(resolve, 10));
+    if (message.task.mode === "outreach") {
+      const operation = message.task.options.operation;
+      outreachOperations.push(structuredClone(message.task.options));
+      const data = operation === "list_candidates"
+        ? {
+            candidates: [{candidateId: "candidate-1", matched: true, userName: "评论用户"}],
+            counts: {all: 1, matched: 1, contactable: 1},
+          }
+        : operation === "prepare"
+          ? {
+              plan: {
+                planId: message.task.options.replacesPlanId ? "plan-revised" : "plan-awaiting-confirmation",
+                status: "awaiting_confirmation",
+                recipientCount: 1,
+                messagePreview: message.task.options.message,
+              },
+              confirmationRequired: true,
+              sendingStarted: false,
+            }
+          : operation === "cancel"
+            ? {cancelRequested: true, settling: false, plan: {planId: message.task.options.planId, status: "cancelled"}}
+          : {recent: [], plan: null};
+      socket.send(JSON.stringify({
+        type: "task.result",
+        taskId: message.taskId,
+        response: {ok: true, data},
+      }));
+      return;
+    }
     if (message.task.mode === "data_pool_assets") {
       assetReadTaskStarts += 1;
       assert.equal(message.task.options.operation, "get");
@@ -1399,17 +1470,15 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   await handshakeCompleted;
   await new Promise((resolve) => setTimeout(resolve, 25));
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_scan_keyword",
-        arguments: {keyword: "露营"},
-      },
-    })}\n`,
-  );
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_scan_keyword",
+      arguments: {keyword: "露营"},
+    },
+  });
   const response = await reader.waitFor((message) => message.id === 2);
   assert.equal(response.result.structuredContent.task.status, "completed");
   assert.deepEqual(
@@ -1464,25 +1533,33 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   const unsupportedTimeFilter = await reader.waitFor(
     (message) => message.id === 205,
   );
+  assert.equal(unsupportedTimeFilter.result.structuredContent.ok, false);
+  assert.equal(
+    unsupportedTimeFilter.result.structuredContent.error.code,
+    "INVALID_COLLECTION_PLAN",
+  );
   assert.match(
-    JSON.stringify(unsupportedTimeFilter),
-    /不支持的筛选参数 timeRange=30d/,
+    unsupportedTimeFilter.result.structuredContent.error.message,
+    /arguments\.timeRange 不在允许范围内/,
   );
+  assert.equal(
+    unsupportedTimeFilter.result.structuredContent.collectionStarted,
+    false,
+  );
+  assert.equal(unsupportedTimeFilter.result.structuredContent.plan, undefined);
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 6,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_capture_comments",
-        arguments: {
-          url: "https://www.xiaohongshu.com/explore/note-1",
-          limit: 20,
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 6,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_capture_comments",
+      arguments: {
+        url: "https://www.xiaohongshu.com/explore/note-1",
+        limit: 20,
       },
-    })}\n`,
-  );
+    },
+  });
   const commentsResponse = await reader.waitFor((message) => message.id === 6);
   assert.equal(commentsResponse.result.structuredContent.result.count, 20);
   assert.equal(
@@ -1498,41 +1575,37 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     /不会进入分析结果/,
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 61,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_capture_comments_full",
-        arguments: {
-          url: "https://www.xiaohongshu.com/explore/note-1",
-          limit: 60,
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 61,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_capture_comments_full",
+      arguments: {
+        url: "https://www.xiaohongshu.com/explore/note-1",
+        limit: 60,
       },
-    })}\n`,
-  );
+    },
+  });
   const fullCommentsResponse = await reader.waitFor(
     (message) => message.id === 61,
   );
   assert.equal(fullCommentsResponse.result.structuredContent.result.count, 60);
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 62,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_deep_collect",
-        arguments: {
-          urls: [
-            "https://www.xiaohongshu.com/explore/deep-1",
-            "https://www.xiaohongshu.com/explore/deep-2",
-          ],
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 62,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_deep_collect",
+      arguments: {
+        urls: [
+          "https://www.xiaohongshu.com/explore/deep-1",
+          "https://www.xiaohongshu.com/explore/deep-2",
+        ],
       },
-    })}\n`,
-  );
+    },
+  });
   const deepCollectResponse = await reader.waitFor(
     (message) => message.id === 62,
   );
@@ -1563,6 +1636,101 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     [...toolNames].sort(),
     contract.tools.map((tool) => tool.name).sort(),
   );
+  for (const tool of toolList.result.tools) {
+    assert.equal(
+      typeof tool.annotations?.title,
+      "string",
+      `${tool.name} must expose a human-readable annotation title`,
+    );
+    assert.ok(
+      tool.annotations.title.trim().length > 0,
+      `${tool.name} annotation title must not be blank`,
+    );
+    for (const hint of [
+      "readOnlyHint",
+      "destructiveHint",
+      "idempotentHint",
+      "openWorldHint",
+    ]) {
+      assert.equal(
+        typeof tool.annotations[hint],
+        "boolean",
+        `${tool.name} must explicitly declare ${hint}`,
+      );
+    }
+  }
+  const annotatedToolNames = (hint) =>
+    toolList.result.tools
+      .filter((tool) => tool.annotations[hint] === true)
+      .map((tool) => tool.name)
+      .sort();
+  assert.deepEqual(annotatedToolNames("readOnlyHint"), [
+    "mediaclaw_connection_status",
+    "mediaclaw_get_asset",
+    "mediaclaw_get_capabilities",
+    "mediaclaw_get_comment_outreach_status",
+    "mediaclaw_get_data_pool_record",
+    "mediaclaw_get_style_profile",
+    "mediaclaw_get_video_transcript",
+    "mediaclaw_list_assets",
+    "mediaclaw_list_comment_outreach_candidates",
+    "mediaclaw_list_paired_devices",
+    "mediaclaw_list_style_profiles",
+    "mediaclaw_query_data_pool",
+    "mediaclaw_query_dataset",
+    "mediaclaw_task_status",
+  ].sort());
+  assert.deepEqual(annotatedToolNames("destructiveHint"), [
+    "mediaclaw_cancel_comment_outreach",
+    "mediaclaw_cancel_task",
+    "mediaclaw_confirm_clear_data",
+    "mediaclaw_confirm_video_transcript",
+    "mediaclaw_extract_image_text",
+    "mediaclaw_manage_agent_update",
+  ].sort());
+  assert.deepEqual(annotatedToolNames("openWorldHint"), [
+    "mediaclaw_capture_account_profile",
+    "mediaclaw_capture_comments",
+    "mediaclaw_capture_comments_full",
+    "mediaclaw_capture_content",
+    "mediaclaw_capture_note",
+    "mediaclaw_capture_profile_basic",
+    "mediaclaw_capture_search_basic",
+    "mediaclaw_connection_status",
+    "mediaclaw_confirm_collection",
+    "mediaclaw_confirm_profile_collection",
+    "mediaclaw_deep_collect",
+    "mediaclaw_enhance_records",
+    "mediaclaw_expand_keywords",
+    "mediaclaw_manage_agent_update",
+    "mediaclaw_research_account_hits",
+    "mediaclaw_research_benchmark_accounts",
+    "mediaclaw_research_keyword_topics",
+    "mediaclaw_research_longtail_keywords",
+    "mediaclaw_research_single_note",
+    "mediaclaw_scan_account",
+    "mediaclaw_scan_keyword",
+  ].sort());
+  assert.ok(toolNames.includes("mediaclaw_prepare_collection"));
+  assert.ok(toolNames.includes("mediaclaw_confirm_collection"));
+  const prepareCollectionTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_prepare_collection",
+  );
+  const confirmCollectionTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_confirm_collection",
+  );
+  assert.equal(prepareCollectionTool.annotations.openWorldHint, false);
+  assert.equal(confirmCollectionTool.annotations.idempotentHint, true);
+  assert.deepEqual(confirmCollectionTool.inputSchema.required, ["decision"]);
+  assert.deepEqual(confirmCollectionTool.inputSchema.oneOf, [
+    {required: ["planId"]}, {required: ["planIds"]},
+  ]);
+  assert.equal(confirmCollectionTool.inputSchema.properties.planIds.items.type, "string");
+  assert.equal(confirmCollectionTool.inputSchema.properties.planIds.uniqueItems, true);
+  assert.deepEqual(confirmCollectionTool.inputSchema.properties.decision.enum, [
+    "approve",
+    "reject",
+  ]);
   assert.ok(toolNames.includes("mediaclaw_expand_keywords"));
   assert.ok(toolNames.includes("mediaclaw_research_keyword_topics"));
   assert.ok(toolNames.includes("mediaclaw_research_longtail_keywords"));
@@ -1590,6 +1758,93 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.ok(toolNames.includes("mediaclaw_research_benchmark_accounts"));
   assert.ok(toolNames.includes("mediaclaw_research_single_note"));
   assert.ok(toolNames.includes("mediaclaw_capture_comments_full"));
+  assert.ok(toolNames.includes("mediaclaw_list_comment_outreach_candidates"));
+  assert.ok(toolNames.includes("mediaclaw_prepare_comment_outreach"));
+  assert.ok(toolNames.includes("mediaclaw_cancel_comment_outreach"));
+  assert.ok(toolNames.includes("mediaclaw_get_comment_outreach_status"));
+  assert.equal(toolNames.includes("mediaclaw_confirm_comment_outreach"), false);
+  const prepareOutreachTool = toolList.result.tools.find(
+    (tool) => tool.name === "mediaclaw_prepare_comment_outreach",
+  );
+  assert.match(prepareOutreachTool.description, /绝不会开始发送/);
+  assert.match(prepareOutreachTool.description, /最终确认/);
+  assert.equal(prepareOutreachTool.inputSchema.properties.candidateIds.maxItems, undefined);
+  assert.equal(prepareOutreachTool.inputSchema.properties.replacesPlanId.type, "string");
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 71,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_list_comment_outreach_candidates",
+        arguments: {filter: "matched"},
+      },
+    })}\n`,
+  );
+  const outreachCandidatesResponse = await reader.waitFor(
+    (message) => message.id === 71,
+  );
+  assert.equal(
+    outreachCandidatesResponse.result.structuredContent.result.candidates[0].candidateId,
+    "candidate-1",
+  );
+
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 72,
+      method: "tools/call",
+      params: {
+        name: "mediaclaw_prepare_comment_outreach",
+        arguments: {
+          candidateIds: ["candidate-1"],
+          message: "你好，这是 Agent 建议的话术",
+          idempotencyKey: "outreach-revision-fixture",
+        },
+      },
+    })}\n`,
+  );
+  const outreachPrepareResponse = await reader.waitFor(
+    (message) => message.id === 72,
+  );
+  assert.equal(
+    outreachPrepareResponse.result.structuredContent.result.plan.status,
+    "awaiting_confirmation",
+  );
+  assert.equal(
+    outreachPrepareResponse.result.structuredContent.result.confirmationRequired,
+    true,
+  );
+  assert.equal(
+    outreachPrepareResponse.result.structuredContent.result.sendingStarted,
+    false,
+  );
+  assert.equal(outreachPrepareResponse.result.structuredContent.result.plan.confirmationToken, undefined);
+  child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: 720, method: "tools/call",
+    params: {name: "mediaclaw_prepare_comment_outreach", arguments: {
+      candidateIds: Array.from({length: 31}, (_, index) => `candidate-${index + 1}`),
+      message: "修改后的固定话术", replacesPlanId: "plan-awaiting-confirmation",
+      idempotencyKey: "outreach-revision-fixture",
+    }},
+  })}\n`);
+  const revisedOutreach = await reader.waitFor((message) => message.id === 720);
+  assert.equal(revisedOutreach.result.structuredContent.result.plan.planId, "plan-revised");
+  assert.equal(revisedOutreach.result.structuredContent.result.plan.status, "awaiting_confirmation");
+  assert.equal(outreachOperations.at(-1).candidateIds.length, 31);
+  assert.equal(outreachOperations.at(-1).replacesPlanId, "plan-awaiting-confirmation");
+  child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: 721, method: "tools/call",
+    params: {name: "mediaclaw_cancel_comment_outreach", arguments: {planId: "plan-revised"}},
+  })}\n`);
+  const cancelledOutreach = await reader.waitFor((message) => message.id === 721);
+  assert.equal(cancelledOutreach.result.structuredContent.result.cancelRequested, true);
+  assert.equal(cancelledOutreach.result.structuredContent.result.plan.status, "cancelled");
+  assert.equal(cancelledOutreach.result.structuredContent.result.sendingStarted, false);
+  assert.equal(outreachOperations.at(-1).operation, "cancel");
+  assert.equal(outreachOperations.at(-1).planId, "plan-revised");
+  assert.equal(outreachOperations.some((operation) => ["confirm", "send"].includes(operation.operation)), false);
   const singleCommentTool = toolList.result.tools.find(
     (tool) => tool.name === "mediaclaw_capture_comments",
   );
@@ -1742,17 +1997,15 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     /apiKey|provider|localModel|transcriptionMode|confirmCharge|"mode"/i,
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 8,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_expand_keywords",
-        arguments: {seedKeyword: "Codex"},
-      },
-    })}\n`,
-  );
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 8,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_expand_keywords",
+      arguments: {seedKeyword: "Codex"},
+    },
+  });
   const expansionResponse = await reader.waitFor((message) => message.id === 8);
   assert.equal(
     expansionResponse.result.structuredContent.result.expandedKeywords.length,
@@ -1763,17 +2016,15 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "Codex 长尾词 249",
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 9,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_longtail_keywords",
-        arguments: {seedKeyword: "Codex"},
-      },
-    })}\n`,
-  );
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 9,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_longtail_keywords",
+      arguments: {seedKeyword: "Codex"},
+    },
+  });
   const longtailResponse = await reader.waitFor((message) => message.id === 9);
   assert.equal(
     longtailResponse.result.structuredContent.result.recommendedMethodId,
@@ -1792,20 +2043,18 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     249,
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 10,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_keyword_topics",
-        arguments: {
-          keyword: "Codex",
-          limit: 80,
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 10,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_keyword_topics",
+      arguments: {
+        keyword: "Codex",
+        limit: 80,
       },
-    })}\n`,
-  );
+    },
+  });
   const topicResponse = await reader.waitFor(
     (message) => message.id === 10,
     10_000,
@@ -1854,23 +2103,21 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(datasetResponse.result.structuredContent.records.length, 5);
   assert.equal(datasetResponse.result.structuredContent.records[0].likes, 12000);
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 12,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_account_hits",
-        arguments: {
-          profileUrl:
-            "https://www.xiaohongshu.com/user/profile/recent-test",
-          scanLimit: 8,
-          recentPostLimit: 5,
-          resultLimit: 3,
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 12,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_account_hits",
+      arguments: {
+        profileUrl:
+          "https://www.xiaohongshu.com/user/profile/recent-test",
+        scanLimit: 8,
+        recentPostLimit: 5,
+        resultLimit: 3,
       },
-    })}\n`,
-  );
+    },
+  });
   const accountHitsResponse = await reader.waitFor(
     (message) => message.id === 12,
   );
@@ -1945,20 +2192,18 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "working",
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 15,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_capture_account_profile",
-        arguments: {
-          profileUrl:
-            "https://www.xiaohongshu.com/user/profile/creator-a",
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 15,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_capture_account_profile",
+      arguments: {
+        profileUrl:
+          "https://www.xiaohongshu.com/user/profile/creator-a",
       },
-    })}\n`,
-  );
+    },
+  });
   const profileResponse = await reader.waitFor((message) => message.id === 15);
   assert.equal(
     profileResponse.result.structuredContent.result.profile.bloggerName,
@@ -2881,17 +3126,15 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "rec-note-demo",
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 18,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_extract_image_text",
-        arguments: {recordId: "rec-note-demo"},
-      },
-    })}\n`,
-  );
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 18,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_extract_image_text",
+      arguments: {recordId: "rec-note-demo"},
+    },
+  });
   const imageTextResponse = await reader.waitFor(
     (message) => message.id === 18,
   );
@@ -2950,20 +3193,18 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "视频逐字稿",
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 191,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_enhance_records",
-        arguments: {
-          recordIds: ["rec-note-demo"],
-          confirmed: true,
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 191,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_enhance_records",
+      arguments: {
+        recordIds: ["rec-note-demo"],
+        confirmed: true,
       },
-    })}\n`,
-  );
+    },
+  });
   const enhancedRecordResponse = await reader.waitFor(
     (message) => message.id === 191,
   );
@@ -2972,21 +3213,19 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(enhancedRecord.normalizedPayload.content, "完整正文");
   assert.equal(enhancedRecord.rawPayload.source, "plugin-detail-owner");
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 20,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_benchmark_accounts",
-        arguments: {
-          keyword: "AI工具",
-          scanLimit: 20,
-          candidateLimit: 2,
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 20,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_benchmark_accounts",
+      arguments: {
+        keyword: "AI工具",
+        scanLimit: 20,
+        candidateLimit: 2,
       },
-    })}\n`,
-  );
+    },
+  });
   const benchmarkResponse = await reader.waitFor(
     (message) => message.id === 20,
   );
@@ -3005,23 +3244,21 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     2,
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 21,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_single_note",
-        arguments: {
-          url: "https://www.xiaohongshu.com/explore/single-research",
-          includeComments: true,
-          includeMediaText: true,
-          analysisTranscriptDecision: "not_needed",
-          analysisTranscriptReason: "图文作品使用 OCR，不需要视频逐字稿",
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 21,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_single_note",
+      arguments: {
+        url: "https://www.xiaohongshu.com/explore/single-research",
+        includeComments: true,
+        includeMediaText: true,
+        analysisTranscriptDecision: "not_needed",
+        analysisTranscriptReason: "图文作品使用 OCR，不需要视频逐字稿",
       },
-    })}\n`,
-  );
+    },
+  });
   const singleNoteResponse = await reader.waitFor(
     (message) => message.id === 21,
   );
@@ -3032,24 +3269,22 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(singleNote.mediaText.text, "图片中的文案");
   assert.equal(singleNote.coverage.recordId, "rec-note-single-research");
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 211,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_single_note",
-        arguments: {
-          url: "https://www.douyin.com/video/single-video-research",
-          platform: "douyin",
-          includeComments: false,
-          includeMediaText: true,
-          analysisTranscriptDecision: "recommend",
-          analysisTranscriptReason: "需要分析视频实际口播结构",
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 211,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_single_note",
+      arguments: {
+        url: "https://www.douyin.com/video/single-video-research",
+        platform: "douyin",
+        includeComments: false,
+        includeMediaText: true,
+        analysisTranscriptDecision: "recommend",
+        analysisTranscriptReason: "需要分析视频实际口播结构",
       },
-    })}\n`,
-  );
+    },
+  });
   const singleVideoResponse = await reader.waitFor(
     (message) => message.id === 211,
   );
@@ -3060,24 +3295,22 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(singleVideo.coverage.transcriptConfirmationRequired, true);
   assert.equal(singleVideo.coverage.transcriptEstimatedCredits, 2);
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 212,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_single_note",
-        arguments: {
-          url: "https://www.douyin.com/video/single-video-existing",
-          platform: "douyin",
-          includeComments: false,
-          includeMediaText: true,
-          analysisTranscriptDecision: "recommend",
-          analysisTranscriptReason: "需要分析视频实际口播结构",
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 212,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_single_note",
+      arguments: {
+        url: "https://www.douyin.com/video/single-video-existing",
+        platform: "douyin",
+        includeComments: false,
+        includeMediaText: true,
+        analysisTranscriptDecision: "recommend",
+        analysisTranscriptReason: "需要分析视频实际口播结构",
       },
-    })}\n`,
-  );
+    },
+  });
   const existingVideoResponse = await reader.waitFor(
     (message) => message.id === 212,
   );
@@ -3087,23 +3320,21 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(existingVideo.mediaText.chargedCredits, 0);
   assert.equal(existingVideo.coverage.transcriptConfirmationRequired, false);
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 213,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_research_single_note",
-        arguments: {
-          url: "https://www.douyin.com/video/single-video-not-needed",
-          platform: "douyin",
-          includeComments: false,
-          analysisTranscriptDecision: "not_needed",
-          analysisTranscriptReason: "当前只比较标题、发布时间和互动指标",
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 213,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_research_single_note",
+      arguments: {
+        url: "https://www.douyin.com/video/single-video-not-needed",
+        platform: "douyin",
+        includeComments: false,
+        analysisTranscriptDecision: "not_needed",
+        analysisTranscriptReason: "当前只比较标题、发布时间和互动指标",
       },
-    })}\n`,
-  );
+    },
+  });
   const noTranscriptVideoResponse = await reader.waitFor(
     (message) => message.id === 213,
   );
@@ -3132,17 +3363,15 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     })}\n`,
   );
   await satelliteReader.waitFor((message) => message.id === 101);
-  satellite.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 102,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_scan_keyword",
-        arguments: {keyword: "露营", limit: 80},
-      },
-    })}\n`,
-  );
+  await sendCollectionAfterFixtureApproval(satellite, satelliteReader, {
+    jsonrpc: "2.0",
+    id: 102,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_scan_keyword",
+      arguments: {keyword: "露营", limit: 80},
+    },
+  });
   const proxiedResponse = await satelliteReader.waitFor(
     (message) => message.id === 102,
   );
@@ -3156,21 +3385,19 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "露营装备清单",
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_scan_account",
-        task: {ttl: 60000},
-        arguments: {
-          profileUrl: "https://www.xiaohongshu.com/user/profile/test",
-          async: true,
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_scan_account",
+      task: {ttl: 60000},
+      arguments: {
+        profileUrl: "https://www.xiaohongshu.com/user/profile/test",
+        async: true,
       },
-    })}\n`,
-  );
+    },
+  });
   const asyncResponse = await reader.waitFor((message) => message.id === 3);
   assert.match(
     asyncResponse.result.structuredContent.task.taskId,
@@ -3181,20 +3408,18 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "working",
   );
 
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 31,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_scan_account",
-        task: {ttl: 60000},
-        arguments: {
-          profileUrl: "https://www.xiaohongshu.com/user/profile/native-task",
-        },
+  await sendCollectionAfterFixtureApproval(child, reader, {
+    jsonrpc: "2.0",
+    id: 31,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_scan_account",
+      task: {ttl: 60000},
+      arguments: {
+        profileUrl: "https://www.xiaohongshu.com/user/profile/native-task",
       },
-    })}\n`,
-  );
+    },
+  });
   const nativeTaskResponse = await reader.waitFor(
     (message) => message.id === 31,
   );
@@ -3272,7 +3497,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(approvedUpdate.result.structuredContent.ok, true);
   assert.equal(
     approvedUpdate.result.structuredContent.agentUpdate.installedVersion,
-    "0.3.2",
+    futureVersion,
   );
   assert.equal(
     approvedUpdate.result.structuredContent.agentUpdate.oldSessionFenced,
@@ -3327,7 +3552,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   );
 });
 
-test("shared Broker isolates Codex and WorkBuddy device identities and task results", async (t) => {
+test("shared Broker isolates Codex, WorkBuddy, and Doubao Work device identities and task results", async (t) => {
   const port = 19000 + Math.floor(Math.random() * 1000);
   const serverPath = path.resolve("plugins/mediaclaw/scripts/mcp-server.mjs");
   const agentStateDir = await mkdtemp(
@@ -3358,13 +3583,24 @@ test("shared Broker isolates Codex and WorkBuddy device identities and task resu
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const doubaoWork = spawn(process.execPath, [serverPath], {
+    env: {
+      ...baseEnv,
+      MEDIACLAW_AGENT_HOST: "doubao-work",
+      MEDIACLAW_AGENT_DEVICE_NAME: "MediaClaw Agent (豆包工作)",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
   t.after(() => codex.kill("SIGTERM"));
   t.after(() => workbuddy.kill("SIGTERM"));
+  t.after(() => doubaoWork.kill("SIGTERM"));
   const codexReader = createLineReader(codex.stdout);
   const workbuddyReader = createLineReader(workbuddy.stdout);
+  const doubaoWorkReader = createLineReader(doubaoWork.stdout);
   await Promise.all([
     waitForText(codex.stderr, /Adapter connected/),
     waitForText(workbuddy.stderr, /Adapter connected/),
+    waitForText(doubaoWork.stderr, /Adapter connected/),
   ]);
 
   const socket = new WebSocket(`ws://127.0.0.1:${port}/extension`);
@@ -3446,21 +3682,26 @@ test("shared Broker isolates Codex and WorkBuddy device identities and task resu
 
   const handshakeDeadline = Date.now() + 5_000;
   while (
-    (authenticatedDeviceIds.size < 2 || devicesByHost.size < 2) &&
+    (authenticatedDeviceIds.size < 3 || devicesByHost.size < 3) &&
     Date.now() < handshakeDeadline
   ) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  assert.equal(devicesByHost.size, 2);
-  assert.equal(authenticatedDeviceIds.size, 2);
-  assert.notEqual(
-    devicesByHost.get("codex").deviceId,
-    devicesByHost.get("workbuddy").deviceId,
+  assert.equal(devicesByHost.size, 3);
+  assert.equal(authenticatedDeviceIds.size, 3);
+  assert.equal(
+    new Set(
+      ["codex", "workbuddy", "doubao-work"].map(
+        (host) => devicesByHost.get(host).deviceId,
+      ),
+    ).size,
+    3,
   );
 
   for (const [child, id] of [
     [codex, 1],
     [workbuddy, 2],
+    [doubaoWork, 3],
   ]) {
     child.stdin.write(
       `${JSON.stringify({
@@ -3474,33 +3715,40 @@ test("shared Broker isolates Codex and WorkBuddy device identities and task resu
   await Promise.all([
     codexReader.waitFor((message) => message.id === 1),
     workbuddyReader.waitFor((message) => message.id === 2),
+    doubaoWorkReader.waitFor((message) => message.id === 3),
   ]);
 
-  codex.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 11,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_capture_search_basic",
-        arguments: {keyword: "codex", limit: 1},
-      },
-    })}\n`,
-  );
-  workbuddy.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 12,
-      method: "tools/call",
-      params: {
-        name: "mediaclaw_capture_search_basic",
-        arguments: {keyword: "workbuddy", limit: 1},
-      },
-    })}\n`,
-  );
-  const [codexResult, workbuddyResult] = await Promise.all([
+  await sendCollectionAfterFixtureApproval(codex, codexReader, {
+    jsonrpc: "2.0",
+    id: 11,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_capture_search_basic",
+      arguments: {keyword: "codex", limit: 1},
+    },
+  });
+  await sendCollectionAfterFixtureApproval(workbuddy, workbuddyReader, {
+    jsonrpc: "2.0",
+    id: 12,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_capture_search_basic",
+      arguments: {keyword: "workbuddy", limit: 1},
+    },
+  });
+  await sendCollectionAfterFixtureApproval(doubaoWork, doubaoWorkReader, {
+    jsonrpc: "2.0",
+    id: 13,
+    method: "tools/call",
+    params: {
+      name: "mediaclaw_capture_search_basic",
+      arguments: {keyword: "doubao-work", limit: 1},
+    },
+  });
+  const [codexResult, workbuddyResult, doubaoWorkResult] = await Promise.all([
     codexReader.waitFor((message) => message.id === 11),
     workbuddyReader.waitFor((message) => message.id === 12),
+    doubaoWorkReader.waitFor((message) => message.id === 13),
   ]);
   assert.equal(
     codexResult.result.structuredContent.result.records[0].title,
@@ -3510,12 +3758,16 @@ test("shared Broker isolates Codex and WorkBuddy device identities and task resu
     workbuddyResult.result.structuredContent.result.records[0].title,
     "workbuddy isolated result",
   );
+  assert.equal(
+    doubaoWorkResult.result.structuredContent.result.records[0].title,
+    "doubao-work isolated result",
+  );
 
   const workbuddyTaskId = workbuddyResult.result.structuredContent.task.taskId;
   codex.stdin.write(
     `${JSON.stringify({
       jsonrpc: "2.0",
-      id: 13,
+      id: 21,
       method: "tools/call",
       params: {
         name: "mediaclaw_task_status",
@@ -3523,7 +3775,7 @@ test("shared Broker isolates Codex and WorkBuddy device identities and task resu
       },
     })}\n`,
   );
-  const crossHostRead = await codexReader.waitFor((message) => message.id === 13);
+  const crossHostRead = await codexReader.waitFor((message) => message.id === 21);
   assert.equal(
     crossHostRead.result.structuredContent.error.code,
     "TASK_NOT_FOUND",

@@ -73,6 +73,20 @@ test("WorkBuddy refreshes the marketplace and installed plugin", async () => {
   assert.equal(result.execution.userRunsCommands, false);
 });
 
+test("Doubao Work reports a non-blocking local reinstall instead of borrowing another host updater", async () => {
+  const result = await createAgentUpdateChecker({
+    currentVersion: "0.3.0",
+    hostKey: "doubao-work",
+    fetchImpl: manifestFetch("0.3.1"),
+  }).check();
+  assert.equal(result.status, "manual_update_available");
+  assert.equal(result.blocking, false);
+  assert.equal(result.approvalRequired, false);
+  assert.equal(result.userGuidance.hostDisplayName, "豆包工作");
+  assert.match(result.message, /本地接入包/);
+  assert.equal(result.execution, undefined);
+});
+
 test("up-to-date and failed checks never block current use", async () => {
   const current = await createAgentUpdateChecker({
     currentVersion: "0.3.1",
