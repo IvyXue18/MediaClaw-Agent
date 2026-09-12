@@ -255,8 +255,8 @@ const idempotentTaskIds = new Map();
 const resultTransfers = new Map();
 const pendingTaskCancellations = new Map();
 const profileCollectionPlans = new Map();
-// A plan is a proposal, never permission. Only the explicit confirmation tool
-// can consume it and establish the internal execution context used by children.
+// A plan is a proposal, never permission. Only a user decision from the host
+// or paired extension can consume it and establish the child execution context.
 const collectionPlans = new Map();
 const COLLECTION_PLAN_TTL_MS = Math.max(100, Number(
   process.env.MEDIACLAW_COLLECTION_PLAN_TTL_MS || 15 * 60_000,
@@ -846,7 +846,7 @@ function publicProfileCollectionPlan(plan = {}) {
       nextTool: "mediaclaw_confirm_profile_collection",
       confirmationArgument: {planId: plan.planId},
       rejectionArgument: {planId: plan.planId, decision: "reject"},
-      instruction: "用自然语言说明范围；仅在当前对话尚未授权该范围时等待用户同意。‘可以／好／开始吧’均可表达同意，不要求确认口令。同一任务已同意的范围、批次及已声明重试不重复询问；范围变化通过 replacesPlanId 重新制定方案，并只确认尚未授权的变化。",
+      instruction: "简要说明方案，调用确认工具申请用户确认。approve 只打开对话确认框；宿主不支持时在插件顶部确认。只有用户亲自批准后才采集，Agent 不得代点确认框或插件按钮。一次批准覆盖本方案全部批次与已声明重试，范围变化需重新制定方案。",
       prompt: plan.confirmationPrompt,
     },
   };
@@ -1636,6 +1636,7 @@ function replaceCollectionPlan(replacesPlanId, adapter) {
   if (!replacesPlanId) return;
   const previous = resolveCollectionPlan(replacesPlanId, adapter);
   previous.supersededAt = nowIso();
+  invalidateCollectionApprovals(previous.planId);
 }
 
 function createCollectionPlan({userGoal, toolName, arguments: input = {}, replacesPlanId}, adapter) {
@@ -1683,7 +1684,7 @@ function createCollectionPlan({userGoal, toolName, arguments: input = {}, replac
       confirmationArgument: {planId: plan.planId, decision: "approve"},
       rejectionArgument: {planId: plan.planId, decision: "reject"},
       prompt: plan.confirmationPrompt,
-      instruction: "简要说明范围；仅在当前对话尚未授权该范围时等待用户同意，不要求固定确认口令。已明确同意的范围可直接确认；多组方案一起展示后用 planIds 一次确认，不逐组重问。confirmation_required 只表示技术方案尚待消费，不代表用户尚未授权。范围变化通过 replacesPlanId 重新制定，并只确认尚未授权的变化。",
+      instruction: "简要说明范围，多组用 planIds 一次申请用户确认。approve 只打开对话确认框；宿主不支持时由用户在插件顶部批准。不得把默认值或泛泛研究目标当成同意，也不得代点批准按钮。未收到真实用户确认时保持 user_approval_required、collectionStarted=false；已批准方案内的分组与重试连续执行，范围变化重新制定方案。",
     },
   };
 }
@@ -1693,7 +1694,10 @@ function captureNeedsCollectionConsent(captureTask) {
 }
 
 async function startConfirmedCollectionPlan(plan) {
-  const collectionConsent = {planId: plan.planId, ownerDeviceId: plan.ownerDeviceId, confirmedAt: plan.usedAt};
+  const collectionConsent = plan.userApproval;
+  if (!hasUserCollectionApproval(collectionConsent, plan.ownerDeviceId)) {
+    throw collectionPlanError("COLLECTION_USER_APPROVAL_REQUIRED", "采集尚未获得用户确认");
+  }
   return requestContext.run({...requestContext.getStore(), collectionConsent}, async () => {
     if (!plan.toolName) return startProfileCollectionWorkflow(plan);
     const executionArgs = structuredClone(plan.arguments);
@@ -1753,6 +1757,142 @@ function startCollectionPlanBatch(plans) {
     }
   })();
   return parent;
+}
+
+// Public MCP parameters only request a user decision. The decision itself arrives
+// from the Adapter's elicitation response lane or the paired extension UI.
+const collectionApprovalRequests = new Map();
+
+function hasUserCollectionApproval(receipt, deviceId) {
+  return receipt?.version === 2 && receipt.ownerDeviceId === deviceId &&
+    ["mcp-elicitation-v1", "extension-ui-v1"].includes(receipt.source) &&
+    Boolean(receipt.planId && receipt.requestId && receipt.scopeDigest && receipt.confirmedAt);
+}
+
+function collectionApprovalDigest(plans) {
+  return crypto.createHash("sha256").update(JSON.stringify(plans.map((plan) => [
+    plan.planId, plan.ownerDeviceId, plan.ownerInstanceId,
+    plan.toolName, plan.arguments, plan.intent, plan.execution, plan.requestedFields,
+  ]))).digest("hex");
+}
+
+function closeCollectionApproval(request, status) {
+  request.status = status;
+  clearTimeout(request.timer);
+  extensionPeer?.send({type: "collection.approval.closed", requestId: request.requestId,
+    deviceId: request.deviceId, sessionId: deviceSessions.get(request.deviceId)?.sessionId || "", status});
+  if (status !== "approved") {
+    finishTask(request.task, {status: status === "expired" ? "input_required" : "cancelled",
+      result: {ok: false, collectionStarted: false, approvalStatus: status},
+      message: status === "expired" ? "确认已过期，采集未启动；请重新制定方案" : "确认已关闭，采集未启动"});
+  }
+}
+
+function invalidateCollectionApprovals(planId) {
+  for (const request of collectionApprovalRequests.values()) {
+    if (request.status === "pending" && request.planIds.includes(planId)) closeCollectionApproval(request, "cancelled");
+  }
+}
+
+function sendCollectionApprovalToExtension(request) {
+  const session = deviceSessions.get(request.deviceId);
+  if (!extensionPeer || !session?.collectionApprovalSupported || request.transport !== "extension-ui-v1") return;
+  extensionPeer.send({type: "collection.approval.request", requestId: request.requestId,
+    deviceId: request.deviceId, sessionId: session.sessionId, sourceHost: request.adapter.hostKey,
+    message: request.message, expiresAt: request.expiresAt});
+}
+
+function requestUserCollectionApproval(plans, adapter, params) {
+  const instanceId = requestContext.getStore()?.instanceId || "";
+  const instance = adapter.instances.get(instanceId);
+  const transport = instance?.collectionApprovalTransport === "mcp-elicitation-v1"
+    ? "mcp-elicitation-v1" : "extension-ui-v1";
+  const scopeDigest = collectionApprovalDigest(plans);
+  let request = [...collectionApprovalRequests.values()].find((entry) => entry.status === "pending" &&
+    entry.instanceId === instanceId && entry.deviceId === adapter.identity.deviceId && entry.transport === transport && entry.scopeDigest === scopeDigest);
+  if (!request) {
+    // Overlapping approval dialogs must not remain actionable after regrouping.
+    for (const plan of plans) invalidateCollectionApprovals(plan.planId);
+    const expiresAtMs = Math.min(...plans.map((plan) => plan.expiresAtMs));
+    const message = plans.map((plan, index) => `${plans.length > 1 ? `第 ${index + 1}/${plans.length} 组：` : ""}${plan.confirmationPrompt}`).join("\n\n");
+    const task = createTask({kind: "confirmation", input: {planIds: plans.map((plan) => plan.planId)}});
+    updateTask(task, {status: "input_required", message: transport === "mcp-elicitation-v1"
+      ? "等待你在对话确认框中批准采集，尚未打开采集页面"
+      : "等待你在插件顶部确认采集，尚未打开采集页面"});
+    request = {requestId: createId("user_approval"), adapter, instanceId, deviceId: adapter.identity.deviceId,
+      planIds: plans.map((plan) => plan.planId), scopeDigest, message, transport, task, params,
+      expiresAt: new Date(expiresAtMs).toISOString(), expiresAtMs, status: "pending"};
+    collectionApprovalRequests.set(request.requestId, request);
+    request.timer = setTimeout(() => {
+      if (request.status === "pending") closeCollectionApproval(request, "expired");
+    }, Math.max(1, expiresAtMs - Date.now()));
+    request.timer.unref?.();
+    // Bound completed request retention without discarding pending decisions.
+    for (const [id, entry] of collectionApprovalRequests) {
+      if (entry.status !== "pending" && entry.expiresAtMs < Date.now()) collectionApprovalRequests.delete(id);
+    }
+  }
+  sendCollectionApprovalToExtension(request);
+  return toolResult({ok: true, status: "user_approval_required", collectionStarted: false,
+    taskId: request.task.taskId, task: taskSnapshot(request.task),
+    approvalRequest: {requestId: request.requestId, message: request.message, expiresAt: request.expiresAt,
+      transport, extensionSupported: adapterSession(adapter)?.collectionApprovalSupported === true},
+    message: request.task.message + (transport === "extension-ui-v1" && !adapterSession(adapter)?.collectionApprovalSupported
+      ? "；当前插件不支持此确认入口，需要安装支持用户确认的插件版本后继续" : ""),
+    nextTool: "mediaclaw_task_status"});
+}
+
+async function resolveUserCollectionApproval(requestId, decision, {adapter, instanceId, source, deviceId, sessionId} = {}) {
+  const request = collectionApprovalRequests.get(String(requestId || ""));
+  if (!request || request.deviceId !== adapter?.identity.deviceId || !adapter.instances.has(request.instanceId) || request.transport !== source ||
+      (source === "mcp-elicitation-v1" && (request.instanceId !== instanceId || adapter.instances.get(instanceId)?.collectionApprovalTransport !== source)) ||
+      (source === "extension-ui-v1" && (deviceId !== request.deviceId || deviceSessions.get(deviceId)?.sessionId !== sessionId))) {
+    throw collectionPlanError("COLLECTION_APPROVAL_OWNER_MISMATCH", "用户确认不属于当前方案或确认入口");
+  }
+  if (!["approve", "reject", "cancel"].includes(decision)) throw collectionPlanError("INVALID_COLLECTION_APPROVAL", "用户确认决定无效");
+  if (request.status !== "pending") throw collectionPlanError("COLLECTION_APPROVAL_ALREADY_CLOSED", "本次用户确认已关闭，不能重复执行");
+  if (request.expiresAtMs <= Date.now()) {
+    closeCollectionApproval(request, "expired");
+    throw collectionPlanError("COLLECTION_APPROVAL_EXPIRED", "本次用户确认已过期，采集未启动");
+  }
+  return requestContext.run({adapter, instanceId: request.instanceId}, async () => {
+    if (decision !== "approve") {
+      if (decision === "reject") {
+        for (const id of request.planIds) {
+          const plan = collectionPlans.get(id) || profileCollectionPlans.get(id);
+          if (plan && !plan.usedAt) plan.rejectedAt = nowIso();
+        }
+      }
+      closeCollectionApproval(request, decision === "reject" ? "rejected" : "cancelled");
+      return toolResult({ok: true, status: decision === "reject" ? "rejected" : "cancelled", collectionStarted: false});
+    }
+    let plans;
+    try {
+      plans = request.planIds.map((id) => resolveCollectionPlan(id, adapter));
+      if (collectionApprovalDigest(plans) !== request.scopeDigest) throw collectionPlanError("COLLECTION_APPROVAL_SCOPE_CHANGED", "方案范围已变化，需要重新确认");
+      if (!extensionPeer || !adapterSession(adapter)) throw collectionPlanError("EXTENSION_NOT_CONNECTED", "插件已断开，采集未启动");
+    } catch (error) { closeCollectionApproval(request, "cancelled"); throw error; }
+    const confirmedAt = nowIso();
+    for (const plan of plans) {
+      plan.usedAt = confirmedAt;
+      plan.userApproval = {version: 2, source, requestId: request.requestId, scopeDigest: request.scopeDigest,
+        planId: plan.planId, ownerDeviceId: plan.ownerDeviceId, confirmedAt};
+    }
+    closeCollectionApproval(request, "approved");
+    const task = plans.length === 1 ? await startConfirmedCollectionPlan(plans[0]) : startCollectionPlanBatch(plans);
+    addChildTask(request.task, task);
+    updateTask(request.task, {status: "running", message: "用户已确认，正在执行采集"});
+    void task.completion.then(() => finishTask(request.task, {status: task.status, result: task.result,
+      error: task.error, message: task.message}));
+    if (request.params.arguments?.async) return toolResult({ok: true,
+      ...(request.params.arguments.planIds ? {planIds: request.planIds} : {planId: request.planIds[0]}),
+      taskId: task.taskId, task: taskSnapshot(task)});
+    if (request.params.task) return {task: taskSnapshot(task)};
+    try { await waitForTask(task); } catch (error) {
+      return toolResult({ok: true, ...getTaskPublicResult(task), message: error.message, nextTool: "mediaclaw_task_status"});
+    }
+    return toolResult(getTaskPublicResult(task), {isError: task.status === "failed"});
+  });
 }
 
 function taskSnapshot(task) {
@@ -1950,7 +2090,9 @@ async function restoreTaskState() {
         : wasInFlight
           ? "waiting_for_extension"
           : snapshot.status,
-      message: invalidRestoredTask
+      message: snapshot.kind === "confirmation" && snapshot.status === "input_required"
+        ? "确认会话已结束，采集未启动；请回到原对话重新申请确认"
+        : invalidRestoredTask
         ? unrestorableWorkflow
           ? "多阶段任务因 Agent Broker 重启已自动终止；已完成采集结果仍保留"
           : orphanedWorkflowChild
@@ -1999,6 +2141,19 @@ async function restoreTaskState() {
     ) {
       resolveCompletion(task);
     }
+  }
+  // The confirmation task is a status pointer, not an executable workflow.
+  // Resume its observation of an already-approved child without reissuing work.
+  for (const task of tasks.values()) {
+    if (task.kind !== "confirmation" || !["queued", "running", "waiting_for_extension"].includes(task.status)) continue;
+    const child = tasks.get(task.currentChildTaskId);
+    if (!child) {
+      finishTask(task, {status: "input_required", error: {code: "COLLECTION_CONFIRMATION_REQUIRED",
+        message: "原执行任务不可用，不能重新采集；请核对已保存结果"}});
+      continue;
+    }
+    void child.completion.then(() => finishTask(task, {status: child.status, result: child.result,
+      error: child.error, message: child.message}));
   }
   if (pruneExpiredTaskHistory(restoredAtMs).length) restoredStateChanged = true;
   if (restoredStateChanged) {
@@ -2854,7 +3009,7 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
               requiredTools.length > 0 && missingAgentTools.length === 0,
           };
         }),
-        instruction: "只按当前实际可用能力制定方案；可用不代表用户已授权。先读已有数据，简要说明必要范围并核对当前任务已有授权；已同意就继续，未授权才询问。插件内最终发送确认、清理预览及逐字稿报价各自保留。",
+        instruction: "只按当前实际可用能力制定方案；可用不代表用户已授权。先读已有数据，新增采集简要说明必要范围并申请对话确认框或插件用户确认；只有真实批准后才执行，已批准方案内的步骤连续进行，Agent 不得代点。插件内最终发送确认、清理预览及逐字稿报价各自保留。",
         error: response?.error || rawCaptureResult?.error || null,
       };
     }
@@ -2968,10 +3123,10 @@ function pumpQueue() {
   }
   if (!next) return;
   if (captureNeedsCollectionConsent(next.captureTask) &&
-      (!next.collectionConsent?.planId || next.collectionConsent.ownerDeviceId !== next.owner?.deviceId)) {
+      (!hasUserCollectionApproval(next.collectionConsent, next.owner?.deviceId))) {
     finishTask(next, {
       status: "input_required",
-      error: {code: "COLLECTION_CONFIRMATION_REQUIRED", message: "该采集缺少已确认方案；请核对当前任务授权并使用方案确认工具，尚未授权才询问用户"},
+      error: {code: "COLLECTION_CONFIRMATION_REQUIRED", message: "该采集缺少用户确认凭据；请通过对话确认框或插件按钮确认，Agent 自报批准不能执行"},
       message: "采集未启动，等待用户确认具体方案",
     });
     pumpQueue();
@@ -3355,6 +3510,7 @@ function handleExtensionMessage(message = {}, peer = null) {
     extensionInfo = {
       extensionId: nextExtensionId,
       extensionVersion: normalizeText(message.extensionVersion, 80),
+      collectionApprovalSupported: message.collectionApprovalSupported === true,
       protocolVersion: normalizeText(message.protocolVersion, 40),
       pendingResultCount:
         Math.max(0, Math.floor(Number(message.pendingResultCount) || 0)),
@@ -3368,6 +3524,9 @@ function handleExtensionMessage(message = {}, peer = null) {
       sessionId,
       hostKey: adapter.hostKey,
     });
+    for (const request of collectionApprovalRequests.values()) {
+      if (request.deviceId === deviceId && request.status === "pending") sendCollectionApprovalToExtension(request);
+    }
     pumpQueue();
     return;
   }
@@ -3377,6 +3536,16 @@ function handleExtensionMessage(message = {}, peer = null) {
   }
 
   if (!extensionPeer || peer !== extensionPeer) return;
+
+  if (message.type === "collection.approval.response") {
+    const deviceId = normalizeText(message.deviceId, 160);
+    void resolveUserCollectionApproval(message.requestId, message.decision, {
+      adapter: getAdapterByDeviceId(deviceId), source: "extension-ui-v1", deviceId,
+      sessionId: normalizeText(message.sessionId, 200),
+    }).catch((error) => peer.send({type: "collection.approval.closed", requestId: message.requestId,
+      deviceId, sessionId: message.sessionId, status: "invalid", error: {code: error.code, message: error.message}}));
+    return;
+  }
 
   if (message.type === "task.result.start") {
     handleResultTransferStart(message);
@@ -6158,6 +6327,14 @@ async function cancelTask(taskId) {
   if (!task) {
     return {ok: false, error: {code: "TASK_NOT_FOUND", message: "任务不存在"}};
   }
+  if (task.kind === "confirmation") {
+    const request = [...collectionApprovalRequests.values()].find((entry) => entry.task === task);
+    if (request?.status === "pending") {
+      closeCollectionApproval(request, "cancelled");
+      return {ok: true, canceled: true, task: taskSnapshot(task)};
+    }
+    if (task.currentChildTaskId) return cancelTask(task.currentChildTaskId);
+  }
   if (
     ["succeeded", "failed", "cancelled", "input_required"].includes(
       task.status,
@@ -6340,7 +6517,7 @@ function toolAnnotations(
 const tools = [
   {
     name: "mediaclaw_get_capabilities",
-    description: "读取当前已连接插件的能力清单，并与本 Agent 实际工具核对。每次新任务在检查连接后先调用，区分可直接指挥、由Agent编排、需插件最终确认和插件独有能力。返回插件实际版本、能力注册表版本、Agent版本及缺少的入口；只读，不打开作品页面、不采集或清理。旧插件不支持时明确报告，不能猜测支持。随后复用已有资产，核对当前任务授权，仅对未授权范围询问。",
+    description: "读取当前已连接插件的能力清单，并与本 Agent 实际工具核对。每次新任务在检查连接后先调用，区分可直接指挥、由Agent编排、需插件最终确认和插件独有能力。返回插件实际版本、能力注册表版本、Agent版本及缺少的入口；只读，不打开作品页面、不采集或清理。旧插件不支持时明确报告，不能猜测支持。随后复用已有资产；新增采集通过固定方案申请对话确认框或插件用户确认。",
     annotations: toolAnnotations("核查插件与 Agent 能力", {readOnlyHint: true, idempotentHint: true}),
     execution: captureExecution,
     inputSchema: {
@@ -6351,7 +6528,7 @@ const tools = [
   },
   {
     name: "mediaclaw_prepare_collection",
-    description: "制定固定范围的采集方案，不打开浏览器、不采集数据。根据用户目标选择 toolName 和 arguments；多关键词等已知动作先分别准备，一起简要展示来源、总量、筛选和数据深度，再用 planIds 一次确认。当前对话已明确授权相同范围时直接衔接确认工具，不要求新的回复或固定口令。只有尚未授权的建议范围才需询问；默认参数本身不构成授权。更改待执行方案使用 replacesPlanId。",
+    description: "制定固定范围的采集方案，不打开浏览器、不采集数据。根据用户目标选择 toolName 和 arguments；多关键词等已知动作先分别准备，一起简要展示来源、总量、筛选和数据深度，再用 planIds 一次确认。调用确认工具申请一次用户确认，不另要求聊天口令。默认参数只是建议；实际采集须由用户在对话确认框或插件入口批准。更改待执行方案使用 replacesPlanId。",
     annotations: toolAnnotations("制定采集方案"),
     inputSchema: {
       type: "object",
@@ -6367,7 +6544,7 @@ const tools = [
   },
   {
     name: "mediaclaw_confirm_collection",
-    description: "将用户在当前对话中对具体范围的明确同意落实为执行；‘可以／好／开始吧’均可，不要求口令。使用 planId 确认单个方案，或 planIds 一次确认全部已展示且获同意的组，按顺序执行，不逐组重问。用户已明确要求执行同样范围时无需再等一条回复。approve 仅执行保存的方案一次，reject 不执行。默认值、沉默或泛泛研究目标不能代替范围授权；用户只同意部分时仅传该部分。参数不能夹带范围变化。付费逐字稿、私信发送和清理保留各自确认。",
+    description: "申请用户确认固定方案。planId 确认单组，planIds 一次确认多组，二选一。decision=approve 只申请对话中的用户确认框，不代表用户已经批准；宿主不支持时等待用户在插件顶部点击。只有真实用户事件才会启动采集，Agent 不得代点界面、构造用户同意或走内部接口绕过。一次批准覆盖本方案全部分组和已声明重试；返回 user_approval_required 时采集未启动，沿 taskId 查状态。reject 关闭方案且不执行。范围变化重新制定。逐字稿、私信和清理保留各自确认。",
     annotations: toolAnnotations("确认或拒绝采集方案", {openWorldHint: true, idempotentHint: true}),
     inputSchema: {
       type: "object",
@@ -6729,8 +6906,7 @@ const tools = [
   },
   {
     name: "mediaclaw_confirm_profile_collection",
-    description:
-      "只在用户已经看到 mediaclaw_prepare_profile_collection 返回的完整方案和范围并明确同意后调用。仅接受未过期、当前设备拥有且未使用的一次性 planId；执行时不能修改目标、字段或数量。一次确认覆盖已展示的分批和页面加载／解析类故障重试。完整归档返回 archiveJobId、最多 20 条预览和本地数据池分页读取方案；单条失败不阻断其余记录。登录、验证码或平台冷却不自动重试，也不包装成‘插件做不了’，而是返回 input_required、已完成覆盖和恢复动作。所有模式都返回逐阶段进度、实际覆盖、执行日志、失败项和后续确认事项，避免黑盒采集。",
+    description: "申请用户确认账号采集方案，不接受 Agent 自报同意作为执行授权。使用原样 planId，approve 只申请对话确认框；宿主不支持时等待用户在插件顶部批准。一次批准覆盖方案中全部批次与可恢复重试。user_approval_required 表示尚未启动，不得代点批准入口。reject 关闭方案。",
     annotations: toolAnnotations("执行账号采集方案", {
       idempotentHint: true,
       openWorldHint: true,
@@ -7523,7 +7699,7 @@ const tools = [
 
 for (const tool of tools) {
   if (!COLLECTION_TOOL_NAMES.has(tool.name)) continue;
-  tool.description = "此入口只准备固定范围的方案，不启动采集；async、task 或 confirmed=true 不构成授权。返回 confirmation_required 后核对当前对话：具体范围已获用户同意则直接调用 mediaclaw_confirm_collection，多组用 planIds 一次确认；尚未获同意时才简要展示并询问，不要求固定口令或逐组重复确认。原操作说明：" + tool.description;
+  tool.description = "此入口只准备固定范围的方案，不启动采集；async、task 或 confirmed=true 不构成授权。返回 confirmation_required 后简要展示方案并调用 mediaclaw_confirm_collection 申请真实用户确认，多组用 planIds 一次申请；只有用户在对话确认框或插件按钮批准后执行，不要求聊天口令或逐组重复确认。原操作说明：" + tool.description;
 }
 
 async function executeCaptureTool(name, args) {
@@ -7873,21 +8049,11 @@ async function handleToolCall(params = {}) {
       // Validate all IDs and ownership before consuming any of them.
       const plans = planIds.map((planId) => resolveCollectionPlan(planId, adapter));
       if (confirmation.decision === "reject") {
-        for (const plan of plans) plan.rejectedAt = nowIso();
+        for (const plan of plans) { plan.rejectedAt = nowIso(); invalidateCollectionApprovals(plan.planId); }
         return toolResult({ok: true, status: "rejected", ...(confirmation.planIds ? {planIds} : {planId: confirmation.planId}), collectionStarted: false});
       }
       if (!extensionPeer || !adapterSession(adapter)) throw collectionPlanError("EXTENSION_NOT_CONNECTED", "插件连接或设备配对未就绪，方案尚未执行");
-      const confirmedAt = nowIso();
-      for (const plan of plans) plan.usedAt = confirmedAt;
-      const task = plans.length === 1 ? await startConfirmedCollectionPlan(plans[0]) : startCollectionPlanBatch(plans);
-      if (confirmation.async) return toolResult({ok: true, ...(confirmation.planIds ? {planIds} : {planId: confirmation.planId}), taskId: task.taskId, task: taskSnapshot(task)});
-      if (params.task) return {task: taskSnapshot(task)};
-      try {
-        await waitForTask(task);
-      } catch (error) {
-        return toolResult({ok: true, ...getTaskPublicResult(task), message: error.message, nextTool: "mediaclaw_task_status"});
-      }
-      return toolResult(getTaskPublicResult(task), {isError: task.status === "failed"});
+      return requestUserCollectionApproval(plans, adapter, params);
     } catch (error) {
       return toolResult({ok: false, error: {code: error.code || "INVALID_COLLECTION_CONFIRMATION", message: error.message}}, {isError: true});
     }
@@ -7958,6 +8124,7 @@ async function handleToolCall(params = {}) {
     }
     if (args.decision === "reject") {
       resolved.plan.rejectedAt = nowIso();
+      invalidateCollectionApprovals(resolved.plan.planId);
       return toolResult({ok: true, status: "rejected", planId: resolved.plan.planId, collectionStarted: false});
     }
     if (!extensionPeer || !adapterSession(adapter)) {
@@ -7974,25 +8141,7 @@ async function handleToolCall(params = {}) {
         {isError: true},
       );
     }
-    const collectionConsent = {planId: resolved.plan.planId, ownerDeviceId: resolved.plan.ownerDeviceId, confirmedAt: nowIso()};
-    const task = requestContext.run({...requestContext.getStore(), collectionConsent}, () => startProfileCollectionWorkflow(resolved.plan));
-    if (args?.async === true) {
-      return toolResult({
-        ok: true,
-        planId: resolved.plan.planId,
-        taskId: task.taskId,
-        archiveJobId:
-          resolved.plan.archive?.enabled === true ? task.taskId : null,
-        task: taskSnapshot(task),
-      });
-    }
-    if (params?.task) {
-      return {task: taskSnapshot(task)};
-    }
-    await waitForTask(task);
-    return toolResult(getTaskPublicResult(task), {
-      isError: task.status === "failed",
-    });
+    return requestUserCollectionApproval([resolved.plan], adapter, params);
   }
   if (name === "mediaclaw_task_status") {
     const task = tasks.get(String(args.taskId || ""));
@@ -8136,6 +8285,7 @@ async function registerAdapter(payload = {}) {
     instanceId,
     token,
     registeredAt: Date.now(),
+    collectionApprovalTransport: payload.collectionApprovalTransport === "mcp-elicitation-v1" ? "mcp-elicitation-v1" : "extension-ui-v1",
     lastSeenAt: Date.now(),
   });
   adapterTokens.set(token, {hostKey, instanceId});
@@ -8145,6 +8295,7 @@ async function registerAdapter(payload = {}) {
     token,
     instanceId,
     brokerVersion: SERVER_VERSION,
+    collectionApprovalVersion: 2,
     protocolVersion: PROTOCOL_VERSION,
     device: publicDevice(adapter),
   };
@@ -8170,6 +8321,9 @@ function unregisterAdapter(payload = {}) {
   const tokenState = adapterTokens.get(token);
   if (!tokenState) return {ok: true, unregistered: false};
   const adapter = adapters.get(tokenState.hostKey);
+  for (const request of collectionApprovalRequests.values()) {
+    if (request.status === "pending" && request.instanceId === tokenState.instanceId && request.adapter === adapter) closeCollectionApproval(request, "cancelled");
+  }
   adapter?.instances.delete(tokenState.instanceId);
   adapterTokens.delete(token);
   return {ok: true, unregistered: true};
@@ -8245,6 +8399,28 @@ async function handleBridgeHttpRequest(request, response) {
     sendJson(response, 200, {ok: true, brokerVersion: SERVER_VERSION});
     return true;
   }
+  if (request.url === "/v1/collection-approvals/capability") {
+    const instanceId = adapterTokens.get(payload.token)?.instanceId;
+    adapter.instances.get(instanceId).collectionApprovalTransport = payload.transport === "mcp-elicitation-v1"
+      ? "mcp-elicitation-v1" : "extension-ui-v1";
+    sendJson(response, 200, {ok: true});
+    return true;
+  }
+  if (request.url === "/v1/collection-approvals/respond") {
+    let result;
+    try {
+      result = await resolveUserCollectionApproval(payload.requestId, payload.decision, {
+        adapter, instanceId: adapterTokens.get(payload.token)?.instanceId, source: "mcp-elicitation-v1",
+      });
+    } catch (error) {
+      result = toolResult({ok: false, collectionStarted: false, error: {
+        code: error.code || "INVALID_COLLECTION_APPROVAL", message: error.message,
+      }}, {isError: true});
+    }
+    await taskStateWriter.flush();
+    sendJson(response, 200, result);
+    return true;
+  }
   if (request.url === "/v1/mcp") {
     let result;
     try {
@@ -8318,6 +8494,9 @@ const adapterSweepTimer = setInterval(() => {
   for (const adapter of adapters.values()) {
     for (const [instanceId, instance] of adapter.instances) {
       if (instance.lastSeenAt >= staleBefore) continue;
+      for (const request of collectionApprovalRequests.values()) {
+        if (request.status === "pending" && request.instanceId === instanceId && request.adapter === adapter) closeCollectionApproval(request, "cancelled");
+      }
       adapter.instances.delete(instanceId);
       adapterTokens.delete(instance.token);
     }

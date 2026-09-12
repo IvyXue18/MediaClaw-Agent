@@ -316,6 +316,7 @@ async function registerAdapter(port, {agentChannel = "release"} = {}) {
     displayName: "Lifecycle Test Agent",
     adapterVersion: "0.3.0-rc.2",
     agentChannel,
+    collectionApprovalTransport: "mcp-elicitation-v1",
     instanceId: `adapter-${Date.now()}-${Math.random()}`,
   });
   assert.equal(registration.ok, true);
@@ -342,11 +343,15 @@ async function callApprovedCollection(port, token, name, args = {}) {
   assert.equal(pending.structuredContent.plan.status, "awaiting_confirmation");
   assert.equal(typeof pending.structuredContent.plan.planId, "string");
   assert.ok(pending.structuredContent.plan.planId.length > 0);
-  // Simulate the user's separate approval of this exact returned plan.
-  return await callTool(port, token, "mediaclaw_confirm_collection", {
+  const confirmation = await callTool(port, token, "mediaclaw_confirm_collection", {
     planId: pending.structuredContent.plan.planId,
     decision: "approve",
     ...(args.async !== undefined ? {async: args.async} : {}),
+  });
+  assert.equal(confirmation.structuredContent.status, "user_approval_required");
+  // Only the separate host UI response authorizes browser execution.
+  return post(port, "/v1/collection-approvals/respond", {
+    token, requestId: confirmation.structuredContent.approvalRequest.requestId, decision: "approve",
   });
 }
 
@@ -809,13 +814,14 @@ test("legacy captures without approval cannot resume or block a confirmed task a
   // Model pre-gate queued and running snapshots without ever starting real work.
   // Put both before the legitimately approved task to exercise queue advancement.
   const {collectionConsent, ...legacyTemplate} = approvedSnapshot;
-  const legacySnapshots = ["queued", "running"].map((status) => {
-    const taskId = `capture-legacy-unconfirmed-${status}`;
+  const legacySnapshots = ["queued", "running"].flatMap((status) => [false, true].map((oldReceipt) => {
+    const taskId = `capture-legacy-unconfirmed-${status}-${oldReceipt}`;
     return {
       ...legacyTemplate,
       taskId,
       status,
       idempotencyKey: "",
+      collectionConsent: oldReceipt ? {planId: collectionConsent.planId, ownerDeviceId: collectionConsent.ownerDeviceId, confirmedAt: collectionConsent.confirmedAt} : null,
       input: {keyword: `旧版无确认 ${status}`, limit: 1},
       captureTask: {
         ...legacyTemplate.captureTask,
@@ -823,10 +829,12 @@ test("legacy captures without approval cannot resume or block a confirmed task a
         keyword: `旧版无确认 ${status}`,
       },
     };
-  });
+  }));
+  const confirmationSnapshot = saved.tasks.find((task) => task.kind === "confirmation" && task.currentChildTaskId === approvedTaskId);
+  assert.ok(confirmationSnapshot);
   await writeFile(statePath, JSON.stringify({
     ...saved,
-    tasks: [...legacySnapshots, approvedSnapshot],
+    tasks: [...legacySnapshots, approvedSnapshot, confirmationSnapshot],
   }), "utf8");
 
   broker = await startBroker({port, stateDirectory});
@@ -869,6 +877,8 @@ test("legacy captures without approval cannot resume or block a confirmed task a
   });
   assert.equal(completed.structuredContent.task.status, "completed");
   assert.equal(completed.structuredContent.result.records[0].title, "仅执行已确认任务");
+  const restoredConfirmation = await callTool(port, registration.token, "mediaclaw_task_status", {taskId: confirmationSnapshot.taskId});
+  assert.equal(restoredConfirmation.structuredContent.task.status, "completed");
   assert.deepEqual(
     extension.messagesOfType("task.start").map((message) => message.taskId),
     [approvedTaskId],

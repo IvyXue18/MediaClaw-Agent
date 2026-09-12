@@ -61,8 +61,20 @@ function createLineReader(stream) {
   };
 }
 
-// Successful capture fixtures explicitly simulate the human approving the displayed
-// plan. This is opt-in at each call site; validation and read-only calls stay raw.
+const approvedFixtureElicitations = new WeakMap();
+
+async function approveNextFixtureElicitation(child, reader) {
+  if (!approvedFixtureElicitations.has(reader)) approvedFixtureElicitations.set(reader, new Set());
+  const approved = approvedFixtureElicitations.get(reader);
+  const prompt = await reader.waitFor((message) => message.method === "elicitation/create" && !approved.has(message.id));
+  approved.add(prompt.id);
+  assert.equal(typeof prompt.params.message, "string");
+  assert.ok(prompt.params.message.length > 0);
+  child.stdin.write(`${JSON.stringify({jsonrpc: "2.0", id: prompt.id, result: {action: "accept", content: {approve: true}}})}\n`);
+}
+
+// Successful capture fixtures explicitly simulate the user submitting the native
+// confirmation form. Validation and read-only calls never auto-approve dialogs.
 async function sendCollectionAfterFixtureApproval(child, reader, request) {
   const planRequestId = `${request.id}:collection-plan`;
   child.stdin.write(
@@ -96,6 +108,7 @@ async function sendCollectionAfterFixtureApproval(child, reader, request) {
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
 }
 
 function waitForText(stream, pattern, timeoutMs = 5000) {
@@ -267,7 +280,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
-      params: {protocolVersion: "2025-11-25"},
+      params: {protocolVersion: "2025-11-25", capabilities: {elicitation: {form: {}}}},
     })}\n`,
   );
   const initialized = await reader.waitFor((message) => message.id === 1);
@@ -2571,6 +2584,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const confirmedProfileCollection = await reader.waitFor(
     (message) => message.id === 152,
   );
@@ -2654,6 +2668,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const confirmedLargeProfileCollection = await reader.waitFor(
     (message) => message.id === 1512,
   );
@@ -2706,6 +2721,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const failedDetailCollection = await reader.waitFor(
     (message) => message.id === 155,
   );
@@ -2765,6 +2781,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const retriedDetailCollection = await reader.waitFor(
     (message) => message.id === 157,
   );
@@ -2814,6 +2831,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const retriedScanCollection = await reader.waitFor(
     (message) => message.id === 159,
   );
@@ -2868,6 +2886,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const pausedDetailCaptchaCollection = await reader.waitFor(
     (message) => message.id === 1592,
   );
@@ -2929,6 +2948,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const pausedCaptchaCollection = await reader.waitFor(
     (message) => message.id === 161,
   );
@@ -3019,6 +3039,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const pausedCooldownCollection = await reader.waitFor(
     (message) => message.id === 164,
   );
@@ -3073,6 +3094,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       },
     })}\n`,
   );
+  await approveNextFixtureElicitation(child, reader);
   const pausedLoginCollection = await reader.waitFor(
     (message) => message.id === 166,
   );
@@ -3359,7 +3381,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
       jsonrpc: "2.0",
       id: 101,
       method: "initialize",
-      params: {protocolVersion: "2025-11-25"},
+      params: {protocolVersion: "2025-11-25", capabilities: {elicitation: {form: {}}}},
     })}\n`,
   );
   await satelliteReader.waitFor((message) => message.id === 101);
@@ -3708,7 +3730,7 @@ test("shared Broker isolates Codex, WorkBuddy, and Doubao Work device identities
         jsonrpc: "2.0",
         id,
         method: "initialize",
-        params: {protocolVersion: "2025-11-25"},
+        params: {protocolVersion: "2025-11-25", capabilities: {elicitation: {form: {}}}},
       })}\n`,
     );
   }
@@ -3861,7 +3883,7 @@ test("local asset tasks expire instead of blocking the queue across restarts", a
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
-      params: {protocolVersion: "2025-11-25"},
+      params: {protocolVersion: "2025-11-25", capabilities: {elicitation: {form: {}}}},
     })}\n`,
   );
   await reader.waitFor((message) => message.id === 1);

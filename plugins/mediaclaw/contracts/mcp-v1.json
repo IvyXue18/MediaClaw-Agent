@@ -6,6 +6,8 @@
   "principles": {
     "agentUpdateRequiresUserApproval": true,
     "allNewCollectionRequiresConfirmedPlan": true,
+    "collectionApprovalRequiresHostOrExtensionUserEvent": true,
+    "agentApproveOnlyRequestsUserConfirmation": true,
     "collectionDefaultsAreProposalsNotAuthorization": true,
     "collectionPlansAreFrozenOwnedExpiringAndOneTime": true,
     "rejectedOrReplacedPlansCannotExecute": true,
@@ -51,7 +53,7 @@
     "paywallField": "paywall",
     "transcriptConfirmationField": "quoteId",
     "collectionPreparation": "Returns confirmation_required and collectionStarted=false; no browser task",
-    "collectionConfirmation": "mediaclaw_confirm_collection consumes planId or planIds once for the scope explicitly authorized in the current conversation; no repeated reply or exact phrase is required"
+    "collectionConfirmation": "mediaclaw_confirm_collection requests native client elicitation or extension UI approval for frozen planId/planIds; approve alone returns user_approval_required and never starts collection; one user event covers all declared groups"
   },
   "tools": [
     {"name": "mediaclaw_get_capabilities", "kind": "control", "stability": "stable", "readOnly": true},

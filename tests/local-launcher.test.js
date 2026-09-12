@@ -71,7 +71,7 @@ function createMessageReader(stream) {
   };
 }
 
-test("Doubao Work local launcher starts the current source adapter", {timeout: 25_000}, async () => {
+test("Doubao Work local launcher starts outside the repository without a configured working directory", {timeout: 25_000}, async () => {
   const temporaryRoot = await mkdtemp(
     path.join(os.tmpdir(), "mediaclaw-doubao-local-"),
   );
@@ -84,7 +84,7 @@ test("Doubao Work local launcher starts the current source adapter", {timeout: 2
     ? ["/d", "/s", "/c", launcher]
     : [];
   const child = spawn(command, args, {
-    cwd: pluginRoot,
+    cwd: temporaryRoot,
     env: {
       ...process.env,
       MEDIACLAW_AGENT_NODE: process.execPath,

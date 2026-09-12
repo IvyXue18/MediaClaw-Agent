@@ -9,8 +9,8 @@ import test from "node:test";
 import MCP_CONTRACT from "../plugins/mediaclaw/contracts/mcp-v1.json" with {type: "json"};
 
 // This fixture only speaks to a fresh Broker and a fake extension on loopback.
-// Explicit confirm calls below simulate the current conversation's scope
-// approval; they cannot prove that a language model interpreted that approval.
+// Public confirm calls only request approval. Successful fixtures separately
+// simulate a host user response over the internal Adapter response lane.
 const NOTE_URL = "https://www.xiaohongshu.com/explore/consent-fixture";
 const PROFILE_URL = "https://www.xiaohongshu.com/user/profile/consent-fixture";
 const RAW_COLLECTIONS = [
@@ -99,6 +99,7 @@ async function fixture(t, {ttlMs = 60_000, respond, responseFor, responseDelayMs
       displayName: "Isolated Consent Fixture",
       adapterVersion: MCP_CONTRACT.serverVersion,
       agentChannel: "local",
+      collectionApprovalTransport: "mcp-elicitation-v1",
       instanceId: `consent-${crypto.randomUUID()}`,
     });
     assert.equal(registered.ok, true, JSON.stringify(registered));
@@ -143,10 +144,18 @@ async function fixture(t, {ttlMs = 60_000, respond, responseFor, responseDelayMs
     sessionId: "isolated-consent-session",
     extensionId: "isolated-consent-extension",
     extensionVersion: "0.3.1",
+    collectionApprovalSupported: true,
   }));
   await waitUntil(async () => (await call("mediaclaw_connection_status")).structuredContent?.connected, "Fake extension did not connect");
+  const respondApproval = (requestId, decision = "approve", identity = owner) =>
+    post("/v1/collection-approvals/respond", {token: identity.token, requestId, decision});
+  const approve = async (name, args = {}, identity = owner) => {
+    const pending = await call(name, args, identity);
+    if (pending.structuredContent?.status !== "user_approval_required") return pending;
+    return respondApproval(pending.structuredContent.approvalRequest.requestId, "approve", identity);
+  };
   return {
-    call, request, register, owner, starts,
+    call, approve, respondApproval, post, socket, request, register, owner, starts,
     async prepare(toolName, args, extra = {}) {
       return pendingPlan(await call("mediaclaw_prepare_collection", {
         userGoal: "先展示方案，等待我的明确确认",
@@ -156,7 +165,7 @@ async function fixture(t, {ttlMs = 60_000, respond, responseFor, responseDelayMs
       }));
     },
     confirm(planId, extra = {}, identity = owner) {
-      return call("mediaclaw_confirm_collection", {planId, decision: "approve", ...extra}, identity);
+      return approve("mediaclaw_confirm_collection", {planId, decision: "approve", ...extra}, identity);
     },
     async persistedTasks() {
       return waitUntil(async () => {
@@ -196,6 +205,113 @@ function completed(result) {
   assert.equal(result.structuredContent.result.ok, true);
   return result.structuredContent;
 }
+
+test("a model's approve only opens user confirmation, and only the matching host response starts capture", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "营养测评", limit: 20});
+  const pending = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+  assert.equal(pending.structuredContent.status, "user_approval_required");
+  assert.equal(pending.structuredContent.collectionStarted, false);
+  const id = pending.structuredContent.approvalRequest.requestId;
+  assert.match(pending.structuredContent.approvalRequest.message, /营养测评/);
+  await delay(30);
+  assert.equal(f.starts.length, 0);
+  const repeated = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+  assert.equal(repeated.structuredContent.approvalRequest.requestId, id);
+  for (const extra of [{userConfirmed: true}, {approvalSource: "mcp-elicitation-v1"}, {receipt: {version: 2}}]) {
+    failsWith(await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", ...extra}), /INVALID_COLLECTION_CONFIRMATION/);
+  }
+  const spoofedMeta = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"}, f.owner,
+    {_meta: {userApproved: true, collectionConsent: {version: 2, source: "mcp-elicitation-v1"}}});
+  assert.equal(spoofedMeta.structuredContent.collectionStarted, false);
+  const anotherSession = await f.register();
+  failsWith(await f.respondApproval(id, "approve", anotherSession), /COLLECTION_APPROVAL_OWNER_MISMATCH/);
+  failsWith(await f.respondApproval("forged-request", "approve"), /COLLECTION_APPROVAL_OWNER_MISMATCH/);
+  assert.equal(f.starts.length, 0);
+  completed(await f.respondApproval(id));
+  assert.equal(f.starts.length, 1);
+  failsWith(await f.respondApproval(id), /COLLECTION_APPROVAL_ALREADY_CLOSED/);
+  const saved = await f.persistedTasks();
+  const receipt = saved.find((task) => task.taskId === f.starts[0].taskId).collectionConsent;
+  assert.equal(receipt.version, 2);
+  assert.equal(receipt.source, "mcp-elicitation-v1");
+  assert.equal(receipt.requestId, id);
+});
+
+test("cancel, rejection, replacement and expiry invalidate pending user approvals", async (t) => {
+  const f = await fixture(t, {ttlMs: 200});
+  for (const decision of ["cancel", "reject"]) {
+    const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: decision, limit: 1});
+    const pending = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+    const id = pending.structuredContent.approvalRequest.requestId;
+    assert.equal((await f.respondApproval(id, decision)).structuredContent.collectionStarted, false);
+    failsWith(await f.respondApproval(id), /COLLECTION_APPROVAL_ALREADY_CLOSED/);
+    if (decision === "cancel") {
+      const again = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+      assert.notEqual(again.structuredContent.approvalRequest.requestId, id);
+      await f.respondApproval(again.structuredContent.approvalRequest.requestId, "cancel");
+    }
+  }
+  const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "replace", limit: 1});
+  const pending = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+  await f.prepare("mediaclaw_capture_search_basic", {keyword: "replace", limit: 2}, {replacesPlanId: plan.planId});
+  failsWith(await f.respondApproval(pending.structuredContent.approvalRequest.requestId), /COLLECTION_APPROVAL_ALREADY_CLOSED/);
+  const expiring = await f.prepare("mediaclaw_capture_search_basic", {keyword: "expire", limit: 1});
+  const expiry = await f.call("mediaclaw_confirm_collection", {planId: expiring.planId, decision: "approve"});
+  await delay(220);
+  failsWith(await f.respondApproval(expiry.structuredContent.approvalRequest.requestId), /COLLECTION_APPROVAL_EXPIRED|COLLECTION_APPROVAL_ALREADY_CLOSED/);
+  assert.equal(f.starts.length, 0);
+});
+
+test("profile approval and cancelling a pending confirmation task cannot bypass the user", async (t) => {
+  const f = await fixture(t);
+  const plan = (await f.call("mediaclaw_prepare_profile_collection", {
+    userGoal: "查看账号链接", profileUrl: PROFILE_URL, purpose: "inventory_export",
+    contentType: "all", coverage: "recent", maxItems: 1, requestedFields: ["post_page_url"],
+  })).structuredContent.plan;
+  const pending = await f.call("mediaclaw_confirm_profile_collection", {planId: plan.planId});
+  assert.equal(pending.structuredContent.status, "user_approval_required");
+  assert.equal(f.starts.length, 0);
+  await f.call("mediaclaw_cancel_task", {taskId: pending.structuredContent.taskId});
+  failsWith(await f.respondApproval(pending.structuredContent.approvalRequest.requestId), /COLLECTION_APPROVAL_ALREADY_CLOSED/);
+  assert.equal(f.starts.length, 0);
+});
+
+test("extension fallback requires the paired UI response and cannot be approved by the MCP response lane", async (t) => {
+  const f = await fixture(t);
+  await f.post("/v1/collection-approvals/capability", {token: f.owner.token, transport: "extension-ui-v1"});
+  const messages = [];
+  f.socket.addEventListener("message", (event) => messages.push(JSON.parse(String(event.data))));
+  const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "插件确认", limit: 1});
+  const pending = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", async: true});
+  const request = await waitUntil(() => messages.find((m) => m.type === "collection.approval.request"), "Approval card not sent");
+  failsWith(await f.respondApproval(request.requestId), /COLLECTION_APPROVAL_OWNER_MISMATCH/);
+  f.socket.send(JSON.stringify({type: "collection.approval.response", requestId: request.requestId,
+    deviceId: request.deviceId, sessionId: "wrong-session", decision: "approve"}));
+  await delay(20);
+  assert.equal(f.starts.length, 0);
+  f.socket.send(JSON.stringify({type: "collection.approval.response", requestId: request.requestId,
+    deviceId: request.deviceId, sessionId: request.sessionId, decision: "approve"}));
+  await waitUntil(() => f.starts.length === 1, "User-approved capture not started");
+  await waitUntil(async () => (await f.call("mediaclaw_task_status", {taskId: pending.structuredContent.taskId})).structuredContent.task.status === "completed", "Approval task did not mirror result");
+  assert.equal(f.starts.length, 1);
+});
+
+test("changing confirmation transport or closing the owning session invalidates old requests", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "切换确认入口", limit: 1});
+  const original = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+  await f.post("/v1/collection-approvals/capability", {token: f.owner.token, transport: "extension-ui-v1"});
+  const replacement = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+  assert.notEqual(replacement.structuredContent.approvalRequest.requestId, original.structuredContent.approvalRequest.requestId);
+  assert.equal(replacement.structuredContent.approvalRequest.transport, "extension-ui-v1");
+  failsWith(await f.respondApproval(original.structuredContent.approvalRequest.requestId), /COLLECTION_APPROVAL_OWNER_MISMATCH|COLLECTION_APPROVAL_ALREADY_CLOSED/);
+  await f.post("/v1/adapters/unregister", {token: f.owner.token});
+  f.socket.send(JSON.stringify({type: "collection.approval.response", requestId: replacement.structuredContent.approvalRequest.requestId,
+    deviceId: f.owner.device.deviceId, sessionId: "isolated-consent-session", decision: "approve"}));
+  await delay(30);
+  assert.equal(f.starts.length, 0);
+});
 
 test("all 18 raw collection entry points and aliases only propose, including async and MCP Tasks", async (t) => {
   const f = await fixture(t);
@@ -404,7 +520,7 @@ test("one approval executes all six frozen groups even after later plans pass th
   }));
   assert.equal(f.starts.length, 0);
   const planIds = plans.map((plan) => plan.planId);
-  const result = completed(await f.call("mediaclaw_confirm_collection", {planIds, decision: "approve"}));
+  const result = completed(await f.approve("mediaclaw_confirm_collection", {planIds, decision: "approve"}));
   assert.deepEqual(f.starts.map((message) => message.task.keyword), keywords);
   assert.ok(Date.now() > Date.parse(plans.at(-1).expiresAt));
   assert.ok(f.starts.every((message) => message.task.limit === 50 && message.task.options.timeRange === "6m" && message.task.options.sortBy === "likes"));
@@ -422,7 +538,7 @@ test("one approval executes all six frozen groups even after later plans pass th
     assert.equal(child.collectionConsent.planId, planIds[index]);
     assert.equal(child.collectionConsent.ownerDeviceId, f.owner.device.deviceId);
   }
-  failsWith(await f.call("mediaclaw_confirm_collection", {planIds, decision: "approve"}), /COLLECTION_PLAN_ALREADY_USED/);
+  failsWith(await f.approve("mediaclaw_confirm_collection", {planIds, decision: "approve"}), /COLLECTION_PLAN_ALREADY_USED/);
   assert.equal(f.starts.length, 6);
 });
 
@@ -451,7 +567,7 @@ test("batch validation is atomic for unknown, foreign, rejected, replaced, consu
     [valid.planId, /INVALID_COLLECTION_CONFIRMATION/],
   ]) {
     for (const decision of ["approve", "reject"]) {
-      failsWith(await f.call("mediaclaw_confirm_collection", {planIds: [valid.planId, badId], decision}), error);
+      failsWith(await f.approve("mediaclaw_confirm_collection", {planIds: [valid.planId, badId], decision}), error);
       assert.deepEqual(f.starts.map((message) => message.task.keyword), ["已执行"]);
     }
   }
@@ -466,7 +582,7 @@ test("batch validation is atomic for unknown, foreign, rejected, replaced, consu
     {planIds: [valid.planId]},
     {planIds: [valid.planId], decision: "yes"},
     {planIds: [valid.planId], decision: "approve", async: "true"},
-  ]) failsWith(await f.call("mediaclaw_confirm_collection", args), /INVALID_COLLECTION_CONFIRMATION/);
+  ]) failsWith(await f.approve("mediaclaw_confirm_collection", args), /INVALID_COLLECTION_CONFIRMATION/);
   assert.deepEqual(f.starts.map((message) => message.task.keyword), ["已执行"]);
   completed(await f.confirm(valid.planId));
   assert.deepEqual(f.starts.map((message) => message.task.keyword), ["已执行", "有效方案"], "an invalid batch must neither consume nor reject the valid plan");
@@ -479,7 +595,7 @@ test("an expired group rejects an entire batch without consuming the still-valid
   const valid = await f.prepare("mediaclaw_capture_search_basic", {keyword: "仍有效的方案", limit: 2});
   await delay(Math.max(0, Date.parse(expired.expiresAt) - Date.now()) + 25);
   for (const decision of ["approve", "reject"]) {
-    failsWith(await f.call("mediaclaw_confirm_collection", {planIds: [valid.planId, expired.planId], decision}), /COLLECTION_PLAN_EXPIRED/);
+    failsWith(await f.approve("mediaclaw_confirm_collection", {planIds: [valid.planId, expired.planId], decision}), /COLLECTION_PLAN_EXPIRED/);
   }
   assert.equal(f.starts.length, 0);
   completed(await f.confirm(valid.planId));
@@ -490,9 +606,9 @@ test("a partial approval executes only selected plans and batch rejection execut
   const f = await fixture(t);
   const plans = [];
   for (const keyword of ["第一组", "第二组", "第三组"]) plans.push(await f.prepare("mediaclaw_capture_search_basic", {keyword, limit: 1}));
-  completed(await f.call("mediaclaw_confirm_collection", {planIds: [plans[0].planId], decision: "approve"}));
+  completed(await f.approve("mediaclaw_confirm_collection", {planIds: [plans[0].planId], decision: "approve"}));
   const planIds = plans.slice(1).map((plan) => plan.planId);
-  const rejected = await f.call("mediaclaw_confirm_collection", {planIds, decision: "reject"});
+  const rejected = await f.approve("mediaclaw_confirm_collection", {planIds, decision: "reject"});
   assert.equal(rejected.structuredContent.collectionStarted, false);
   assert.deepEqual(rejected.structuredContent.planIds, planIds);
   for (const id of planIds) failsWith(await f.confirm(id), /COLLECTION_PLAN_REJECTED/);
@@ -505,7 +621,7 @@ test("a failed group preserves earlier results and stops unstarted groups", asyn
   }});
   const plans = [];
   for (const keyword of ["已完成", "筛选失败", "未开始"]) plans.push(await f.prepare("mediaclaw_capture_search_basic", {keyword, limit: 1}));
-  const result = await f.call("mediaclaw_confirm_collection", {planIds: plans.map((plan) => plan.planId), decision: "approve"});
+  const result = await f.approve("mediaclaw_confirm_collection", {planIds: plans.map((plan) => plan.planId), decision: "approve"});
   assert.equal(result.isError, true);
   assert.equal(result.structuredContent.task.status, "failed");
   assert.equal(result.structuredContent.result.completedCount, 1);
@@ -519,9 +635,9 @@ test("concurrent batch confirmations consume all plans once and expose an async 
   const plans = [];
   for (const keyword of ["甲", "乙"]) plans.push(await f.prepare("mediaclaw_capture_search_basic", {keyword, limit: 1}));
   const args = {planIds: plans.map((plan) => plan.planId), decision: "approve", async: true};
-  const responses = await Promise.all([f.call("mediaclaw_confirm_collection", args), f.call("mediaclaw_confirm_collection", args)]);
+  const responses = await Promise.all([f.approve("mediaclaw_confirm_collection", args), f.approve("mediaclaw_confirm_collection", args)]);
   assert.equal(responses.filter((response) => response.structuredContent.ok).length, 1);
-  failsWith(responses.find((response) => !response.structuredContent.ok), /COLLECTION_PLAN_ALREADY_USED/);
+  failsWith(responses.find((response) => !response.structuredContent.ok), /COLLECTION_PLAN_ALREADY_USED|COLLECTION_APPROVAL_ALREADY_CLOSED/);
   const accepted = responses.find((response) => response.structuredContent.ok).structuredContent;
   assert.deepEqual(accepted.planIds, args.planIds);
   const result = await waitUntil(async () => {
@@ -536,7 +652,7 @@ test("cancelling an approved batch stops its current child and never starts the 
   const f = await fixture(t, {responseDelayMs: () => 250});
   const plans = [];
   for (const keyword of ["当前组", "后续组"]) plans.push(await f.prepare("mediaclaw_capture_search_basic", {keyword, limit: 1}));
-  const accepted = await f.call("mediaclaw_confirm_collection", {planIds: plans.map((plan) => plan.planId), decision: "approve", async: true});
+  const accepted = await f.approve("mediaclaw_confirm_collection", {planIds: plans.map((plan) => plan.planId), decision: "approve", async: true});
   const taskId = accepted.structuredContent.taskId;
   await waitUntil(() => f.starts.length === 1, "First group did not start");
   const cancelled = await f.call("mediaclaw_cancel_task", {taskId});
@@ -588,7 +704,7 @@ test("concurrent and repeated approvals consume one exact plan only once", async
   const plan = await f.prepare("mediaclaw_enhance_records", {recordIds: ["record-a"], confirmed: true});
   const results = await Promise.all([f.confirm(plan.planId, {async: true}), f.confirm(plan.planId, {async: true})]);
   assert.equal(results.filter((item) => item.structuredContent.ok).length, 1);
-  failsWith(results.find((item) => !item.structuredContent.ok), /COLLECTION_PLAN_ALREADY_USED/);
+  failsWith(results.find((item) => !item.structuredContent.ok), /COLLECTION_PLAN_ALREADY_USED|COLLECTION_APPROVAL_ALREADY_CLOSED/);
   await waitUntil(() => f.starts.length === 1, "Confirmed enhancement did not start");
   assert.deepEqual(f.starts[0].task.options.recordIds, ["record-a"]);
   assert.equal(f.starts[0].task.options.confirmation.confirmed, true);
@@ -678,7 +794,7 @@ test("confirmed single-note comments and OCR children share the original consent
   assert.deepEqual(f.starts.map((message) => message.task.mode), ["current_note", "comments", "extract_image_text"]);
   assert.equal(f.starts[1].task.limit, 4);
   const state = await waitUntil(async () => {
-    const tasks = await f.persistedTasks();
+    const tasks = (await f.persistedTasks()).filter((task) => task.kind !== "confirmation");
     return tasks.length === 4 && tasks.every((task) => task.status === "succeeded") ? tasks : null;
   }, "Workflow and children did not persist their final state");
   for (const task of state) {
