@@ -121,7 +121,7 @@ test("Doubao Work local launcher starts outside the repository without a configu
     const initialized = await reader.waitFor((message) => message?.id === 1);
     assert.ok(initialized, `local launcher did not initialize: ${stderr}`);
     assert.equal(initialized.result?.serverInfo?.name, "mediaclaw-agent-adapter");
-    assert.equal(initialized.result?.serverInfo?.version, "0.3.2-local.1");
+    assert.equal(initialized.result?.serverInfo?.version, "0.3.2-local.20260912.1");
 
     child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",

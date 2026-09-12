@@ -255,8 +255,9 @@ const idempotentTaskIds = new Map();
 const resultTransfers = new Map();
 const pendingTaskCancellations = new Map();
 const profileCollectionPlans = new Map();
-// A plan is a proposal, never permission. Only a user decision from the host
-// or paired extension can consume it and establish the child execution context.
+// A plan is a proposal, never permission. Scope authorization is either a host
+// user event or an explicitly recorded conversation relay; only the former is
+// independently supplied by the host. Both consume the same frozen plan once.
 const collectionPlans = new Map();
 const COLLECTION_PLAN_TTL_MS = Math.max(100, Number(
   process.env.MEDIACLAW_COLLECTION_PLAN_TTL_MS || 15 * 60_000,
@@ -337,7 +338,7 @@ function buildConnectionOnboarding({connected = false, awaitingPairing = false} 
     statusLabel: "接入包已启动，等待浏览器插件连接",
     nextAction: {
       type: "enable_extension",
-      label: "在安装了社媒虾的浏览器中打开扩展设置并开启 Agent 接管；尚未安装浏览器扩展时前往官方下载页",
+      label: "浏览器执行端尚未连接；由 Agent 核查接入状态，连接后只需批准配对",
     },
     browserExtension: {
       status: "not_detected",
@@ -345,7 +346,7 @@ function buildConnectionOnboarding({connected = false, awaitingPairing = false} 
       supportedBrowserFamily: "Chromium",
       downloadUrl: BROWSER_EXTENSION_DOWNLOAD_URL,
       installedHelp:
-        "如果已经安装，请在准备使用的浏览器中确认扩展已启用，再打开设置 → Agent 接管。",
+        "Agent 会复查连接状态；无法连接时在当前对话报告具体原因，不引导插件内业务操作。",
     },
     welcome: null,
   };
@@ -840,13 +841,15 @@ function publicProfileCollectionPlan(plan = {}) {
     browserActions: plan.browserActions,
     safetyBoundaries: plan.safetyBoundaries,
     limitations: plan.limitations,
+    authorizationPolicy: collectionApprovalPolicy([plan]),
     confirmation: {
       required: true,
+      freshReplyRequired: !collectionApprovalPolicy([plan]).explicitScopeRequestAllowed,
       startsCollection: false,
       nextTool: "mediaclaw_confirm_profile_collection",
       confirmationArgument: {planId: plan.planId},
       rejectionArgument: {planId: plan.planId, decision: "reject"},
-      instruction: "简要说明方案，调用确认工具申请用户确认。approve 只打开对话确认框；宿主不支持时在插件顶部确认。只有用户亲自批准后才采集，Agent 不得代点确认框或插件按钮。一次批准覆盖本方案全部批次与已声明重试，范围变化需重新制定方案。",
+      instruction: "普通采集可复用当前用户对具体范围的明确请求；否则在 Agent 对话里展示可改方案、等待回复，或使用宿主确认框。携原样 planId 与 authorization 记录授权，不凭默认值自行同意；一次覆盖全部批次与重试。修改用 replacesPlanId，不引导插件操作。",
       prompt: plan.confirmationPrompt,
     },
   };
@@ -1676,15 +1679,17 @@ function createCollectionPlan({userGoal, toolName, arguments: input = {}, replac
     toolName,
     arguments: structuredClone(args),
     scope,
+    authorizationPolicy: collectionApprovalPolicy([plan]),
     limitations: ["实际数量受页面加载与平台限制影响；不足时报告实际覆盖，不自动扩大时间、数量或补采范围", "分析目标和默认参数只用于建议方案，不等于用户已经授权采集", scope.transcript],
     confirmation: {
       required: true,
+      freshReplyRequired: !collectionApprovalPolicy([plan]).explicitScopeRequestAllowed,
       startsCollection: false,
       nextTool: "mediaclaw_confirm_collection",
       confirmationArgument: {planId: plan.planId, decision: "approve"},
       rejectionArgument: {planId: plan.planId, decision: "reject"},
       prompt: plan.confirmationPrompt,
-      instruction: "简要说明范围，多组用 planIds 一次申请用户确认。approve 只打开对话确认框；宿主不支持时由用户在插件顶部批准。不得把默认值或泛泛研究目标当成同意，也不得代点批准按钮。未收到真实用户确认时保持 user_approval_required、collectionStarted=false；已批准方案内的分组与重试连续执行，范围变化重新制定方案。",
+      instruction: "普通采集可复用当前用户对具体范围的明确请求，携 authorization 记录原话；模糊目标或较高风险先在 Agent 对话展示可改方案并等待回复。单独 approve 不表示同意。多组用 planIds 一次授权，范围内拆批及重试连续执行；修改用 replacesPlanId，不引导插件操作。",
     },
   };
 }
@@ -1759,13 +1764,49 @@ function startCollectionPlanBatch(plans) {
   return parent;
 }
 
-// Public MCP parameters only request a user decision. The decision itself arrives
-// from the Adapter's elicitation response lane or the paired extension UI.
+// Approval stays in the Agent. Native host events and conversation relays are
+// recorded separately: quoted chat text is evidence, not proof of its author.
 const collectionApprovalRequests = new Map();
+
+const conversationAuthorizationSchema = {
+  type: "object",
+  properties: {
+    type: {type: "string", enum: ["user_request", "user_reply"], description: "user_request 仅用于用户已指定普通采集具体范围；user_reply 用于展示本方案后收到的真实回复，不要求固定口令"},
+    userMessage: {type: "string", minLength: 1, maxLength: 2400, description: "如实保留本次用户授权原话；不得填写 Agent 自己的判断、默认方案、旧任务授权或虚构回复"},
+  },
+  required: ["type", "userMessage"],
+  additionalProperties: false,
+};
+
+function collectionApprovalPolicy(plans) {
+  const estimates = plans.reduce((total, plan) => {
+    total.listItems += plan.scope?.basicItemLimit || plan.riskNotice?.estimates?.listItems || 0;
+    total.detailPages += plan.scope?.detailPageLimit || plan.riskNotice?.estimates?.detailPageVisits || 0;
+    total.comments += plan.scope?.commentItemLimit || plan.riskNotice?.estimates?.comments || 0;
+    return total;
+  }, {listItems: 0, detailPages: 0, comments: 0});
+  const elevated = estimates.listItems > 1000 || estimates.detailPages > PROFILE_DETAIL_YELLOW_THRESHOLD ||
+    estimates.comments > PROFILE_COMMENT_RED_TOTAL_THRESHOLD ||
+    plans.some((plan) => ["yellow", "red"].includes(plan.riskNotice?.level) || plan.scope?.imageTextMode === "force");
+  return {risk: elevated ? "elevated" : "ordinary", explicitScopeRequestAllowed: !elevated,
+    confirmationLocation: "agent", estimates,
+    instruction: elevated ? "先说明本方案总量及风险，在对话里收到用户同意后执行；用户可缩小或修改范围。"
+      : "用户已明确指定本次来源、数量和数据深度时复用该授权；模糊目标先展示可修改方案并等待对话回复。"};
+}
+
+function validateConversationAuthorization(input, {replyRequired = false} = {}) {
+  const authorization = collectionArguments(conversationAuthorizationSchema, input, "authorization");
+  if (!authorization?.userMessage?.trim()) throw collectionPlanError("CONVERSATION_AUTHORIZATION_REQUIRED", "请先在当前对话中取得用户对具体方案的授权，可修改或取消方案；不能用空白或自行推断代替用户回复");
+  if (replyRequired && authorization.type !== "user_reply") throw collectionPlanError("PLAN_REVIEW_REQUIRED", "此方案需要先展示具体范围与风险，再接收用户回复；可在对话中修改方案后继续");
+  return {...authorization, userMessage: authorization.userMessage.trim()};
+}
 
 function hasUserCollectionApproval(receipt, deviceId) {
   return receipt?.version === 2 && receipt.ownerDeviceId === deviceId &&
-    ["mcp-elicitation-v1", "extension-ui-v1"].includes(receipt.source) &&
+    ["mcp-elicitation-v1", "conversation-v1"].includes(receipt.source) &&
+    (receipt.source !== "conversation-v1" || (receipt.userEventVerified === false &&
+      ["user_request", "user_reply"].includes(receipt.authorization?.type) &&
+      typeof receipt.authorization?.userMessage === "string" && Boolean(receipt.authorization.userMessage.trim()))) &&
     Boolean(receipt.planId && receipt.requestId && receipt.scopeDigest && receipt.confirmedAt);
 }
 
@@ -1779,8 +1820,6 @@ function collectionApprovalDigest(plans) {
 function closeCollectionApproval(request, status) {
   request.status = status;
   clearTimeout(request.timer);
-  extensionPeer?.send({type: "collection.approval.closed", requestId: request.requestId,
-    deviceId: request.deviceId, sessionId: deviceSessions.get(request.deviceId)?.sessionId || "", status});
   if (status !== "approved") {
     finishTask(request.task, {status: status === "expired" ? "input_required" : "cancelled",
       result: {ok: false, collectionStarted: false, approvalStatus: status},
@@ -1794,19 +1833,11 @@ function invalidateCollectionApprovals(planId) {
   }
 }
 
-function sendCollectionApprovalToExtension(request) {
-  const session = deviceSessions.get(request.deviceId);
-  if (!extensionPeer || !session?.collectionApprovalSupported || request.transport !== "extension-ui-v1") return;
-  extensionPeer.send({type: "collection.approval.request", requestId: request.requestId,
-    deviceId: request.deviceId, sessionId: session.sessionId, sourceHost: request.adapter.hostKey,
-    message: request.message, expiresAt: request.expiresAt});
-}
-
-function requestUserCollectionApproval(plans, adapter, params) {
+function requestUserCollectionApproval(plans, adapter, params, authorization = null) {
   const instanceId = requestContext.getStore()?.instanceId || "";
   const instance = adapter.instances.get(instanceId);
-  const transport = instance?.collectionApprovalTransport === "mcp-elicitation-v1"
-    ? "mcp-elicitation-v1" : "extension-ui-v1";
+  const transport = !authorization && instance?.collectionApprovalTransport === "mcp-elicitation-v1"
+    ? "mcp-elicitation-v1" : "conversation-v1";
   const scopeDigest = collectionApprovalDigest(plans);
   let request = [...collectionApprovalRequests.values()].find((entry) => entry.status === "pending" &&
     entry.instanceId === instanceId && entry.deviceId === adapter.identity.deviceId && entry.transport === transport && entry.scopeDigest === scopeDigest);
@@ -1818,7 +1849,7 @@ function requestUserCollectionApproval(plans, adapter, params) {
     const task = createTask({kind: "confirmation", input: {planIds: plans.map((plan) => plan.planId)}});
     updateTask(task, {status: "input_required", message: transport === "mcp-elicitation-v1"
       ? "等待你在对话确认框中批准采集，尚未打开采集页面"
-      : "等待你在插件顶部确认采集，尚未打开采集页面"});
+      : "方案待你在当前对话中确认；可以直接修改范围或取消，采集尚未启动"});
     request = {requestId: createId("user_approval"), adapter, instanceId, deviceId: adapter.identity.deviceId,
       planIds: plans.map((plan) => plan.planId), scopeDigest, message, transport, task, params,
       expiresAt: new Date(expiresAtMs).toISOString(), expiresAtMs, status: "pending"};
@@ -1832,21 +1863,28 @@ function requestUserCollectionApproval(plans, adapter, params) {
       if (entry.status !== "pending" && entry.expiresAtMs < Date.now()) collectionApprovalRequests.delete(id);
     }
   }
-  sendCollectionApprovalToExtension(request);
+  // Scope stays frozen, but this call owns the response mode (async/MCP Tasks).
+  request.params = params;
+  if (authorization) return resolveUserCollectionApproval(request.requestId, "approve", {
+    adapter, instanceId, source: "conversation-v1", authorization,
+  });
   return toolResult({ok: true, status: "user_approval_required", collectionStarted: false,
     taskId: request.task.taskId, task: taskSnapshot(request.task),
     approvalRequest: {requestId: request.requestId, message: request.message, expiresAt: request.expiresAt,
-      transport, extensionSupported: adapterSession(adapter)?.collectionApprovalSupported === true},
-    message: request.task.message + (transport === "extension-ui-v1" && !adapterSession(adapter)?.collectionApprovalSupported
-      ? "；当前插件不支持此确认入口，需要安装支持用户确认的插件版本后继续" : ""),
-    nextTool: "mediaclaw_task_status"});
+      transport},
+    authorizationPolicy: collectionApprovalPolicy(plans),
+    message: request.task.message,
+    nextAction: {type: "ask_in_conversation", message: request.message,
+      instruction: "在当前对话等待用户回复；用户可修改、批准或取消。修改用 replacesPlanId 重新准备，得到具体授权后携 authorization 调用确认；不要持续轮询等待用户，也不要引导插件操作。"},
+    nextTool: "mediaclaw_confirm_collection"});
 }
 
-async function resolveUserCollectionApproval(requestId, decision, {adapter, instanceId, source, deviceId, sessionId} = {}) {
+async function resolveUserCollectionApproval(requestId, decision, {adapter, instanceId, source, authorization} = {}) {
   const request = collectionApprovalRequests.get(String(requestId || ""));
   if (!request || request.deviceId !== adapter?.identity.deviceId || !adapter.instances.has(request.instanceId) || request.transport !== source ||
+      request.instanceId !== instanceId ||
       (source === "mcp-elicitation-v1" && (request.instanceId !== instanceId || adapter.instances.get(instanceId)?.collectionApprovalTransport !== source)) ||
-      (source === "extension-ui-v1" && (deviceId !== request.deviceId || deviceSessions.get(deviceId)?.sessionId !== sessionId))) {
+      !["mcp-elicitation-v1", "conversation-v1"].includes(source)) {
     throw collectionPlanError("COLLECTION_APPROVAL_OWNER_MISMATCH", "用户确认不属于当前方案或确认入口");
   }
   if (!["approve", "reject", "cancel"].includes(decision)) throw collectionPlanError("INVALID_COLLECTION_APPROVAL", "用户确认决定无效");
@@ -1870,13 +1908,17 @@ async function resolveUserCollectionApproval(requestId, decision, {adapter, inst
     try {
       plans = request.planIds.map((id) => resolveCollectionPlan(id, adapter));
       if (collectionApprovalDigest(plans) !== request.scopeDigest) throw collectionPlanError("COLLECTION_APPROVAL_SCOPE_CHANGED", "方案范围已变化，需要重新确认");
+      if (source === "conversation-v1") authorization = validateConversationAuthorization(authorization, {
+        replyRequired: !collectionApprovalPolicy(plans).explicitScopeRequestAllowed,
+      });
       if (!extensionPeer || !adapterSession(adapter)) throw collectionPlanError("EXTENSION_NOT_CONNECTED", "插件已断开，采集未启动");
     } catch (error) { closeCollectionApproval(request, "cancelled"); throw error; }
     const confirmedAt = nowIso();
     for (const plan of plans) {
       plan.usedAt = confirmedAt;
       plan.userApproval = {version: 2, source, requestId: request.requestId, scopeDigest: request.scopeDigest,
-        planId: plan.planId, ownerDeviceId: plan.ownerDeviceId, confirmedAt};
+        planId: plan.planId, ownerDeviceId: plan.ownerDeviceId, confirmedAt,
+        ...(source === "conversation-v1" ? {authorization, userEventVerified: false} : {userEventVerified: true})};
     }
     closeCollectionApproval(request, "approved");
     const task = plans.length === 1 ? await startConfirmedCollectionPlan(plans[0]) : startCollectionPlanBatch(plans);
@@ -2844,7 +2886,8 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
         response?.confirmationRequired === true ||
         payload?.confirmationRequired === true ||
         payload?.plan?.status === "awaiting_confirmation",
-      sendingStarted: false,
+      sendingStarted: response?.sendingStarted === true || payload?.sendingStarted === true,
+      scheduled: response?.scheduled === true || payload?.scheduled === true,
       error: response?.error || payload?.error || null,
     };
   }
@@ -3009,7 +3052,7 @@ function compactCaptureResponse(response = {}, captureTask = {}) {
               requiredTools.length > 0 && missingAgentTools.length === 0,
           };
         }),
-        instruction: "只按当前实际可用能力制定方案；可用不代表用户已授权。先读已有数据，新增采集简要说明必要范围并申请对话确认框或插件用户确认；只有真实批准后才执行，已批准方案内的步骤连续进行，Agent 不得代点。插件内最终发送确认、清理预览及逐字稿报价各自保留。",
+        instruction: "只按当前实际可用能力制定方案；可用不代表授权。已有数据直接读取，普通采集复用当前用户对具体范围的授权，模糊目标或新增风险先在对话展示可修改方案。扣费、删除、发送先展示具体后果并收到回复；配对外的确认、修改、取消全部在 Agent 完成，不引导用户去插件点击。",
         error: response?.error || rawCaptureResult?.error || null,
       };
     }
@@ -3126,7 +3169,7 @@ function pumpQueue() {
       (!hasUserCollectionApproval(next.collectionConsent, next.owner?.deviceId))) {
     finishTask(next, {
       status: "input_required",
-      error: {code: "COLLECTION_CONFIRMATION_REQUIRED", message: "该采集缺少用户确认凭据；请通过对话确认框或插件按钮确认，Agent 自报批准不能执行"},
+      error: {code: "COLLECTION_CONFIRMATION_REQUIRED", message: "该采集缺少范围授权记录；请在当前对话确认或修改具体方案，再记录授权执行"},
       message: "采集未启动，等待用户确认具体方案",
     });
     pumpQueue();
@@ -3510,7 +3553,6 @@ function handleExtensionMessage(message = {}, peer = null) {
     extensionInfo = {
       extensionId: nextExtensionId,
       extensionVersion: normalizeText(message.extensionVersion, 80),
-      collectionApprovalSupported: message.collectionApprovalSupported === true,
       protocolVersion: normalizeText(message.protocolVersion, 40),
       pendingResultCount:
         Math.max(0, Math.floor(Number(message.pendingResultCount) || 0)),
@@ -3524,9 +3566,6 @@ function handleExtensionMessage(message = {}, peer = null) {
       sessionId,
       hostKey: adapter.hostKey,
     });
-    for (const request of collectionApprovalRequests.values()) {
-      if (request.deviceId === deviceId && request.status === "pending") sendCollectionApprovalToExtension(request);
-    }
     pumpQueue();
     return;
   }
@@ -3536,16 +3575,6 @@ function handleExtensionMessage(message = {}, peer = null) {
   }
 
   if (!extensionPeer || peer !== extensionPeer) return;
-
-  if (message.type === "collection.approval.response") {
-    const deviceId = normalizeText(message.deviceId, 160);
-    void resolveUserCollectionApproval(message.requestId, message.decision, {
-      adapter: getAdapterByDeviceId(deviceId), source: "extension-ui-v1", deviceId,
-      sessionId: normalizeText(message.sessionId, 200),
-    }).catch((error) => peer.send({type: "collection.approval.closed", requestId: message.requestId,
-      deviceId, sessionId: message.sessionId, status: "invalid", error: {code: error.code, message: error.message}}));
-    return;
-  }
 
   if (message.type === "task.result.start") {
     handleResultTransferStart(message);
@@ -6517,7 +6546,7 @@ function toolAnnotations(
 const tools = [
   {
     name: "mediaclaw_get_capabilities",
-    description: "读取当前已连接插件的能力清单，并与本 Agent 实际工具核对。每次新任务在检查连接后先调用，区分可直接指挥、由Agent编排、需插件最终确认和插件独有能力。返回插件实际版本、能力注册表版本、Agent版本及缺少的入口；只读，不打开作品页面、不采集或清理。旧插件不支持时明确报告，不能猜测支持。随后复用已有资产；新增采集通过固定方案申请对话确认框或插件用户确认。",
+    description: "读取当前连接的实际能力清单并与 Agent 入口核对；只读，不采集或清理。先复用已有资产，按用户具体授权和风险决定是否需要新确认。配对之外的业务交互全部在 Agent 对话中完成；能力缺失时在对话说明限制，不引导插件操作，不凭版本号猜测。",
     annotations: toolAnnotations("核查插件与 Agent 能力", {readOnlyHint: true, idempotentHint: true}),
     execution: captureExecution,
     inputSchema: {
@@ -6528,7 +6557,7 @@ const tools = [
   },
   {
     name: "mediaclaw_prepare_collection",
-    description: "制定固定范围的采集方案，不打开浏览器、不采集数据。根据用户目标选择 toolName 和 arguments；多关键词等已知动作先分别准备，一起简要展示来源、总量、筛选和数据深度，再用 planIds 一次确认。调用确认工具申请一次用户确认，不另要求聊天口令。默认参数只是建议；实际采集须由用户在对话确认框或插件入口批准。更改待执行方案使用 replacesPlanId。",
+    description: "制定可调整的固定采集范围，不采集。多组先准备后用 planIds 一次授权。用户已明确指定普通采集来源、数量与数据深度时可复用本次请求，不重复问；模糊目标或风险增加时在对话展示方案并等待回复，默认参数只作建议。更改用 replacesPlanId 作废旧方案，拒绝可取消；所有操作在 Agent 完成。",
     annotations: toolAnnotations("制定采集方案"),
     inputSchema: {
       type: "object",
@@ -6544,7 +6573,7 @@ const tools = [
   },
   {
     name: "mediaclaw_confirm_collection",
-    description: "申请用户确认固定方案。planId 确认单组，planIds 一次确认多组，二选一。decision=approve 只申请对话中的用户确认框，不代表用户已经批准；宿主不支持时等待用户在插件顶部点击。只有真实用户事件才会启动采集，Agent 不得代点界面、构造用户同意或走内部接口绕过。一次批准覆盖本方案全部分组和已声明重试；返回 user_approval_required 时采集未启动，沿 taskId 查状态。reject 关闭方案且不执行。范围变化重新制定。逐字稿、私信和清理保留各自确认。",
+    description: "授权或拒绝冻结方案：planId 单组，planIds 多组，二选一。普通采集已有当前用户具体范围请求时传 authorization.type=user_request 及真实 userMessage；模糊目标和较高风险先展示可改方案，收到用户回复再传 user_reply。不要为已授权范围重复索要批准。单独 approve 只申请宿主确认框；不支持则返回对话问题，等待用户而不持续轮询。Agent 转述原话不能独立证明来源，不得虚构或用默认值冒充授权。一次授权覆盖所有分组和已声明重试；reject不执行，修改用replacesPlanId。不得引导插件确认。扣费、发送、清理使用各自预览后的确认工具。",
     annotations: toolAnnotations("确认或拒绝采集方案", {openWorldHint: true, idempotentHint: true}),
     inputSchema: {
       type: "object",
@@ -6552,6 +6581,7 @@ const tools = [
         planId: {type: "string"},
         planIds: {type: "array", items: {type: "string"}, minItems: 1, maxItems: 1000, uniqueItems: true, description: "同一次同意覆盖的方案 ID；与 planId 二选一，全部校验通过后一次确认并顺序执行"},
         decision: {type: "string", enum: ["approve", "reject"]},
+        authorization: conversationAuthorizationSchema,
         async: {type: "boolean", default: false},
       },
       required: ["decision"],
@@ -6906,7 +6936,7 @@ const tools = [
   },
   {
     name: "mediaclaw_confirm_profile_collection",
-    description: "申请用户确认账号采集方案，不接受 Agent 自报同意作为执行授权。使用原样 planId，approve 只申请对话确认框；宿主不支持时等待用户在插件顶部批准。一次批准覆盖方案中全部批次与可恢复重试。user_approval_required 表示尚未启动，不得代点批准入口。reject 关闭方案。",
+    description: "授权或拒绝账号方案。普通范围可沿用当前用户具体请求，传authorization.type=user_request及原话；风险提示方案需先展示，再收到用户回复传user_reply。无authorization只申请宿主确认或返回当前对话问题，不启动。一次授权覆盖所有批次与已声明重试；修改用replacesPlanId，reject不执行；不引导插件批准。",
     annotations: toolAnnotations("执行账号采集方案", {
       idempotentHint: true,
       openWorldHint: true,
@@ -6917,6 +6947,7 @@ const tools = [
       properties: {
         planId: {type: "string"},
         decision: {type: "string", enum: ["approve", "reject"], default: "approve"},
+        authorization: conversationAuthorizationSchema,
         async: {
           type: "boolean",
           default: false,
@@ -7396,7 +7427,7 @@ const tools = [
   {
     name: "mediaclaw_prepare_comment_outreach",
     description:
-      "为选中的评论候选生成私信触达批次和固定话术预览。按所选范围交给插件去重、分组并校验当前发送额度，不另设 Agent 收件人数上限。用户修改收件人或话术时传 replacesPlanId，原待确认方案原子作废；已开始的任务不能静默替换，请按用户要求明确终止。此工具绝不会开始发送；用户仍须在插件最近任务中核对最终收件人、发送账号与话术并点击最终确认。",
+      "为选中的评论候选生成私信触达批次和固定话术预览。按所选范围交给插件去重、分组并校验当前发送额度，不另设 Agent 收件人数上限。用户修改收件人或话术时传 replacesPlanId，原待确认方案原子作废；已开始的任务不能静默替换，请按用户要求明确终止。此工具绝不会开始发送。必须在当前对话完整展示实际发送账号、去重后的全部收件人、原文和额度限制；用户可修改或取消，收到对最终方案的回复后调用 mediaclaw_confirm_comment_outreach。",
     annotations: toolAnnotations("准备评论触达方案"),
     execution: captureExecution,
     inputSchema: {
@@ -7413,6 +7444,42 @@ const tools = [
         async: {type: "boolean", default: false},
       },
       required: ["candidateIds", "message"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_set_comment_outreach_enabled",
+    description: "仅在用户明确要求开启或关闭评论触达时，记录本次授权并在 Agent 内调整开关。开启不准备或发送任何私信，仍需逐方案完整预览后确认；关闭会停止当前触达的剩余发送，已发送消息不撤回。先说明关闭影响，勿把泛泛营销目标当作开关授权。不能修改额度、间隔或其他风控设置，不引导插件操作。",
+    annotations: toolAnnotations("开启或关闭评论触达"),
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        enabled: {type: "boolean"},
+        authorization: conversationAuthorizationSchema,
+        async: {type: "boolean", default: false},
+      },
+      required: ["enabled", "authorization"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaclaw_confirm_comment_outreach",
+    description: "仅在当前对话完整展示 prepare 返回的发送账号、全部实际收件人、原文与限制，并收到用户明确回复后，确认发送冻结的私信方案。传原样 planId、confirmationToken 和 authorization.type=user_reply及用户原话；泛泛营销目标不算发送授权。无法修改收件人或话术，调整必须重新prepare/replacesPlanId；取消用cancel_comment_outreach。复用发送前身份、范围、额度、时效与一次消费检查，不引导插件点击。",
+    annotations: toolAnnotations("确认评论触达发送", {openWorldHint: true}),
+    execution: captureExecution,
+    inputSchema: {
+      type: "object",
+      properties: {
+        planId: {type: "string", minLength: 1},
+        confirmationToken: {type: "string", minLength: 1},
+        authorization: {...conversationAuthorizationSchema, properties: {
+          ...conversationAuthorizationSchema.properties,
+          type: {type: "string", enum: ["user_reply"]},
+        }},
+        async: {type: "boolean", default: false},
+      },
+      required: ["planId", "confirmationToken", "authorization"],
       additionalProperties: false,
     },
   },
@@ -7699,7 +7766,7 @@ const tools = [
 
 for (const tool of tools) {
   if (!COLLECTION_TOOL_NAMES.has(tool.name)) continue;
-  tool.description = "此入口只准备固定范围的方案，不启动采集；async、task 或 confirmed=true 不构成授权。返回 confirmation_required 后简要展示方案并调用 mediaclaw_confirm_collection 申请真实用户确认，多组用 planIds 一次申请；只有用户在对话确认框或插件按钮批准后执行，不要求聊天口令或逐组重复确认。原操作说明：" + tool.description;
+  tool.description = "此入口准备冻结方案，不启动采集；async、task、confirmed=true不构成授权。普通采集可在confirm_collection中记录当前用户具体请求而不重复问；模糊目标、范围扩展或较高风险先在对话展示可改方案、收到回复再执行，多组用planIds一次授权。不要求固定口令，不引导插件操作。原操作说明：" + tool.description;
 }
 
 async function executeCaptureTool(name, args) {
@@ -7912,6 +7979,22 @@ async function executeCaptureTool(name, args) {
       },
     });
   }
+  if (name === "mediaclaw_set_comment_outreach_enabled") {
+    const input = collectionArguments(tools.find((tool) => tool.name === name).inputSchema, args);
+    const authorization = validateConversationAuthorization(input.authorization);
+    return startSingleCapture("outreach", {...input, authorization,
+      options: {operation: "set_enabled", enabled: input.enabled},
+    });
+  }
+  if (name === "mediaclaw_confirm_comment_outreach") {
+    const input = collectionArguments(tools.find((tool) => tool.name === name).inputSchema, args);
+    const authorization = validateConversationAuthorization(input.authorization, {replyRequired: true});
+    return startSingleCapture("outreach", {
+      ...input,
+      options: {operation: "confirm", planId: input.planId, confirmationToken: input.confirmationToken},
+      authorization,
+    });
+  }
   if (name === "mediaclaw_cancel_comment_outreach") {
     return startSingleCapture("outreach", {
       ...args,
@@ -8053,7 +8136,10 @@ async function handleToolCall(params = {}) {
         return toolResult({ok: true, status: "rejected", ...(confirmation.planIds ? {planIds} : {planId: confirmation.planId}), collectionStarted: false});
       }
       if (!extensionPeer || !adapterSession(adapter)) throw collectionPlanError("EXTENSION_NOT_CONNECTED", "插件连接或设备配对未就绪，方案尚未执行");
-      return requestUserCollectionApproval(plans, adapter, params);
+      const authorization = confirmation.authorization ? validateConversationAuthorization(confirmation.authorization, {
+        replyRequired: !collectionApprovalPolicy(plans).explicitScopeRequestAllowed,
+      }) : null;
+      return await requestUserCollectionApproval(plans, adapter, params, authorization);
     } catch (error) {
       return toolResult({ok: false, error: {code: error.code || "INVALID_COLLECTION_CONFIRMATION", message: error.message}}, {isError: true});
     }
@@ -8071,7 +8157,7 @@ async function handleToolCall(params = {}) {
         ? "MediaClaw 插件已连接，可以开始采集"
         : awaitingPairing
           ? "设备已发现，等待用户在 MediaClaw 插件中批准配对"
-        : "尚未连接。请在 MediaClaw 插件设置中开启“允许本机 Agent 调用”";
+        : "浏览器执行端尚未连接；当前无法执行。我会在 Agent 中检查连接状态，已发出配对请求时仅需批准配对";
     return toolResult({
       ok: connected,
       connected,
@@ -8141,7 +8227,14 @@ async function handleToolCall(params = {}) {
         {isError: true},
       );
     }
-    return requestUserCollectionApproval([resolved.plan], adapter, params);
+    try {
+      const authorization = args.authorization ? validateConversationAuthorization(args.authorization, {
+        replyRequired: !collectionApprovalPolicy([resolved.plan]).explicitScopeRequestAllowed,
+      }) : null;
+      return await requestUserCollectionApproval([resolved.plan], adapter, params, authorization);
+    } catch (error) {
+      return toolResult({ok: false, collectionStarted: false, error: {code: error.code || "INVALID_COLLECTION_CONFIRMATION", message: error.message}}, {isError: true});
+    }
   }
   if (name === "mediaclaw_task_status") {
     const task = tasks.get(String(args.taskId || ""));
@@ -8210,7 +8303,7 @@ async function handleToolCall(params = {}) {
           code: extensionPeer ? "PAIRING_REQUIRED" : "EXTENSION_NOT_CONNECTED",
           message: extensionPeer
             ? "设备尚未获用户批准。请先在 MediaClaw 插件中完成配对。"
-            : "MediaClaw 插件尚未连接。请先在插件设置中开启“允许本机 Agent 调用”。",
+            : "浏览器执行端尚未连接，暂时无法执行；请保留当前对话，由 Agent 检查连接。仅已发出的配对请求需要你批准。",
         },
       },
       {isError: true},
@@ -8285,7 +8378,7 @@ async function registerAdapter(payload = {}) {
     instanceId,
     token,
     registeredAt: Date.now(),
-    collectionApprovalTransport: payload.collectionApprovalTransport === "mcp-elicitation-v1" ? "mcp-elicitation-v1" : "extension-ui-v1",
+    collectionApprovalTransport: payload.collectionApprovalTransport === "mcp-elicitation-v1" ? "mcp-elicitation-v1" : "conversation-v1",
     lastSeenAt: Date.now(),
   });
   adapterTokens.set(token, {hostKey, instanceId});
@@ -8295,7 +8388,7 @@ async function registerAdapter(payload = {}) {
     token,
     instanceId,
     brokerVersion: SERVER_VERSION,
-    collectionApprovalVersion: 2,
+    collectionApprovalVersion: 3,
     protocolVersion: PROTOCOL_VERSION,
     device: publicDevice(adapter),
   };
@@ -8402,7 +8495,7 @@ async function handleBridgeHttpRequest(request, response) {
   if (request.url === "/v1/collection-approvals/capability") {
     const instanceId = adapterTokens.get(payload.token)?.instanceId;
     adapter.instances.get(instanceId).collectionApprovalTransport = payload.transport === "mcp-elicitation-v1"
-      ? "mcp-elicitation-v1" : "extension-ui-v1";
+      ? "mcp-elicitation-v1" : "conversation-v1";
     sendJson(response, 200, {ok: true});
     return true;
   }

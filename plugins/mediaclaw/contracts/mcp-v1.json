@@ -5,9 +5,12 @@
   "protocolVersion": "3",
   "principles": {
     "agentUpdateRequiresUserApproval": true,
-    "allNewCollectionRequiresConfirmedPlan": true,
-    "collectionApprovalRequiresHostOrExtensionUserEvent": true,
-    "agentApproveOnlyRequestsUserConfirmation": true,
+    "allNewCollectionRequiresScopedAuthorization": true,
+    "collectionAuthorizationStaysInAgent": true,
+    "pairingIsOnlyExtensionUserAction": true,
+    "ordinaryExplicitScopeRequestMayAuthorizeCollection": true,
+    "conversationRelayIsNotIndependentUserEventProof": true,
+    "bareApproveOnlyRequestsUserConfirmation": true,
     "collectionDefaultsAreProposalsNotAuthorization": true,
     "collectionPlansAreFrozenOwnedExpiringAndOneTime": true,
     "rejectedOrReplacedPlansCannotExecute": true,
@@ -38,8 +41,8 @@
     "largeResultsUseChunkedExtensionTransport": true,
     "videoTranscriptRequiresOneTimeQuote": true,
     "destructiveDataClearRequiresPreviewToken": true,
-    "commentOutreachRequiresExtensionFinalConfirmation": true,
-    "agentCannotConfirmCommentOutreach": true,
+    "commentOutreachRequiresReviewedConversationApproval": true,
+    "commentOutreachConfirmationBoundToAgentSession": true,
     "videoTranscriptSupportsLocalExecution": false,
     "byokSupported": false
   },
@@ -53,7 +56,7 @@
     "paywallField": "paywall",
     "transcriptConfirmationField": "quoteId",
     "collectionPreparation": "Returns confirmation_required and collectionStarted=false; no browser task",
-    "collectionConfirmation": "mediaclaw_confirm_collection requests native client elicitation or extension UI approval for frozen planId/planIds; approve alone returns user_approval_required and never starts collection; one user event covers all declared groups"
+    "collectionConfirmation": "mediaclaw_confirm_collection accepts scoped conversation authorization (ordinary explicit user_request or post-preview user_reply) or requests native client elicitation; bare approve never starts collection; unsupported hosts ask in the current conversation, never the extension; one authorization covers declared groups and retries"
   },
   "tools": [
     {"name": "mediaclaw_get_capabilities", "kind": "control", "stability": "stable", "readOnly": true},
@@ -73,7 +76,9 @@
     {"name": "mediaclaw_enhance_records", "requiresCollectionPlan": true, "startsCollection": false, "kind": "capture", "stability": "stable", "requiresCredential": true, "confirmationArgument": "planId"},
     {"name": "mediaclaw_capture_comments", "requiresCollectionPlan": true, "startsCollection": false, "kind": "capture", "stability": "stable"},
     {"name": "mediaclaw_list_comment_outreach_candidates", "kind": "outreach", "stability": "stable", "externalWrite": false},
-    {"name": "mediaclaw_prepare_comment_outreach", "kind": "outreach", "stability": "stable", "startsSending": false, "requiresExtensionFinalConfirmation": true},
+    {"name": "mediaclaw_prepare_comment_outreach", "kind": "outreach", "stability": "stable", "startsSending": false, "requiresReviewedConversationApproval": true},
+    {"name": "mediaclaw_set_comment_outreach_enabled", "kind": "control", "stability": "stable", "startsSending": false, "requiresUserRequest": true},
+    {"name": "mediaclaw_confirm_comment_outreach", "kind": "outreach", "stability": "stable", "externalWrite": true, "requiresReviewedConversationApproval": true, "confirmationArgument": "confirmationToken"},
     {"name": "mediaclaw_cancel_comment_outreach", "kind": "outreach", "stability": "stable", "startsSending": false, "requiresUserRequest": true},
     {"name": "mediaclaw_get_comment_outreach_status", "kind": "outreach", "stability": "stable", "externalWrite": false},
     {"name": "mediaclaw_preview_clear_data", "kind": "control", "stability": "stable"},

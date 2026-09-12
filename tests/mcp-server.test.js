@@ -1711,6 +1711,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "mediaclaw_capture_search_basic",
     "mediaclaw_connection_status",
     "mediaclaw_confirm_collection",
+    "mediaclaw_confirm_comment_outreach",
     "mediaclaw_confirm_profile_collection",
     "mediaclaw_deep_collect",
     "mediaclaw_enhance_records",
@@ -1775,12 +1776,13 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.ok(toolNames.includes("mediaclaw_prepare_comment_outreach"));
   assert.ok(toolNames.includes("mediaclaw_cancel_comment_outreach"));
   assert.ok(toolNames.includes("mediaclaw_get_comment_outreach_status"));
-  assert.equal(toolNames.includes("mediaclaw_confirm_comment_outreach"), false);
+  assert.equal(toolNames.includes("mediaclaw_confirm_comment_outreach"), true);
   const prepareOutreachTool = toolList.result.tools.find(
     (tool) => tool.name === "mediaclaw_prepare_comment_outreach",
   );
   assert.match(prepareOutreachTool.description, /绝不会开始发送/);
-  assert.match(prepareOutreachTool.description, /最终确认/);
+  assert.match(prepareOutreachTool.description, /当前对话完整展示实际发送账号/);
+  assert.match(prepareOutreachTool.description, /mediaclaw_confirm_comment_outreach/);
   assert.equal(prepareOutreachTool.inputSchema.properties.candidateIds.maxItems, undefined);
   assert.equal(prepareOutreachTool.inputSchema.properties.replacesPlanId.type, "string");
 

@@ -7,11 +7,13 @@ import test from "node:test";
 import MCP_CONTRACT from "../plugins/mediaclaw/contracts/mcp-v1.json" with {type: "json"};
 
 // Exercise the real stdio Adapter against an isolated fake Broker. Only the
-// fixture's explicit client responses represent the user, never tool arguments.
+// fixture's explicit client responses represent native UI events. Relayed user
+// text is a separate, weaker authorization source evaluated by the Broker.
 async function fixture(t, {
   capabilities = {elicitation: {form: {}}}, protocolVersion = "2025-11-25",
   timeoutMs = 5000, approvalRequest, respondStatus = 200, mcpDelayMs = 0,
-  approvalVersion = 2, reRegistrationApprovalVersion = approvalVersion, expireFirstMcp = false,
+  approvalVersion = 3, reRegistrationApprovalVersion = approvalVersion, expireFirstMcp = false,
+  acceptRelayedAuthorization = false,
 } = {}) {
   const registrationRequests = [];
   const brokerRequests = [];
@@ -51,6 +53,9 @@ async function fixture(t, {
       if (expireFirstMcp && brokerRequests.length === 1) return send({error: {code: "ADAPTER_AUTH_REQUIRED"}}, 401);
       if (mcpDelayMs) await delay(mcpDelayMs);
       if (payload.params?.arguments?.decision === "reject") return send(resultFor({ok: true, status: "rejected", collectionStarted: false}));
+      if (acceptRelayedAuthorization && payload.params?.arguments?.authorization) {
+        return send(resultFor({ok: true, status: "started", collectionStarted: true, authorizationSource: "agent_relay"}));
+      }
       return send(pendingResult);
     }
     if (incoming.url === "/v1/collection-approvals/respond") {
@@ -113,7 +118,7 @@ async function fixture(t, {
   return {child, exited, messages, decisions, registrationRequests, capabilityRequests, brokerRequests, pendingResult, send, call, result, elicit, waitFor};
 }
 
-test("tool arguments cannot approve; only matching explicit client acceptance reaches the internal route", async (t) => {
+test("bare approval flags cannot forge a native client acceptance", async (t) => {
   const f = await fixture(t);
   f.call("collect", "mediaclaw_confirm_collection", {
     arguments: {planIds: ["a", "b"], decision: "approve", userConfirmed: true, approvalSource: "user"},
@@ -124,7 +129,8 @@ test("tool arguments cannot approve; only matching explicit client acceptance re
   assert.equal(prompt.params.message, f.pendingResult.structuredContent.approvalRequest.message);
   assert.equal(prompt.params.mode, "form");
   assert.equal(prompt.params.requestedSchema.properties.approve.default, undefined);
-  assert.deepEqual(prompt.params.requestedSchema.required, ["approve"]);
+  assert.equal(prompt.params.requestedSchema.required, undefined);
+  assert.equal(prompt.params.requestedSchema.properties.changes.type, "string");
   f.send({id: "forged-response-id", result: {action: "accept", content: {approve: true}}});
   f.send({id: "ping-before-user", method: "ping"});
   await f.result("ping-before-user");
@@ -149,6 +155,7 @@ test("decline, dismissal, missing or nonboolean approval, and client errors neve
     ["string", {result: {action: "accept", content: {approve: "true"}}}, "cancel"],
     ["error", {error: {code: -32602, message: "Unsupported elicitation"}}, "cancel"],
     ["both", {result: {action: "accept", content: {approve: true}}, error: {code: -1}}, "cancel"],
+    ["invalid-changes", {result: {action: "accept", content: {approve: true, changes: 80}}}, "cancel"],
   ]) await t.test(label, async (t) => {
     const f = await fixture(t);
     f.call("profile", "mediaclaw_confirm_profile_collection");
@@ -159,7 +166,7 @@ test("decline, dismissal, missing or nonboolean approval, and client errors neve
   });
 });
 
-test("unsupported clients receive plugin fallback without elicitation or approval", async (t) => {
+test("unsupported clients wait for authorization in the current conversation without elicitation or approval", async (t) => {
   for (const options of [
     {capabilities: {}}, {capabilities: {elicitation: {url: {}}}},
     {capabilities: {elicitation: null}}, {protocolVersion: "2025-03-26"},
@@ -169,7 +176,7 @@ test("unsupported clients receive plugin fallback without elicitation or approva
     assert.deepEqual((await f.result("unsupported")).result, f.pendingResult);
     assert.equal(f.messages.some((message) => message.method === "elicitation/create"), false);
     assert.equal(f.decisions.length, 0);
-    assert.equal(f.capabilityRequests.at(-1).transport, "extension-ui-v1");
+    assert.equal(f.capabilityRequests.at(-1).transport, "conversation-v1");
   });
 });
 
@@ -262,12 +269,12 @@ test("an uncertain Broker execution response is not retried or reported as unsta
   assert.equal(f.messages.filter((message) => message.method === "elicitation/create").length, 1);
 });
 
-test("a Broker without approval protocol v2 cannot receive any collection or confirm-approve call", async (t) => {
+test("a Broker without approval protocol v3 cannot receive any collection or confirm-approve call", async (t) => {
   const f = await fixture(t, {approvalVersion: null});
   const rawCollections = MCP_CONTRACT.tools.filter((tool) => tool.requiresCollectionPlan === true).map((tool) => tool.name);
   assert.equal(rawCollections.length, 18);
-  for (const [index, name] of [...rawCollections, "mediaclaw_confirm_collection", "mediaclaw_confirm_profile_collection"].entries()) {
-    f.call(`old-${index}`, name, {arguments: {planId: "old", confirmed: true, async: true}, _meta: {collectionApprovalVersion: 2}});
+  for (const [index, name] of [...rawCollections, "mediaclaw_confirm_collection", "mediaclaw_confirm_profile_collection", "mediaclaw_confirm_comment_outreach", "mediaclaw_set_comment_outreach_enabled"].entries()) {
+    f.call(`old-${index}`, name, {arguments: {planId: "old", confirmed: true, async: true}, _meta: {collectionApprovalVersion: 3}});
     const result = (await f.result(`old-${index}`)).result;
     assert.equal(result.isError, true);
     assert.equal(result.structuredContent.collectionStarted, false);
@@ -285,7 +292,7 @@ test("a Broker without approval protocol v2 cannot receive any collection or con
 });
 
 test("re-registration rechecks approval support before retrying against another Broker", async (t) => {
-  const f = await fixture(t, {expireFirstMcp: true, reRegistrationApprovalVersion: null});
+  const f = await fixture(t, {expireFirstMcp: true, reRegistrationApprovalVersion: 2});
   f.call("restart-to-legacy");
   const result = (await f.result("restart-to-legacy")).result.structuredContent;
   assert.equal(result.error.code, "COLLECTION_APPROVAL_RUNTIME_UPGRADE_REQUIRED");
@@ -293,4 +300,81 @@ test("re-registration rechecks approval support before retrying against another 
   assert.equal(f.registrationRequests.length, 2);
   assert.equal(f.brokerRequests.length, 1, "the initial unauthorized call must not be retried into an older Broker");
   assert.equal(f.decisions.length, 0);
+});
+
+test("a Broker-accepted specific user request returns without another native confirmation", async (t) => {
+  const f = await fixture(t, {acceptRelayedAuthorization: true});
+  const authorization = {type: "user_request", userMessage: "采集小红书营养测评近半年按点赞排的80条基础结果"};
+  f.call("already-authorized", "mediaclaw_confirm_collection", {
+    arguments: {planId: "frozen-plan", decision: "approve", authorization},
+  });
+  const result = (await f.result("already-authorized")).result.structuredContent;
+  assert.equal(result.collectionStarted, true);
+  assert.equal(result.authorizationSource, "agent_relay");
+  assert.deepEqual(f.brokerRequests[0].params.arguments.authorization, authorization);
+  assert.equal(f.messages.some((message) => message.method === "elicitation/create"), false);
+  assert.equal(f.decisions.length, 0, "relayed evidence must not be relabeled as a native user event");
+});
+
+test("without native forms, the plan remains in the conversation until a relayed user reply", async (t) => {
+  const f = await fixture(t, {capabilities: {}, acceptRelayedAuthorization: true});
+  f.call("show-plan");
+  assert.equal((await f.result("show-plan")).result.structuredContent.collectionStarted, false);
+  assert.equal(f.capabilityRequests[0].transport, "conversation-v1");
+  const authorization = {type: "user_reply", userMessage: "好，按这个范围来"};
+  f.call("user-replied", "mediaclaw_confirm_collection", {
+    arguments: {planId: "frozen-plan", decision: "approve", authorization},
+  });
+  assert.equal((await f.result("user-replied")).result.structuredContent.collectionStarted, true);
+  assert.equal(f.messages.some((message) => message.method === "elicitation/create"), false);
+  assert.equal(f.decisions.length, 0);
+  assert.deepEqual(f.brokerRequests.at(-1).params.arguments.authorization, authorization);
+});
+
+test("native change requests cancel execution first and preserve the original plan references", async (t) => {
+  for (const [label, name, args, content, nextTool] of [
+    ["single-even-with-approval", "mediaclaw_confirm_collection", {planId: "single-plan"}, {approve: true, changes: " 改成近一周20条 "}, "mediaclaw_prepare_collection"],
+    ["profile-without-approval", "mediaclaw_confirm_profile_collection", {planId: "profile-plan"}, {changes: "只要10条基础作品"}, "mediaclaw_prepare_profile_collection"],
+    ["batch", "mediaclaw_confirm_collection", {planIds: ["first", "second"]}, {approve: true, changes: "第二组换成抖音"}, "mediaclaw_prepare_collection"],
+  ]) await t.test(label, async (t) => {
+    const f = await fixture(t);
+    f.call("revise", name, {arguments: {decision: "approve", ...args}});
+    const prompt = await f.elicit();
+    assert.equal(prompt.params.requestedSchema.required, undefined);
+    f.send({id: prompt.id, result: {action: "accept", content}});
+    const result = (await f.result("revise")).result.structuredContent;
+    assert.equal(result.status, "revision_requested");
+    assert.equal(result.collectionStarted, false);
+    assert.equal(result.requestedChanges, content.changes.trim());
+    assert.equal(result.nextTool, nextTool);
+    assert.equal(result.cancellationConfirmed, true);
+    if (args.planId) {
+      assert.equal(result.planId, args.planId);
+      assert.equal(result.replacesPlanId, args.planId);
+    } else assert.deepEqual(result.planIds, args.planIds);
+    assert.deepEqual(f.decisions.map((item) => item.decision), ["cancel"]);
+  });
+});
+
+test("empty changes allow explicit approval, while lost cancellation preserves the requested revision", async (t) => {
+  await t.test("empty-changes", async (t) => {
+    const f = await fixture(t);
+    f.call("empty-changes");
+    const prompt = await f.elicit();
+    f.send({id: prompt.id, result: {action: "accept", content: {approve: true, changes: "   "}}});
+    assert.equal((await f.result("empty-changes")).result.structuredContent.collectionStarted, true);
+  });
+  await t.test("lost-cancellation", async (t) => {
+    const f = await fixture(t, {respondStatus: 503});
+    f.call("revise-lost");
+    const prompt = await f.elicit();
+    f.send({id: prompt.id, result: {action: "accept", content: {changes: "只要20条"}}});
+    const result = (await f.result("revise-lost")).result.structuredContent;
+    assert.equal(result.status, "revision_requested");
+    assert.equal(result.requestedChanges, "只要20条");
+    assert.equal(result.collectionStarted, false);
+    assert.equal(result.cancellationConfirmed, false);
+    assert.equal(result.nextTool, "mediaclaw_task_status");
+    assert.deepEqual(f.decisions.map((item) => item.decision), ["cancel"]);
+  });
 });

@@ -9,8 +9,8 @@ import test from "node:test";
 import MCP_CONTRACT from "../plugins/mediaclaw/contracts/mcp-v1.json" with {type: "json"};
 
 // This fixture only speaks to a fresh Broker and a fake extension on loopback.
-// Public confirm calls only request approval. Successful fixtures separately
-// simulate a host user response over the internal Adapter response lane.
+// Bare public confirm calls only request approval. Fixtures separately simulate
+// host events or supply explicitly labeled Agent-relayed conversation evidence.
 const NOTE_URL = "https://www.xiaohongshu.com/explore/consent-fixture";
 const PROFILE_URL = "https://www.xiaohongshu.com/user/profile/consent-fixture";
 const RAW_COLLECTIONS = [
@@ -277,23 +277,29 @@ test("profile approval and cancelling a pending confirmation task cannot bypass 
   assert.equal(f.starts.length, 0);
 });
 
-test("extension fallback requires the paired UI response and cannot be approved by the MCP response lane", async (t) => {
+test("unsupported native clients stay in conversation and ignore former extension approval messages", async (t) => {
   const f = await fixture(t);
-  await f.post("/v1/collection-approvals/capability", {token: f.owner.token, transport: "extension-ui-v1"});
+  await f.post("/v1/collection-approvals/capability", {token: f.owner.token, transport: "conversation-v1"});
   const messages = [];
   f.socket.addEventListener("message", (event) => messages.push(JSON.parse(String(event.data))));
-  const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "插件确认", limit: 1});
+  const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "对话确认", limit: 1});
   const pending = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", async: true});
-  const request = await waitUntil(() => messages.find((m) => m.type === "collection.approval.request"), "Approval card not sent");
-  failsWith(await f.respondApproval(request.requestId), /COLLECTION_APPROVAL_OWNER_MISMATCH/);
-  f.socket.send(JSON.stringify({type: "collection.approval.response", requestId: request.requestId,
-    deviceId: request.deviceId, sessionId: "wrong-session", decision: "approve"}));
+  assert.equal(pending.structuredContent.approvalRequest.transport, "conversation-v1");
+  assert.equal(pending.structuredContent.nextAction.type, "ask_in_conversation");
+  assert.equal(pending.structuredContent.approvalRequest.extensionSupported, undefined);
+  const requestId = pending.structuredContent.approvalRequest.requestId;
+  failsWith(await f.respondApproval(requestId), /COLLECTION_APPROVAL_OWNER_MISMATCH/);
+  f.socket.send(JSON.stringify({type: "collection.approval.response", requestId,
+    deviceId: f.owner.device.deviceId, sessionId: "isolated-consent-session", decision: "approve"}));
   await delay(20);
+  assert.equal(messages.some((message) => message.type.startsWith("collection.approval.")), false);
   assert.equal(f.starts.length, 0);
-  f.socket.send(JSON.stringify({type: "collection.approval.response", requestId: request.requestId,
-    deviceId: request.deviceId, sessionId: request.sessionId, decision: "approve"}));
-  await waitUntil(() => f.starts.length === 1, "User-approved capture not started");
-  await waitUntil(async () => (await f.call("mediaclaw_task_status", {taskId: pending.structuredContent.taskId})).structuredContent.task.status === "completed", "Approval task did not mirror result");
+  const approved = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", async: true,
+    authorization: {type: "user_reply", userMessage: "就按这个范围查吧"}});
+  assert.equal(approved.structuredContent.ok, true);
+  await waitUntil(() => f.starts.length === 1, "Conversation approval did not execute");
+  failsWith(await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve",
+    authorization: {type: "user_reply", userMessage: "就按这个范围查吧"}}), /COLLECTION_PLAN_ALREADY_USED/);
   assert.equal(f.starts.length, 1);
 });
 
@@ -301,16 +307,141 @@ test("changing confirmation transport or closing the owning session invalidates 
   const f = await fixture(t);
   const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "切换确认入口", limit: 1});
   const original = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
-  await f.post("/v1/collection-approvals/capability", {token: f.owner.token, transport: "extension-ui-v1"});
+  await f.post("/v1/collection-approvals/capability", {token: f.owner.token, transport: "conversation-v1"});
   const replacement = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
   assert.notEqual(replacement.structuredContent.approvalRequest.requestId, original.structuredContent.approvalRequest.requestId);
-  assert.equal(replacement.structuredContent.approvalRequest.transport, "extension-ui-v1");
+  assert.equal(replacement.structuredContent.approvalRequest.transport, "conversation-v1");
   failsWith(await f.respondApproval(original.structuredContent.approvalRequest.requestId), /COLLECTION_APPROVAL_OWNER_MISMATCH|COLLECTION_APPROVAL_ALREADY_CLOSED/);
   await f.post("/v1/adapters/unregister", {token: f.owner.token});
   f.socket.send(JSON.stringify({type: "collection.approval.response", requestId: replacement.structuredContent.approvalRequest.requestId,
     deviceId: f.owner.device.deviceId, sessionId: "isolated-consent-session", decision: "approve"}));
   await delay(30);
   assert.equal(f.starts.length, 0);
+});
+
+test("ordinary explicit user requests execute once without a second approval and keep relay provenance", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "明确范围", limit: 2, timeRange: "7d"});
+  assert.equal(plan.authorizationPolicy.explicitScopeRequestAllowed, true);
+  const authorization = {type: "user_request", userMessage: "采集小红书明确范围，近一周2条基础结果，不打开详情"};
+  const result = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", authorization});
+  completed(result);
+  assert.equal(result.structuredContent.approvalRequest, undefined);
+  assert.equal(f.starts.length, 1);
+  const snapshots = await f.persistedTasks();
+  const actual = snapshots.find((task) => task.taskId === f.starts[0].taskId);
+  assert.equal(actual.collectionConsent.source, "conversation-v1");
+  assert.equal(actual.collectionConsent.userEventVerified, false, "Agent relay must not masquerade as independent user-event proof");
+  assert.deepEqual(actual.collectionConsent.authorization, authorization);
+  assert.equal(actual.collectionConsent.planId, plan.planId);
+});
+
+test("a conversation reply uses its current async preference when reusing the pending request", async (t) => {
+  const f = await fixture(t, {responseDelayMs: () => 150});
+  await f.post("/v1/collection-approvals/capability", {token: f.owner.token, transport: "conversation-v1"});
+  const plan = await f.prepare("mediaclaw_capture_note", {url: NOTE_URL});
+  const pending = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve"});
+  const approved = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", async: true,
+    authorization: {type: "user_reply", userMessage: "就采集这一篇"}});
+  assert.equal(approved.structuredContent.ok, true);
+  assert.ok(approved.structuredContent.taskId);
+  assert.notEqual(approved.structuredContent.task.status, "completed");
+  assert.notEqual(approved.structuredContent.taskId, pending.structuredContent.taskId);
+  await f.call("mediaclaw_cancel_task", {taskId: approved.structuredContent.taskId});
+});
+
+test("empty or synthetic conversation evidence is rejected before collection", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.prepare("mediaclaw_capture_note", {url: NOTE_URL});
+  for (const authorization of [{}, {type: "user_reply", userMessage: "   "},
+    {type: "agent_inference", userMessage: "目标一致"},
+    {type: "user_reply", userMessage: "同意", verifiedByHost: true}]) {
+    const result = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", authorization});
+    assert.equal(result.isError, true);
+  }
+  assert.equal(f.starts.length, 0);
+});
+
+test("risk is checked across the complete batch and elevated scopes require a reviewed reply", async (t) => {
+  const f = await fixture(t);
+  const plans = await Promise.all(["第一组", "第二组", "第三组", "第四组"].map((keyword) => f.prepare("mediaclaw_capture_search_basic", {keyword, limit: 300})));
+  const args = {planIds: plans.map((plan) => plan.planId), decision: "approve"};
+  failsWith(await f.call("mediaclaw_confirm_collection", {...args,
+    authorization: {type: "user_request", userMessage: "这四组各采300条"}}), /PLAN_REVIEW_REQUIRED/);
+  assert.equal(f.starts.length, 0);
+  const result = await f.call("mediaclaw_confirm_collection", {...args,
+    authorization: {type: "user_reply", userMessage: "看过总计1200条和分批风险，同意按这四组执行"}});
+  completed(result);
+  assert.deepEqual(f.starts.map((message) => message.task.keyword), ["第一组", "第二组", "第三组", "第四组"]);
+});
+
+test("conversation revision invalidates the old plan and executes only the adjusted scope", async (t) => {
+  const f = await fixture(t);
+  const original = await f.prepare("mediaclaw_capture_search_basic", {keyword: "调整样本", limit: 80, timeRange: "6m"});
+  const pending = await f.call("mediaclaw_confirm_collection", {planId: original.planId, decision: "approve"});
+  const revised = await f.prepare("mediaclaw_capture_search_basic", {keyword: "调整样本", limit: 5, timeRange: "7d"}, {replacesPlanId: original.planId});
+  failsWith(await f.respondApproval(pending.structuredContent.approvalRequest.requestId), /COLLECTION_APPROVAL_ALREADY_CLOSED/);
+  const authorization = {type: "user_reply", userMessage: "改成近一周5条基础结果，直接查吧"};
+  failsWith(await f.call("mediaclaw_confirm_collection", {planId: original.planId, decision: "approve", authorization}), /COLLECTION_PLAN_REPLACED/);
+  await f.call("mediaclaw_confirm_collection", {planId: revised.planId, decision: "approve", authorization});
+  assert.equal(f.starts.length, 1);
+  assert.equal(f.starts[0].task.limit, 5);
+  assert.equal(f.starts[0].task.options.timeRange, "7d");
+});
+
+test("account collection also accepts specific ordinary conversation authorization", async (t) => {
+  const f = await fixture(t);
+  const plan = (await f.call("mediaclaw_prepare_profile_collection", {
+    userGoal: "采集该账号最新1条链接", profileUrl: PROFILE_URL, purpose: "inventory_export",
+    contentType: "all", coverage: "recent", maxItems: 1, requestedFields: ["post_page_url"],
+  })).structuredContent.plan;
+  assert.equal(plan.authorizationPolicy.explicitScopeRequestAllowed, true);
+  const result = await f.call("mediaclaw_confirm_profile_collection", {planId: plan.planId,
+    authorization: {type: "user_request", userMessage: "采集该账号最新1条作品链接，不打开详情"}});
+  completed(result);
+  assert.equal(f.starts.length, 1);
+});
+
+test("outreach confirmation requires a post-preview reply and forwards only frozen execution inputs", async (t) => {
+  const f = await fixture(t, {responseFor: () => ({ok: true, sendingStarted: true, scheduled: false,
+    confirmationRequired: false, data: {plan: {planId: "outreach-fixture", status: "running"}}})});
+  const args = {planId: "outreach-fixture", confirmationToken: "review-token"};
+  for (const extra of [{}, {authorization: {type: "user_request", userMessage: "帮我联系客户"}},
+    {authorization: {type: "user_reply", userMessage: " "}},
+    {authorization: {type: "user_reply", userMessage: "同意"}, message: "偷换内容"}]) {
+    const result = await f.call("mediaclaw_confirm_comment_outreach", {...args, ...extra});
+    assert.ok(result.error || result.isError, JSON.stringify(result));
+  }
+  assert.equal(f.starts.length, 0);
+  const result = await f.call("mediaclaw_confirm_comment_outreach", {...args,
+    authorization: {type: "user_reply", userMessage: "已核对发送账号、名单和原文，发送吧"}});
+  completed(result);
+  assert.equal(result.structuredContent.result.sendingStarted, true);
+  assert.equal(result.structuredContent.result.scheduled, false);
+  assert.equal(result.structuredContent.result.confirmationRequired, false);
+  assert.equal(f.starts.length, 1);
+  assert.equal(f.starts[0].task.mode, "outreach");
+  assert.equal(f.starts[0].task.options.operation, "confirm");
+  assert.equal(f.starts[0].task.options.planId, args.planId);
+  assert.equal(f.starts[0].task.options.confirmationToken, args.confirmationToken);
+  assert.equal(f.starts[0].task.options.message, undefined);
+});
+
+test("outreach enablement needs explicit authorization and cannot alter policy limits", async (t) => {
+  const f = await fixture(t);
+  for (const args of [{enabled: true}, {enabled: "true", authorization: {type: "user_request", userMessage: "开启"}},
+    {enabled: true, dailyLimit: 99999, authorization: {type: "user_request", userMessage: "开启"}}]) {
+    const result = await f.call("mediaclaw_set_comment_outreach_enabled", args);
+    assert.ok(result.error || result.isError, JSON.stringify(result));
+  }
+  assert.equal(f.starts.length, 0);
+  await f.call("mediaclaw_set_comment_outreach_enabled", {enabled: true,
+    authorization: {type: "user_reply", userMessage: "开启评论触达，但先给我看发送方案"}});
+  assert.equal(f.starts.length, 1);
+  assert.equal(f.starts[0].task.mode, "outreach");
+  assert.equal(f.starts[0].task.options.operation, "set_enabled");
+  assert.equal(f.starts[0].task.options.enabled, true);
+  assert.equal(f.starts[0].task.options.confirmationToken, undefined);
 });
 
 test("all 18 raw collection entry points and aliases only propose, including async and MCP Tasks", async (t) => {
