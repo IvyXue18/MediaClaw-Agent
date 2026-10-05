@@ -250,6 +250,8 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   const child = spawn(process.execPath, [serverPath], {
     env: {
       ...process.env,
+      // Pin the host: auto-detection would pick whichever Agent runs the tests.
+      MEDIACLAW_AGENT_HOST: "codex",
       // this is the Codex bridge test: pin the host so running the suite inside another Agent (e.g. Claude Code) does not change it
       MEDIACLAW_AGENT_HOST: "codex",
       MEDIACLAW_AGENT_PORT: String(port),
@@ -3372,7 +3374,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   assert.equal(noTranscriptVideo.coverage.transcriptDecision, "not_needed");
 
   const satellite = spawn(process.execPath, [serverPath], {
-    env: {...process.env, MEDIACLAW_AGENT_PORT: String(port)},
+    env: {...process.env, MEDIACLAW_AGENT_HOST: "codex", MEDIACLAW_AGENT_PORT: String(port)},
     stdio: ["pipe", "pipe", "pipe"],
   });
   t.after(() => {
@@ -3858,6 +3860,7 @@ test("local asset tasks expire instead of blocking the queue across restarts", a
   const child = spawn(process.execPath, [serverPath], {
     env: {
       ...process.env,
+      MEDIACLAW_AGENT_HOST: "codex",
       MEDIACLAW_AGENT_PORT: String(port),
       MEDIACLAW_AGENT_STATE_DIR: agentStateDir,
       MEDIACLAW_AGENT_BROKER_IDLE_MS: "5000",
