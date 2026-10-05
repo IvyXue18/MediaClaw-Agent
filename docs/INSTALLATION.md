@@ -11,7 +11,7 @@ MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户�
 
 ## 第二步：把安装交给 Agent
 
-在 Codex 或 WorkBuddy 的新对话中直接发送：
+在 Codex、WorkBuddy 或 Claude Code 的新对话中直接发送：
 
 > 请从 https://github.com/IvyXue18/MediaClaw-Agent 通过当前宿主的 marketplace 安装、升级或修复 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。平台和芯片识别、官方运行时准备、SHA-256 校验及连接复查都由你完成；不要让我下载 ZIP、选择 `.exe` 或使用终端。
 
@@ -26,6 +26,12 @@ Agent 负责识别宿主、注册官方 marketplace 和安装接入包。接入�
 Agent 应先核实 WorkBuddy 的实际用户数据目录，每次调用内置 CLI 都通过 `CODEBUDDY_CONFIG_DIR` 指向同一目录（WorkBuddy AI 常见为 `~/.workbuddy-ai`）。先用插件与市场列表确认操作的是当前 WorkBuddy，避免写到独立 CodeBuddy 的配置目录。市场已注册时仍需确认官方来源并刷新，再安装或更新 `mediaclaw@mediaclaw-agent`，通过宿主列表复查实际版本、安装路径和启用状态。上述操作由 Agent 执行，不要求用户输入终端或斜杠命令，也不能靠手写安装记录代替宿主安装。
 
 安装能力与会话管理能力应分别检查。缺少自动新建会话能力时，Agent 仍应先完成安装、启用和验版，再说明必要的重开或新会话动作。没有实际创建续接会话或设置续接机制时，不能承诺新会话会自行开始检查。如果内置 CLI 也确实不可用，Agent 应简短说明具体失败点，并按当前界面给出最少操作步骤。
+
+### Claude Code
+
+Claude Code（终端、桌面版 Code 标签和 IDE 扩展）使用同一个官方 marketplace。Agent 通过 Claude Code 自带的插件命令注册 `IvyXue18/MediaClaw-Agent` 并安装 `mediaclaw@mediaclaw-agent`，再用插件列表复查实际版本和启用状态；这些命令由 Agent 执行，不要求用户输入。Claude Code 不会给已经开始的会话热加载刚安装的插件，安装后需要新开一个会话（或重启 Claude Code）才会出现社媒虾工具；Agent 应明确说明这一步。
+
+Claude Code 的终端、桌面版和 IDE 共用同一个设备身份，在浏览器插件中批准一次即可。
 
 ## 豆包工作本地开发接入
 
@@ -60,7 +66,7 @@ Agent 应先核实 WorkBuddy 的实际用户数据目录，每次调用内置 CL
 
 ## 后续更新
 
-在已有 MediaClaw 的 Codex 或 WorkBuddy 对话中直接说“升级 MediaClaw Agent”即可。这句话本身代表明确授权；Agent 会自行刷新官方 marketplace、安装、核验版本并保存原任务，不向用户展示或要求用户执行终端、CLI、斜杠命令、缓存清理或路径操作。
+在已有 MediaClaw 的 Codex、WorkBuddy 或 Claude Code 对话中直接说“升级 MediaClaw Agent”即可。这句话本身代表明确授权；Agent 会自行刷新官方 marketplace、安装、核验版本并保存原任务，不向用户展示或要求用户执行终端、CLI、斜杠命令、缓存清理或路径操作。
 
 安装完成后必须完全退出并重新打开当前宿主。运行中的旧对话不能热加载新 Skill/MCP，同一进程里再建对话也不能作为新版生效证据。重开后只有状态显示新版已经真实激活，才会自动继续原任务；已有设备批准默认复用。正式版更新只跟随正式 Release，不跟随 prerelease。
 

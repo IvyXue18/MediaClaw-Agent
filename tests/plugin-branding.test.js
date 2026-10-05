@@ -41,10 +41,11 @@ test("MediaClaw host surfaces share the canonical MC logo", () => {
   assert.equal(workbuddySkillMeta.iconSource, "https://mediaclaw.app/logo.png");
 });
 
-test("published host entry points exclude unfinished Claude support", () => {
-  assert.equal(fs.existsSync(path.join(projectRoot, ".claude-plugin")), false);
-  assert.equal(fs.existsSync(path.join(pluginRoot, ".claude-plugin")), false);
-  assert.equal(fs.existsSync(path.join(pluginRoot, ".mcp.claude.json")), false);
+test("Claude Code entry points ship while Claude Desktop extension stays unpublished", () => {
+  assert.equal(fs.existsSync(path.join(projectRoot, ".claude-plugin", "marketplace.json")), true);
+  assert.equal(fs.existsSync(path.join(pluginRoot, ".claude-plugin", "plugin.json")), true);
+  assert.equal(fs.existsSync(path.join(pluginRoot, ".mcp.claude.json")), true);
+  // Claude Desktop Chat (.mcpb manifest) is not released yet
   assert.equal(fs.existsSync(path.join(pluginRoot, "manifest.json")), false);
   assert.equal(
     fs.existsSync(path.join(pluginRoot, ".mcp.doubao-work.json")),
@@ -55,6 +56,7 @@ test("published host entry points exclude unfinished Claude support", () => {
 test("all supported Agent hosts inherit the broad default MediaClaw trigger", () => {
   const codexPlugin = readJson(".codex-plugin/plugin.json");
   const workbuddyPlugin = readJson(".codebuddy-plugin/plugin.json");
+  const claudePlugin = readJson(".claude-plugin/plugin.json");
   const skill = fs.readFileSync(
     path.join(pluginRoot, "skills/mediaclaw-content-research/SKILL.md"),
     "utf8",
@@ -67,6 +69,7 @@ test("all supported Agent hosts inherit the broad default MediaClaw trigger", ()
   for (const description of [
     codexPlugin.description,
     workbuddyPlugin.description,
+    claudePlugin.description,
     skill,
     adapter,
   ]) {

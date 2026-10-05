@@ -32,6 +32,8 @@ if [ -n "${PLUGIN_DATA:-}" ]; then
   RUNTIME_ROOT="$PLUGIN_DATA/runtime/$RELEASE_VERSION"
 elif [ -n "${CODEBUDDY_PLUGIN_DATA:-}" ]; then
   RUNTIME_ROOT="$CODEBUDDY_PLUGIN_DATA/runtime/$RELEASE_VERSION"
+elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  RUNTIME_ROOT="$CLAUDE_PLUGIN_DATA/runtime/$RELEASE_VERSION"
 else
   RUNTIME_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/mediaclaw-agent/runtime/$RELEASE_VERSION"
 fi
