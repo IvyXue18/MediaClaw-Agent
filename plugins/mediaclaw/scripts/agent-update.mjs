@@ -50,6 +50,17 @@ const CODEX_CLI_FALLBACKS = [
   "/usr/bin/codex",
 ].filter(Boolean);
 
+const CLAUDE_CLI_FALLBACKS = [
+  process.env.CLAUDE_CLI_PATH,
+  process.env.HOME && path.join(process.env.HOME, ".local", "bin", "claude"),
+  process.env.HOME && path.join(process.env.HOME, ".claude", "local", "claude"),
+  process.env.APPDATA && path.join(process.env.APPDATA, "npm", "claude.cmd"),
+  process.env.USERPROFILE && path.join(process.env.USERPROFILE, ".local", "bin", "claude.exe"),
+  "/opt/homebrew/bin/claude",
+  "/usr/local/bin/claude",
+  "/usr/bin/claude",
+].filter(Boolean);
+
 export const AGENT_UPDATE_TOOL = {
   name: "mediaclaw_manage_agent_update",
   description:
@@ -140,6 +151,28 @@ function updateCommandPlan(hostKey) {
       verify: {
         file: "codebuddy",
         fallbackFiles: WORKBUDDY_CLI_FALLBACKS,
+        args: ["plugin", "list", "--json"],
+      },
+    };
+  }
+  if (hostKey === "claude") {
+    // `plugin update` needs --yes when stdin/stdout is not a TTY (always true inside the Adapter)
+    return {
+      commands: [
+        {
+          file: "claude",
+          fallbackFiles: CLAUDE_CLI_FALLBACKS,
+          args: ["plugin", "marketplace", "update", MARKETPLACE_NAME],
+        },
+        {
+          file: "claude",
+          fallbackFiles: CLAUDE_CLI_FALLBACKS,
+          args: ["plugin", "update", PLUGIN_SELECTOR, "--yes"],
+        },
+      ],
+      verify: {
+        file: "claude",
+        fallbackFiles: CLAUDE_CLI_FALLBACKS,
         args: ["plugin", "list", "--json"],
       },
     };

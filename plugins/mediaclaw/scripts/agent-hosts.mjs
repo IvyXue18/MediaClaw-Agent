@@ -25,6 +25,23 @@ const AGENT_HOST_DEFINITIONS = Object.freeze([
     deviceDisplayName: "MediaClaw Agent (豆包工作)",
     automaticUpdate: false,
   }),
+  // One host for every Claude surface: they share one device identity and one approval.
+  // The connector's MEDIACLAW_AGENT_DEVICE_NAME tells the user which surface is connected.
+  Object.freeze({
+    key: "claude",
+    aliases: Object.freeze([
+      "claude",
+      "claude-code",
+      "claude_code",
+      "claude-desktop",
+      "claude_desktop",
+      "claude-cowork",
+      "claude_cowork",
+    ]),
+    displayName: "Claude Code",
+    deviceDisplayName: "MediaClaw Agent (Claude Code)",
+    automaticUpdate: true,
+  }),
 ]);
 
 const AGENT_HOST_BY_KEY = new Map(
@@ -35,18 +52,6 @@ const AGENT_HOST_ALIAS_TO_KEY = new Map(
     definition.aliases.map((alias) => [alias, definition.key]),
   ),
 );
-const LEGACY_HOST_ALIASES = new Map(
-  [
-    "claude",
-    "claude-code",
-    "claude_code",
-    "claude-desktop",
-    "claude_desktop",
-    "claude-cowork",
-    "claude_cowork",
-  ].map((alias) => [alias, "claude"]),
-);
-
 function sanitizeHostKey(value) {
   return String(value || "")
     .trim()
@@ -58,11 +63,7 @@ function sanitizeHostKey(value) {
 
 export function normalizeAgentHostKey(value) {
   const normalized = sanitizeHostKey(value);
-  return (
-    AGENT_HOST_ALIAS_TO_KEY.get(normalized) ||
-    LEGACY_HOST_ALIASES.get(normalized) ||
-    normalized
-  );
+  return AGENT_HOST_ALIAS_TO_KEY.get(normalized) || normalized;
 }
 
 export function getAgentHostDefinition(value) {

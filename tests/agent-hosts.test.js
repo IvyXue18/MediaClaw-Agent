@@ -18,13 +18,17 @@ test("Agent hosts resolve canonical keys and retained aliases from one registry"
     "codex",
     "workbuddy",
     "doubao-work",
+    "claude",
   ]);
   assert.equal(normalizeAgentHostKey("codebuddy"), "workbuddy");
   assert.equal(normalizeAgentHostKey("doubao"), "doubao-work");
   assert.equal(normalizeAgentHostKey("doubao_work"), "doubao-work");
   assert.equal(normalizeAgentHostKey("claude-desktop"), "claude");
   assert.equal(isSupportedAgentHost("doubaowork"), true);
-  assert.equal(isSupportedAgentHost("claude"), false);
+  assert.equal(normalizeAgentHostKey("claude_code"), "claude");
+  assert.equal(normalizeAgentHostKey("claude-cowork"), "claude");
+  assert.equal(isSupportedAgentHost("claude"), true);
+  assert.equal(isSupportedAgentHost("claude-code"), true);
 });
 
 test("Agent host registry owns user-facing identity and update capabilities", () => {
@@ -36,6 +40,12 @@ test("Agent host registry owns user-facing identity and update capabilities", ()
   assert.equal(agentHostSupportsAutomaticUpdate("codex"), true);
   assert.equal(agentHostSupportsAutomaticUpdate("workbuddy"), true);
   assert.equal(agentHostSupportsAutomaticUpdate("doubao-work"), false);
+  assert.equal(agentHostSupportsAutomaticUpdate("claude"), true);
+  assert.equal(agentHostDisplayName("claude-code"), "Claude Code");
+  assert.equal(
+    agentHostDeviceDisplayName("claude"),
+    "MediaClaw Agent (Claude Code)",
+  );
 });
 
 test("Agent host detection keeps explicit connector identity authoritative", () => {
@@ -44,6 +54,11 @@ test("Agent host detection keeps explicit connector identity authoritative", () 
     "doubao-work",
   );
   assert.equal(detectAgentHostKey({CODEBUDDY_PLUGIN_ROOT: "/tmp/plugin"}), "workbuddy");
+  assert.equal(detectAgentHostKey({CLAUDECODE: "1"}), "claude");
+  assert.equal(
+    detectAgentHostKey({MEDIACLAW_AGENT_HOST: "claude-code", CLAUDECODE: "1"}),
+    "claude",
+  );
   assert.equal(detectAgentHostKey({}), "codex");
 });
 

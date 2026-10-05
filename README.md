@@ -1,6 +1,6 @@
 # MediaClaw Agent
 
-MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包，面向 Codex 和 WorkBuddy 提供安装入口。连接成功后，你可以直接使用 MediaClaw 浏览器插件已经提供的内容采集、资料读取和社媒研究能力，并继续完成选题、策划与内容创作。
+MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包，面向 Codex、WorkBuddy 和 Claude Code 提供安装入口。连接成功后，你可以直接使用 MediaClaw 浏览器插件已经提供的内容采集、资料读取和社媒研究能力，并继续完成选题、策划与内容创作。
 
 它不能单独使用：你还需要安装 MediaClaw 浏览器插件、完成有效会员验证，并在浏览器中批准当前 Agent。设备配对与平台登录是接入前提；任务范围、费用和执行结果应在 Agent 对话中说明。
 
@@ -41,13 +41,13 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 
 ## 自动检查 Agent 更新
 
-每个新会话第一次使用 MediaClaw 时，Agent 会检查官方稳定版。你也可以在 Codex 或 WorkBuddy 的 MediaClaw 对话里直接说：
+每个新会话第一次使用 MediaClaw 时，Agent 会检查官方稳定版。你也可以在 Codex、WorkBuddy 或 Claude Code 的 MediaClaw 对话里直接说：
 
 > 升级 MediaClaw Agent。
 
 这句话本身就是升级授权。Agent 会自行刷新官方来源、安装并核验新版本，同时保存你升级前没有做完的请求；不会让你打开终端、输入命令、寻找缓存目录或重新描述需求。
 
-宿主不会给运行中的旧对话热加载已经替换的 Skill 和 MCP。安装完成后，Agent 会明确提示你完全退出并重新打开 Codex 或 WorkBuddy；这是用户唯一需要做的动作。重开后只有当前运行版本确实等于目标版本，Agent 才会宣布升级完成并继续原请求。安装记录变了但旧进程仍在运行时，不算升级成功。更新检查失败不会阻塞当前版本使用；正式版不会自动跟随 prerelease。
+宿主不会给运行中的旧对话热加载已经替换的 Skill 和 MCP。安装完成后，Agent 会明确提示你完全退出并重新打开 Codex、WorkBuddy 或 Claude Code；这是用户唯一需要做的动作。重开后只有当前运行版本确实等于目标版本，Agent 才会宣布升级完成并继续原请求。安装记录变了但旧进程仍在运行时，不算升级成功。更新检查失败不会阻塞当前版本使用；正式版不会自动跟随 prerelease。
 
 ## 安装前准备
 
@@ -56,12 +56,12 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 1. 安装或升级 MediaClaw 浏览器插件。
 2. 在 MediaClaw 插件中完成有效会员验证。
 3. 在浏览器中登录你要使用的小红书或抖音账号。
-4. 在 Codex 或 WorkBuddy 中安装本仓库的 MediaClaw 接入包。
+4. 在 Codex、WorkBuddy 或 Claude Code 中安装本仓库的 MediaClaw 接入包。
 5. 打开 MediaClaw 插件的“Agent 接管”，批准当前 Agent。
 
 ## 第一次安装也可以交给 Agent
 
-你可以直接把下面的话发给 Codex 或 WorkBuddy：
+你可以直接把下面的话发给 Codex、WorkBuddy 或 Claude Code：
 
 > 请从 https://github.com/IvyXue18/MediaClaw-Agent 通过当前宿主的 marketplace 安装、升级或修复 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。平台和芯片识别、官方运行时准备、SHA-256 校验及连接复查都由你完成；不要让我下载 ZIP、选择 `.exe`、使用终端，或向我索取激活码、Cookie、平台 Token、端口和本机令牌。
 

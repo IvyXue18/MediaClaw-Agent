@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0 — Unreleased
+
+- 新增 Claude Code 宿主：提供 Claude Code marketplace 与插件清单，复用同一套 MCP 与内容研究 Skill。Claude Code 的终端、桌面版和 IDE 共用一个设备身份，在浏览器插件中批准一次即可；支持“升级 MediaClaw Agent”自动更新，运行时保存在 Claude Code 的持久插件数据目录。
+
 ## 0.3.2 — Unreleased
 
 - 新增已连接插件能力核查，明确 Agent 可调用、宿主编排及尚无入口的能力，不再凭版本号推断对齐。

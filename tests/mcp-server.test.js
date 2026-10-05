@@ -250,6 +250,8 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
   const child = spawn(process.execPath, [serverPath], {
     env: {
       ...process.env,
+      // this is the Codex bridge test: pin the host so running the suite inside another Agent (e.g. Claude Code) does not change it
+      MEDIACLAW_AGENT_HOST: "codex",
       MEDIACLAW_AGENT_PORT: String(port),
       MEDIACLAW_AGENT_STATE_DIR: agentStateDir,
       MEDIACLAW_AGENT_ADAPTER_TTL_MS: "500",

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mediaclaw": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/launch-agent.cmd",
+      "env": {
+        "MEDIACLAW_AGENT_HOST": "claude",
+        "MEDIACLAW_AGENT_DEVICE_NAME": "MediaClaw Agent (Claude Code)"
+      }
+    }
+  }
+}

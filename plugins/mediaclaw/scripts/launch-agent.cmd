@@ -19,6 +19,8 @@ if defined PLUGIN_DATA (
   set "RUNTIME_ROOT=%PLUGIN_DATA%\runtime\%RELEASE_VERSION%"
 ) else if defined CODEBUDDY_PLUGIN_DATA (
   set "RUNTIME_ROOT=%CODEBUDDY_PLUGIN_DATA%\runtime\%RELEASE_VERSION%"
+) else if defined CLAUDE_PLUGIN_DATA (
+  set "RUNTIME_ROOT=%CLAUDE_PLUGIN_DATA%\runtime\%RELEASE_VERSION%"
 ) else if defined LOCALAPPDATA (
   set "RUNTIME_ROOT=%LOCALAPPDATA%\MediaClaw\Agent\runtime\%RELEASE_VERSION%"
 ) else (
