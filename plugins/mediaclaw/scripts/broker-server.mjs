@@ -499,7 +499,8 @@ function keywordExpansionQueryLimit(suffixLetters) {
 
 function normalizePlatform(value) {
   const platform = String(value || "xiaohongshu").trim().toLowerCase();
-  return platform === "douyin" ? "douyin" : "xiaohongshu";
+  if (platform === "douyin" || platform === "tiktok") return platform;
+  return "xiaohongshu";
 }
 
 function normalizeEnum(value, allowed, fallback) {
@@ -591,6 +592,8 @@ const SEARCH_FILTER_CAPABILITIES = Object.freeze({
     ]),
     searchScope: Object.freeze(["all", "seen", "unseen", "followed"]),
   }),
+  // TikTok search exposes no native filter the plugin can apply; only neutral values pass.
+  tiktok: Object.freeze({}),
 });
 
 const SEARCH_FILTER_NEUTRAL_VALUES = Object.freeze({
@@ -639,7 +642,7 @@ function normalizeProfileCollectionPlatform(value, profileUrl = "") {
   if (requested && inferred && requested !== inferred) throw new Error("方案平台与主页链接不一致，请修改方案");
   if (requested) return normalizePlatform(requested);
   if (inferred) return inferred;
-  throw new Error("无法从主页链接识别平台，请先明确是小红书还是抖音");
+  throw new Error("无法从主页链接识别平台，请先明确是小红书、抖音还是 TikTok");
 }
 
 function normalizeProfileCollectionFields(value, {allowEmpty = false} = {}) {
@@ -1514,6 +1517,7 @@ function collectionUrlPlatform(url) {
   const belongsTo = (domain) => hostname === domain || hostname.endsWith(`.${domain}`);
   if (belongsTo("douyin.com") || belongsTo("iesdouyin.com")) return "douyin";
   if (belongsTo("xiaohongshu.com") || belongsTo("xhslink.com")) return "xiaohongshu";
+  if (belongsTo("tiktok.com")) return "tiktok";
   return null;
 }
 
@@ -1545,6 +1549,11 @@ function prepareCollectionArguments(toolName, input) {
     const inferred = [...urlPlatforms][0];
     if (input?.platform && inferred && input.platform !== inferred) throw new Error("方案平台与来源链接不一致，请修改方案");
     args.platform = normalizePlatform(input?.platform || inferred || args.platform);
+    // A platform inferred from the URL must still be one this tool accepts.
+    const allowedPlatforms = definition.inputSchema.properties.platform.enum;
+    if (Array.isArray(allowedPlatforms) && !allowedPlatforms.includes(args.platform)) {
+      throw new Error(`${args.platform} 暂不支持 ${toolName}，可用平台：${allowedPlatforms.join("、")}`);
+    }
   }
   if (Object.hasOwn(definition.inputSchema.properties, "timeRange")) {
     buildKeywordCaptureOptions(args); // Validate platform/filter combinations before proposing anything.
@@ -1667,7 +1676,7 @@ function createCollectionPlan({userGoal, toolName, arguments: input = {}, replac
     toolName,
     arguments: structuredClone(args),
     scope,
-    confirmationPrompt: `建议执行：${title}。平台：${scope.platform === "xiaohongshu" ? "小红书" : scope.platform === "douyin" ? "抖音" : scope.platform}。来源：${scope.targets.join("、")}。${scope.filterSummary ? `筛选：${scope.filterSummary}。` : ""}${scope.browserActions.join("；")}。获取：${scope.fields.join("、")}。请确认是否按此方案执行；未收到你的明确同意前不会开始。`,
+    confirmationPrompt: `建议执行：${title}。平台：${scope.platform === "xiaohongshu" ? "小红书" : scope.platform === "douyin" ? "抖音" : scope.platform === "tiktok" ? "TikTok" : scope.platform}。来源：${scope.targets.join("、")}。${scope.filterSummary ? `筛选：${scope.filterSummary}。` : ""}${scope.browserActions.join("；")}。获取：${scope.fields.join("、")}。请确认是否按此方案执行；未收到你的明确同意前不会开始。`,
   };
   collectionPlans.set(plan.planId, plan);
   return {
@@ -6763,7 +6772,7 @@ const tools = [
       type: "object",
       properties: {
         url: {type: "string"},
-        platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
+        platform: {type: "string", enum: ["xiaohongshu", "douyin", "tiktok"]},
         includeComments: {type: "boolean", default: false},
         commentsPerItemLimit: {
           type: "integer",
@@ -6789,7 +6798,7 @@ const tools = [
       type: "object",
       properties: {
         keyword: {type: "string"},
-        platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
+        platform: {type: "string", enum: ["xiaohongshu", "douyin", "tiktok"]},
         limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
         ...SEARCH_FILTER_SCHEMA_PROPERTIES,
         idempotencyKey: {type: "string"},
@@ -6809,7 +6818,7 @@ const tools = [
       type: "object",
       properties: {
         profileUrl: {type: "string"},
-        platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
+        platform: {type: "string", enum: ["xiaohongshu", "douyin", "tiktok"]},
         limit: {type: "integer", minimum: 1, maximum: 300, default: 80},
         idempotencyKey: {type: "string"},
         async: {type: "boolean", default: false},
@@ -6832,7 +6841,7 @@ const tools = [
           description: "保留用户已经确认的数据目标，用于执行审计和防止目标被默认能力降级。",
         },
         profileUrl: {type: "string", description: "账号主页链接"},
-        platform: {type: "string", enum: ["xiaohongshu", "douyin"]},
+        platform: {type: "string", enum: ["xiaohongshu", "douyin", "tiktok"]},
         purpose: {
           type: "string",
           enum: [
@@ -7368,7 +7377,7 @@ const tools = [
         url: {type: "string"},
         platform: {
           type: "string",
-          enum: ["xiaohongshu", "douyin"],
+          enum: ["xiaohongshu", "douyin", "tiktok"],
           default: "xiaohongshu",
         },
         limit: {type: "integer", minimum: 1, maximum: 500, default: 30},
@@ -7391,7 +7400,7 @@ const tools = [
         url: {type: "string"},
         platform: {
           type: "string",
-          enum: ["xiaohongshu", "douyin"],
+          enum: ["xiaohongshu", "douyin", "tiktok"],
           default: "xiaohongshu",
         },
         limit: {type: "integer", minimum: 1, maximum: 500, default: 60},
@@ -7531,7 +7540,7 @@ const tools = [
       properties: {
         platform: {
           type: "string",
-          enum: ["xiaohongshu", "douyin"],
+          enum: ["xiaohongshu", "douyin", "tiktok"],
         },
         recordType: {
           type: "string",

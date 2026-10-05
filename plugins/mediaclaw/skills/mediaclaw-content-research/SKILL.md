@@ -219,16 +219,18 @@ Agent 负责把自然语言意图转成标准参数；平台能力、参数校�
 
 ### 平台能力
 
-| 维度 | 小红书 | 抖音 |
-| --- | --- | --- |
-| `timeRange` | `any` / `1d` / `7d` / `6m` | `any` / `1d` / `7d` / `6m` |
-| `sortBy` | `default` / `latest` / `likes` / `comments` / `collects` | `default` / `latest` / `likes` |
-| `contentType` | `all` / `video` / `image` | 不适用，只传 `all` |
-| `videoDuration` | 不适用，只传 `all` | `all` / `under_1m` / `between_1m_5m` / `over_5m` |
-| `searchScope` | `all` / `seen` / `unseen` / `followed` | `all` / `seen` / `unseen` / `followed` |
-| `locationScope` | `all` / `city` / `nearby` | 不适用，只传 `all` |
+| 维度 | 小红书 | 抖音 | TikTok |
+| --- | --- | --- | --- |
+| `timeRange` | `any` / `1d` / `7d` / `6m` | `any` / `1d` / `7d` / `6m` | 只传 `any` |
+| `sortBy` | `default` / `latest` / `likes` / `comments` / `collects` | `default` / `latest` / `likes` | 只传 `default` |
+| `contentType` | `all` / `video` / `image` | 不适用，只传 `all` | 只传 `all` |
+| `videoDuration` | 不适用，只传 `all` | `all` / `under_1m` / `between_1m_5m` / `over_5m` | 只传 `all` |
+| `searchScope` | `all` / `seen` / `unseen` / `followed` | `all` / `seen` / `unseen` / `followed` | 只传 `all` |
+| `locationScope` | `all` / `city` / `nearby` | 不适用，只传 `all` | 只传 `all` |
 
 不存在 `30d` 或 `1y`。插件会拒绝平台不支持的非中性值，并在每次 Agent 搜索前真实应用所有适用维度，包括 `default`、`any` 和 `all`，避免复用页面遗留筛选。
+
+TikTok 搜索没有插件可应用的原生筛选，只能采集当前结果后由插件按本地点赞阈值筛选已加载样本；用户要求时间、排序或类型筛选时，先说明不支持，再决定是否按无筛选采集。TikTok 当前可用单篇、作者主页、搜索列表、已显示评论和数据池读取；采集增强、深度采集、账号指标、逐字稿、配图文字、私信、监控与研究类组合工具不可用。是否可用以 `mediaclaw_get_capabilities` 返回的 `platforms` 为准，旧插件没有该字段时视为不支持 TikTok。
 
 ### 意图映射
 
