@@ -7354,7 +7354,7 @@ const tools = [
         },
         platform: {
           type: "string",
-          enum: ["xiaohongshu", "douyin"],
+          enum: ["xiaohongshu", "douyin", "tiktok"],
           default: "xiaohongshu",
         },
         includeComments: {type: "boolean", default: false},

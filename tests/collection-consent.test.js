@@ -601,7 +601,7 @@ test("platform inference uses URL hostnames rather than lookalike domains or pat
   assert.equal(f.starts.length, 0);
 });
 
-test("TikTok links infer the tiktok platform only for tools the plugin can run there", async (t) => {
+test("TikTok links infer the tiktok platform for capture, enhancement and deep collection only", async (t) => {
   const f = await fixture(t);
   const video = "https://www.tiktok.com/@fixture/video/7412345678901234567";
   for (const [toolName, args] of [
@@ -621,9 +621,9 @@ test("TikTok links infer the tiktok platform only for tools the plugin can run t
     failsWith(unsupported, /INVALID_COLLECTION_PLAN/);
     assert.match(unsupported.structuredContent.error.message, new RegExp(`tiktok 不支持筛选参数 ${dimension}=${value}`));
   }
-  const deep = await f.call("mediaclaw_deep_collect", {urls: [video]});
-  failsWith(deep, /INVALID_COLLECTION_PLAN/);
-  assert.match(deep.structuredContent.error.message, /tiktok 暂不支持 mediaclaw_deep_collect/);
+  const deep = await f.prepare("mediaclaw_deep_collect", {urls: [video]});
+  assert.equal(deep.arguments.platform, "tiktok");
+  failsWith(await f.call("mediaclaw_research_keyword_topics", {keyword: "coffee", platform: "tiktok"}), /INVALID|PLATFORM|VALIDATION/);
   const lookalike = await f.call("mediaclaw_capture_note", {url: "https://tiktok.com.attacker.test/@x/video/1"});
   if (lookalike.structuredContent.ok) assert.notEqual(pendingPlan(lookalike).arguments.platform, "tiktok");
   assert.equal(f.starts.length, 0);
