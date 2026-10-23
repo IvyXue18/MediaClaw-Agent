@@ -2,7 +2,7 @@
 
 set -eu
 
-RELEASE_VERSION="v0.4.0-beta.1"
+RELEASE_VERSION="v0.4.0"
 REPOSITORY="IvyXue18/MediaClaw-Agent"
 
 case "$(uname -s)-$(uname -m)" in
