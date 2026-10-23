@@ -42,6 +42,22 @@ const AGENT_HOST_DEFINITIONS = Object.freeze([
     deviceDisplayName: "MediaClaw Agent (Claude Code)",
     automaticUpdate: true,
   }),
+  // Grok Build has no plugin marketplace: the connector runs a cloned launcher, so updates stay manual.
+  Object.freeze({
+    key: "grok-build",
+    aliases: Object.freeze(["grok-build", "grok_build", "grokbuild", "grok"]),
+    displayName: "Grok Build",
+    deviceDisplayName: "MediaClaw Agent (Grok Build)",
+    automaticUpdate: false,
+  }),
+  // Grok Bot runs the Agent and the browser extension together on its cloud computer.
+  Object.freeze({
+    key: "grok-bot",
+    aliases: Object.freeze(["grok-bot", "grok_bot", "grokbot"]),
+    displayName: "Grok Bot",
+    deviceDisplayName: "MediaClaw Agent (Grok Bot 云电脑)",
+    automaticUpdate: false,
+  }),
 ]);
 
 const AGENT_HOST_BY_KEY = new Map(

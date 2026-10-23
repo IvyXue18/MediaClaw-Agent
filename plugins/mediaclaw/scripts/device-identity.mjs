@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {isSupportedAgentHost, normalizeAgentHostKey} from "./agent-hosts.mjs";
 
 export function resolveStateDirectory(env = process.env) {
   if (env.MEDIACLAW_AGENT_STATE_DIR) {
@@ -101,6 +102,8 @@ export async function loadOrCreateDeviceIdentity({
   displayName = `MediaClaw Agent on ${os.hostname()}`,
   host = "codex",
 } = {}) {
+  host = normalizeAgentHostKey(host);
+  if (!isSupportedAgentHost(host)) throw new Error("Unsupported MediaClaw Agent host");
   const filePath = path.join(stateDirectory, "device-identity.json");
   await fs.mkdir(stateDirectory, {recursive: true, mode: 0o700});
   await fs.chmod(stateDirectory, 0o700).catch(() => {});

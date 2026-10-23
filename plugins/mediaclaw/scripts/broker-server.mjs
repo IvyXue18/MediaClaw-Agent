@@ -22,6 +22,7 @@ import {
 import {
   agentHostDeviceDisplayName,
   normalizeAgentHostKey,
+  isSupportedAgentHost,
 } from "./agent-hosts.mjs";
 
 const SERVER_NAME = "mediaclaw-agent-broker";
@@ -8359,6 +8360,9 @@ function resolveAdapterToken(payload = {}) {
 
 async function registerAdapter(payload = {}) {
   const hostKey = normalizeHostKey(payload.hostKey || payload.host);
+  if (!isSupportedAgentHost(hostKey)) {
+    return {ok: false, error: {code: "UNSUPPORTED_AGENT_HOST", message: "当前 Agent 宿主不受支持"}};
+  }
   const instanceId = normalizeText(payload.instanceId, 160) || createId("adapter");
   const adapterVersion = normalizeText(payload.adapterVersion, 80);
   if (compareVersions(adapterVersion, SERVER_VERSION) === 1) {
@@ -8482,7 +8486,7 @@ async function handleBridgeHttpRequest(request, response) {
   const payload = await readJsonRequest(request);
   if (request.url === "/v1/adapters/register") {
     const registration = await registerAdapter(payload);
-    sendJson(response, registration.restartRequired ? 409 : 200, registration);
+    sendJson(response, registration.restartRequired ? 409 : registration.ok ? 200 : 403, registration);
     return true;
   }
   if (request.url === "/v1/adapters/unregister") {

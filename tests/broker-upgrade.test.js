@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {spawn} from "node:child_process";
-import {mkdtemp, rm} from "node:fs/promises";
+import {mkdtemp, readdir, rm} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -48,6 +48,22 @@ test("a newer Adapter makes an older shared Broker exit for replacement", async 
   );
   t.after(() => broker.kill("SIGTERM"));
   await waitForText(broker.stderr, /shared Agent Broker listening/);
+
+  // An unsupported adapter must be rejected before identity creation or restart logic.
+  for (const hostKey of ["cursor", "future-agent"]) {
+    const rejected = await fetch(`http://127.0.0.1:${port}/v1/adapters/register`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({hostKey, adapterVersion: "99.0.0", instanceId: "unsupported-adapter"}),
+    });
+    assert.equal(rejected.status, 403);
+    const result = await rejected.json();
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "UNSUPPORTED_AGENT_HOST");
+    assert.equal(result.token, undefined);
+    assert.equal(result.restartRequired, undefined);
+  }
+  assert.deepEqual(await readdir(path.join(stateDirectory, "hosts")).catch(() => []), []);
 
   const exited = new Promise((resolve) => broker.once("exit", resolve));
   const response = await fetch(

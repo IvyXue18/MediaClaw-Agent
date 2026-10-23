@@ -11,7 +11,7 @@ MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户�
 
 ## 第二步：把安装交给 Agent
 
-在 Codex、WorkBuddy 或 Claude Code 的新对话中直接发送：
+在 Codex、WorkBuddy 或 Claude Code 的新对话中直接发送（Grok Build 与 Grok Bot 请使用插件“Agent 接管”中复制的专属提示词）：
 
 > 请从 https://github.com/IvyXue18/MediaClaw-Agent 通过当前宿主的 marketplace 安装、升级或修复 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。平台和芯片识别、官方运行时准备、SHA-256 校验及连接复查都由你完成；不要让我下载 ZIP、选择 `.exe` 或使用终端。
 
@@ -32,6 +32,21 @@ Agent 应先核实 WorkBuddy 的实际用户数据目录，每次调用内置 CL
 Claude Code（终端、桌面版 Code 标签和 IDE 扩展）使用同一个官方 marketplace。Agent 通过 Claude Code 自带的插件命令注册 `IvyXue18/MediaClaw-Agent` 并安装 `mediaclaw@mediaclaw-agent`，再用插件列表复查实际版本和启用状态；这些命令由 Agent 执行，不要求用户输入。Claude Code 不会给已经开始的会话热加载刚安装的插件，安装后需要新开一个会话（或重启 Claude Code）才会出现社媒虾工具；Agent 应明确说明这一步。
 
 Claude Code 的终端、桌面版和 IDE 共用同一个设备身份，在浏览器插件中批准一次即可。
+
+### Grok Build
+
+Grok Build 没有插件市场，使用本机 MCP 连接器。Agent 把官方仓库克隆到 `~/.mediaclaw/MediaClaw-Agent`（Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`），备份后只在 `~/.grok/config.toml` 中新增或替换 `[mcp_servers.mediaclaw]`：`command` 为该目录下 `plugins/mediaclaw/scripts/launch-agent.cmd` 的绝对路径，`env` 设置 `MEDIACLAW_AGENT_HOST = "grok-build"` 与 `MEDIACLAW_AGENT_DEVICE_NAME = "MediaClaw Agent (Grok Build)"`。随后用 `grok mcp list --json` 和 `grok mcp doctor mediaclaw --json` 复查。Grok 也会读取 `~/.claude.json`、`.cursor/mcp.json` 和项目 `.mcp.json`，需要确认只生效一份 `mediaclaw`。当前会话没有出现工具时，在 TUI 中用 `/mcps` 按 `r` 刷新，或重新运行 `grok`。更新方式为重新拉取该目录，暂不支持“升级 MediaClaw Agent”自动更新。
+
+### Grok Bot（云电脑）
+
+Grok Bot 在自己的云电脑上工作，浏览器插件和 Agent 都安装在那台云电脑里，用户本地电脑不需要安装。持久文件统一放在 `/workspace/mediaclaw`：
+
+1. 浏览器插件：先在云电脑浏览器打开 Chrome 应用商店安装；不可用时从 `https://mediaclaw.app/download` 下载本地安装包，解压后在 `chrome://extensions` 开启开发者模式并加载已解压的扩展程序。
+2. 激活：用户在对话中提供激活码，Bot 在插件中填写并确认会员有效，不把激活码写入文件或日志。
+3. 连接器：克隆官方仓库到 `/workspace/mediaclaw/MediaClaw-Agent`，用 Grok Bot 的自定义 MCP 服务器能力新增 stdio 服务器 `mediaclaw`，启动命令为 `plugins/mediaclaw/scripts/launch-agent`，环境变量为 `MEDIACLAW_AGENT_HOST=grok-bot`、`MEDIACLAW_AGENT_DEVICE_NAME=MediaClaw Agent (Grok Bot 云电脑)`、`MEDIACLAW_AGENT_STATE_DIR=/workspace/mediaclaw/state`、`PLUGIN_DATA=/workspace/mediaclaw/plugin-data`，让设备身份与运行时在云电脑恢复后保留。
+4. 配对与登录：在插件“Agent 接管”中开启调用；出现待批准设备时，由 Bot 在云电脑浏览器中自行点击“批准配对”，只批准设备名为 `MediaClaw Agent (Grok Bot 云电脑)` 且是自己刚启动的连接器，名称不符或出现其他设备时停止并告知用户。用户只需接管画面扫码或输入账号登录平台。
+
+同一云电脑上的其他 Bot 共享浏览器登录状态；平台提示环境或网络风险时，可在 Grok 设置的 Computer 中让流量经由用户桌面。
 
 ## 豆包工作本地开发接入
 

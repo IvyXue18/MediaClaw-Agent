@@ -398,3 +398,10 @@ test("approval id and original goal are mandatory before any update command", as
   assert.equal(missingGoal.error.code, "UPDATE_GOAL_REQUIRED");
   assert.equal(commandCount, 0);
 });
+
+
+test("unsupported hosts cannot request another host updater or manual reinstall", () => {
+  for (const hostKey of ["cursor", "future-agent"]) {
+    assert.throws(() => createAgentUpdateChecker({currentVersion: "0.3.0", hostKey, fetchImpl: manifestFetch("0.3.1")}), /Unsupported MediaClaw Agent host/);
+  }
+});

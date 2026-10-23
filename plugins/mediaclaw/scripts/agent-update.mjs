@@ -7,6 +7,7 @@ import {
   agentHostDisplayName,
   agentHostSupportsAutomaticUpdate,
   normalizeAgentHostKey,
+  isSupportedAgentHost,
 } from "./agent-hosts.mjs";
 
 const DEFAULT_RELEASES_URL =
@@ -341,6 +342,7 @@ export function createAgentUpdateChecker({
     process.env.MEDIACLAW_AGENT_UPDATE_MANIFEST_URL || DEFAULT_RELEASES_URL,
   fetchImpl = globalThis.fetch,
 } = {}) {
+  if (!isSupportedAgentHost(hostKey)) throw new Error("Unsupported MediaClaw Agent host");
   let pendingCheck = null;
 
   async function check() {
