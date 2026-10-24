@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {execFileSync, spawnSync} from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   compareVersions,
   createAgentUpdateChecker,
@@ -149,11 +153,13 @@ function updateOrchestrator({
   hostKey = "codex",
   currentVersion = "0.3.0-rc.1",
   stateStore = memoryStateStore(),
+  packageRoot = "",
 } = {}) {
   const checker = createAgentUpdateChecker({
     currentVersion,
     hostKey,
     fetchImpl: manifestFetch("0.3.1"),
+    packageRoot,
   });
   return createAgentUpdateOrchestrator({
     checker,
@@ -162,6 +168,7 @@ function updateOrchestrator({
     commandRunner,
     approvalIdFactory: () => "approval-test",
     stateStore,
+    packageRoot,
   });
 }
 
@@ -401,7 +408,125 @@ test("approval id and original goal are mandatory before any update command", as
 
 
 test("unsupported hosts cannot request another host updater or manual reinstall", () => {
-  for (const hostKey of ["cursor", "future-agent"]) {
+  for (const hostKey of ["windsurf", "future-agent"]) {
     assert.throws(() => createAgentUpdateChecker({currentVersion: "0.3.0", hostKey, fetchImpl: manifestFetch("0.3.1")}), /Unsupported MediaClaw Agent host/);
   }
 });
+
+for (const hostKey of ["grok-build", "grok-bot", "deepseek-harness", "cursor"]) {
+  test(`${hostKey} approval fast-forwards to the official stable release tag, then verifies the manifest`, async () => {
+    const commands = [];
+    const packageRoot = "/workspace/mediaclaw/MediaClaw-Agent";
+    const orchestrator = updateOrchestrator({
+      hostKey,
+      packageRoot,
+      commandRunner: async (command) => {
+        commands.push([command.file, ...command.args]);
+        return command.args.includes("show")
+          ? {code: 0, stdout: JSON.stringify({name: "mediaclaw", version: "0.3.1"})}
+          : {code: 0};
+      },
+    });
+    const offered = await orchestrator.status();
+    assert.equal(offered.status, "update_available");
+    assert.equal(offered.execution.userRunsCommands, false);
+    const result = await orchestrator.decide({
+      decision: "approve",
+      approvalId: offered.approvalId,
+      originalGoal: "继续完成原任务",
+    });
+    assert.equal(result.ok, true);
+    // Use the approved official tag; require a clean checkout and a fast-forward.
+    assert.deepEqual(commands, [
+      ["git", "-C", packageRoot, "status", "--porcelain"],
+      ["git", "-C", packageRoot, "fetch", "--no-tags", "https://github.com/IvyXue18/MediaClaw-Agent.git", "refs/tags/v0.3.1"],
+      ["git", "-C", packageRoot, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
+      ["git", "-C", packageRoot, "merge", "--ff-only", "FETCH_HEAD"],
+      ["git", "-C", packageRoot, "show", "HEAD:plugins/mediaclaw/.codex-plugin/plugin.json"],
+    ]);
+    assert.equal(result.agentUpdate.oldSessionFenced, true);
+    assert.equal(result.agentUpdate.installedVersion, "0.3.1");
+  });
+
+  test(`${hostKey} without a checkout falls back to the reinstall prompt`, async () => {
+    const result = await createAgentUpdateChecker({
+      currentVersion: "0.3.0",
+      hostKey,
+      fetchImpl: manifestFetch("0.3.1"),
+      packageRoot: "",
+    }).check();
+    assert.equal(result.status, "manual_update_available");
+    assert.equal(result.blocking, false);
+    assert.equal(result.execution, undefined);
+  });
+}
+
+test("a relative package root is ignored instead of pulling the working directory", async () => {
+  const result = await createAgentUpdateChecker({
+    currentVersion: "0.3.0",
+    hostKey: "grok-build",
+    fetchImpl: manifestFetch("0.3.1"),
+    packageRoot: "relative/MediaClaw-Agent",
+  }).check();
+  assert.equal(result.status, "manual_update_available");
+});
+
+for (const scenario of ["stable-tag", "ahead", "dirty"]) {
+  test(`git checkout update preserves the approved release boundary (${scenario})`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "mediaclaw-update-"));
+    t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+    const official = path.join(root, "official");
+    const checkout = path.join(root, "installed");
+    const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], {encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]}).trim();
+    fs.mkdirSync(official);
+    git(official, "init", "--initial-branch=main");
+    git(official, "config", "user.name", "Update Test");
+    git(official, "config", "user.email", "update-test@example.invalid");
+    const manifest = "plugins/mediaclaw/.codex-plugin/plugin.json";
+    fs.mkdirSync(path.dirname(path.join(official, manifest)), {recursive: true});
+    const commitVersion = (version, message) => {
+      fs.writeFileSync(path.join(official, manifest), JSON.stringify({name: "mediaclaw", version}));
+      git(official, "add", manifest);
+      git(official, "commit", "-m", message);
+      return git(official, "rev-parse", "HEAD");
+    };
+    const original = commitVersion("0.3.0", "installed release");
+    git(root, "clone", official, checkout);
+    const stable = commitVersion("0.3.1", "approved stable release");
+    git(official, "tag", "v0.3.1");
+    // The default branch contains an unreleased commit with the same manifest version.
+    fs.writeFileSync(path.join(official, "unreleased.txt"), "must not install this\n");
+    git(official, "add", "unreleased.txt");
+    git(official, "commit", "-m", "unreleased change");
+    if (scenario === "ahead") git(checkout, "pull", "--ff-only");
+    if (scenario === "dirty") fs.writeFileSync(path.join(checkout, "local-note.txt"), "keep me\n");
+    const before = git(checkout, "rev-parse", "HEAD");
+    const commands = [];
+    const orchestrator = updateOrchestrator({
+      hostKey: "cursor",
+      packageRoot: checkout,
+      commandRunner: async (command) => {
+        commands.push(command.args);
+        const args = command.args.map((value) => value === "https://github.com/IvyXue18/MediaClaw-Agent.git" ? official : value);
+        const result = spawnSync(command.file, args, {encoding: "utf8"});
+        return {code: result.status, stdout: result.stdout, stderr: result.stderr};
+      },
+    });
+    const offered = await orchestrator.status();
+    const result = await orchestrator.decide({decision: "approve", approvalId: offered.approvalId, originalGoal: "继续测试"});
+    if (scenario === "stable-tag") {
+      assert.equal(result.ok, true);
+      assert.equal(git(checkout, "rev-parse", "HEAD"), stable);
+      assert.equal(fs.existsSync(path.join(checkout, "unreleased.txt")), false);
+      assert.notEqual(stable, original);
+    } else {
+      assert.equal(result.ok, false);
+      assert.equal(git(checkout, "rev-parse", "HEAD"), before);
+      assert.equal(commands.some((args) => args.includes("merge")), false);
+      if (scenario === "dirty") {
+        assert.equal(commands.length, 1);
+        assert.equal(fs.readFileSync(path.join(checkout, "local-note.txt"), "utf8"), "keep me\n");
+      }
+    }
+  });
+}

@@ -50,7 +50,7 @@ test("a newer Adapter makes an older shared Broker exit for replacement", async 
   await waitForText(broker.stderr, /shared Agent Broker listening/);
 
   // An unsupported adapter must be rejected before identity creation or restart logic.
-  for (const hostKey of ["cursor", "future-agent"]) {
+  for (const hostKey of ["windsurf", "future-agent"]) {
     const rejected = await fetch(`http://127.0.0.1:${port}/v1/adapters/register`, {
       method: "POST",
       headers: {"content-type": "application/json"},

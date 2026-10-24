@@ -68,5 +68,6 @@ echo MediaClaw Agent 官方组件已校验，正在建立本机连接。 1>&2
 
 :run
 set "MEDIACLAW_AGENT_STANDALONE=1"
+if not defined MEDIACLAW_AGENT_PACKAGE_ROOT if exist "%~dp0..\..\..\.git" for %%I in ("%~dp0..\..\..") do set "MEDIACLAW_AGENT_PACKAGE_ROOT=%%~fI"
 "%BINARY%" %*
 exit /b %ERRORLEVEL%

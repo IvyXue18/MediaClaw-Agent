@@ -24,6 +24,8 @@ test("Agent hosts resolve canonical keys and retained aliases from one registry"
     "claude",
     "grok-build",
     "grok-bot",
+    "deepseek-harness",
+    "cursor",
   ]);
   assert.equal(normalizeAgentHostKey("codebuddy"), "workbuddy");
   assert.equal(normalizeAgentHostKey("doubao"), "doubao-work");
@@ -38,6 +40,9 @@ test("Agent hosts resolve canonical keys and retained aliases from one registry"
   assert.equal(normalizeAgentHostKey("grok_build"), "grok-build");
   assert.equal(normalizeAgentHostKey("grok_bot"), "grok-bot");
   assert.equal(normalizeAgentHostKey("GrokBot"), "grok-bot");
+  assert.equal(normalizeAgentHostKey("dsh"), "deepseek-harness");
+  assert.equal(normalizeAgentHostKey("deepseek_harness"), "deepseek-harness");
+  assert.equal(normalizeAgentHostKey("cursor-agent"), "cursor");
 });
 
 test("Agent host registry owns user-facing identity and update capabilities", () => {
@@ -55,13 +60,19 @@ test("Agent host registry owns user-facing identity and update capabilities", ()
     agentHostDeviceDisplayName("claude"),
     "MediaClaw Agent (Claude Code)",
   );
-  // Grok hosts run a cloned launcher without a plugin manager, so no automatic update.
-  assert.equal(agentHostSupportsAutomaticUpdate("grok-build"), false);
-  assert.equal(agentHostSupportsAutomaticUpdate("grok-bot"), false);
+  // Grok hosts run the launcher from a cloned official repository and update by pulling it.
+  assert.equal(agentHostSupportsAutomaticUpdate("grok-build"), true);
+  assert.equal(agentHostSupportsAutomaticUpdate("grok-bot"), true);
   assert.equal(agentHostDisplayName("grok"), "Grok Build");
   assert.equal(agentHostDisplayName("grok-bot"), "Grok Bot");
   assert.equal(agentHostDeviceDisplayName("grok-build"), "MediaClaw Agent (Grok Build)");
   assert.equal(agentHostDeviceDisplayName("grok-bot"), "MediaClaw Agent (Grok Bot 云电脑)");
+  assert.equal(agentHostSupportsAutomaticUpdate("deepseek-harness"), true);
+  assert.equal(agentHostDisplayName("dsh"), "DeepSeek Harness");
+  assert.equal(agentHostDeviceDisplayName("deepseek-harness"), "MediaClaw Agent (DeepSeek Harness)");
+  assert.equal(agentHostSupportsAutomaticUpdate("cursor"), true);
+  assert.equal(agentHostDisplayName("cursor_cli"), "Cursor");
+  assert.equal(agentHostDeviceDisplayName("cursor"), "MediaClaw Agent (Cursor)");
 });
 
 test("Agent host detection keeps explicit connector identity authoritative", () => {
@@ -119,7 +130,7 @@ test("Doubao Work local STDIO contract runs the current Agent source tree", () =
   );
 });
 
-const unsupportedHosts = ["cursor", "future-agent", "grok-desktop"];
+const unsupportedHosts = ["windsurf", "future-agent", "grok-desktop"];
 
 test("unsupported host keys cannot resolve to a supported host or updater", () => {
   for (const host of unsupportedHosts) {
@@ -141,18 +152,18 @@ test("unsupported hosts cannot create or reuse a persisted device identity", asy
   await loadOrCreateDeviceIdentity({stateDirectory, host: "codex"});
   const identityPath = path.join(stateDirectory, "device-identity.json");
   const original = fs.readFileSync(identityPath, "utf8");
-  await assert.rejects(loadOrCreateDeviceIdentity({stateDirectory, host: "cursor"}), /Unsupported MediaClaw Agent host/);
+  await assert.rejects(loadOrCreateDeviceIdentity({stateDirectory, host: "windsurf"}), /Unsupported MediaClaw Agent host/);
   assert.equal(fs.readFileSync(identityPath, "utf8"), original);
 });
 
 test("Adapter startup rejects an unsupported explicit host", () => {
   assert.throws(() => execFileSync(process.execPath, [path.resolve("plugins/mediaclaw/scripts/mcp-server.mjs")], {
-    env: {...process.env, MEDIACLAW_AGENT_HOST: "cursor"},
+    env: {...process.env, MEDIACLAW_AGENT_HOST: "windsurf"},
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 3000,
   }), (error) => {
     assert.equal(error.status, 1);
-    assert.match(String(error.stderr), /MediaClaw Agent only supports: codex, workbuddy, doubao-work, claude, grok-build, grok-bot/);
+    assert.match(String(error.stderr), /MediaClaw Agent only supports: codex, workbuddy, doubao-work, claude, grok-build, grok-bot, deepseek-harness, cursor/);
     return true;
   });
 });

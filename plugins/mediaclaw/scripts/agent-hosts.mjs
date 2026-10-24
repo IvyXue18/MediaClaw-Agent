@@ -42,13 +42,14 @@ const AGENT_HOST_DEFINITIONS = Object.freeze([
     deviceDisplayName: "MediaClaw Agent (Claude Code)",
     automaticUpdate: true,
   }),
-  // Grok Build has no plugin marketplace: the connector runs a cloned launcher, so updates stay manual.
+  // Grok Build has no plugin marketplace: the connector runs the launcher from a cloned official repository.
   Object.freeze({
     key: "grok-build",
     aliases: Object.freeze(["grok-build", "grok_build", "grokbuild", "grok"]),
     displayName: "Grok Build",
     deviceDisplayName: "MediaClaw Agent (Grok Build)",
-    automaticUpdate: false,
+    automaticUpdate: true,
+    updateSource: "git_checkout",
   }),
   // Grok Bot runs the Agent and the browser extension together on its cloud computer.
   Object.freeze({
@@ -56,7 +57,31 @@ const AGENT_HOST_DEFINITIONS = Object.freeze([
     aliases: Object.freeze(["grok-bot", "grok_bot", "grokbot"]),
     displayName: "Grok Bot",
     deviceDisplayName: "MediaClaw Agent (Grok Bot 云电脑)",
-    automaticUpdate: false,
+    automaticUpdate: true,
+    updateSource: "git_checkout",
+  }),
+  // DeepSeek Harness loads the cloned launcher from a profile patch entry.
+  Object.freeze({
+    key: "deepseek-harness",
+    aliases: Object.freeze([
+      "deepseek-harness",
+      "deepseek_harness",
+      "deepseekharness",
+      "dsh",
+    ]),
+    displayName: "DeepSeek Harness",
+    deviceDisplayName: "MediaClaw Agent (DeepSeek Harness)",
+    automaticUpdate: true,
+    updateSource: "git_checkout",
+  }),
+  // The Cursor IDE and cursor-agent CLI share ~/.cursor/mcp.json, so they share one device identity.
+  Object.freeze({
+    key: "cursor",
+    aliases: Object.freeze(["cursor", "cursor-agent", "cursor_agent", "cursor-cli", "cursor_cli"]),
+    displayName: "Cursor",
+    deviceDisplayName: "MediaClaw Agent (Cursor)",
+    automaticUpdate: true,
+    updateSource: "git_checkout",
   }),
 ]);
 
@@ -103,6 +128,11 @@ export function agentHostDeviceDisplayName(value) {
 
 export function agentHostSupportsAutomaticUpdate(value) {
   return getAgentHostDefinition(value)?.automaticUpdate === true;
+}
+
+// "git_checkout" hosts update by pulling the cloned official repository the launcher runs from.
+export function agentHostUpdateSource(value) {
+  return getAgentHostDefinition(value)?.updateSource || "marketplace";
 }
 
 export function detectAgentHostKey(env = process.env) {

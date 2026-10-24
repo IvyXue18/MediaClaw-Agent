@@ -116,4 +116,10 @@ if [ ! -x "$BINARY" ]; then
 fi
 
 export MEDIACLAW_AGENT_STANDALONE=1
+# Git-checkout hosts update by pulling this checkout; marketplace caches are not checkouts.
+PACKAGE_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
+if [ -z "${MEDIACLAW_AGENT_PACKAGE_ROOT:-}" ] && [ -e "$PACKAGE_ROOT/.git" ]; then
+  export MEDIACLAW_AGENT_PACKAGE_ROOT="$PACKAGE_ROOT"
+fi
+
 exec "$BINARY" "$@"

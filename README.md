@@ -1,6 +1,6 @@
 # MediaClaw Agent
 
-MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包，面向 Codex、WorkBuddy、Claude Code、Grok Build 和 Grok Bot（云电脑）提供安装入口。连接成功后，你可以直接使用 MediaClaw 浏览器插件已经提供的内容采集、资料读取和社媒研究能力，并继续完成选题、策划与内容创作。
+MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包，面向 Codex、WorkBuddy、Claude Code、Grok Build、Grok Bot（云电脑）、DeepSeek Harness 和 Cursor 提供安装入口。连接成功后，你可以直接使用 MediaClaw 浏览器插件已经提供的内容采集、资料读取和社媒研究能力，并继续完成选题、策划与内容创作。
 
 它不能单独使用：你还需要安装 MediaClaw 浏览器插件、完成有效会员验证，并在浏览器中批准当前 Agent。设备配对与平台登录是接入前提；任务范围、费用和执行结果应在 Agent 对话中说明。
 
@@ -41,7 +41,7 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 
 ## 自动检查 Agent 更新
 
-每个新会话第一次使用 MediaClaw 时，Agent 会检查官方稳定版。你也可以在 Codex、WorkBuddy 或 Claude Code 的 MediaClaw 对话里直接说：
+每个新会话第一次使用 MediaClaw 时，Agent 会检查官方稳定版。你也可以在 Codex、WorkBuddy、Claude Code、Grok Build、Grok Bot、DeepSeek Harness 或 Cursor 的 MediaClaw 对话里直接说：
 
 > 升级 MediaClaw Agent。
 

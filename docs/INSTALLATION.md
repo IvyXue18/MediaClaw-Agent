@@ -35,7 +35,15 @@ Claude Code 的终端、桌面版和 IDE 共用同一个设备身份，在浏览
 
 ### Grok Build
 
-Grok Build 没有插件市场，使用本机 MCP 连接器。Agent 把官方仓库克隆到 `~/.mediaclaw/MediaClaw-Agent`（Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`），备份后只在 `~/.grok/config.toml` 中新增或替换 `[mcp_servers.mediaclaw]`：`command` 为该目录下 `plugins/mediaclaw/scripts/launch-agent.cmd` 的绝对路径，`env` 设置 `MEDIACLAW_AGENT_HOST = "grok-build"` 与 `MEDIACLAW_AGENT_DEVICE_NAME = "MediaClaw Agent (Grok Build)"`。随后用 `grok mcp list --json` 和 `grok mcp doctor mediaclaw --json` 复查。Grok 也会读取 `~/.claude.json`、`.cursor/mcp.json` 和项目 `.mcp.json`，需要确认只生效一份 `mediaclaw`。当前会话没有出现工具时，在 TUI 中用 `/mcps` 按 `r` 刷新，或重新运行 `grok`。更新方式为重新拉取该目录，暂不支持“升级 MediaClaw Agent”自动更新。
+Grok Build 没有插件市场，使用本机 MCP 连接器。Agent 把官方仓库克隆到 `~/.mediaclaw/MediaClaw-Agent`（Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`），备份后只在 `~/.grok/config.toml` 中新增或替换 `[mcp_servers.mediaclaw]`：`command` 为该目录下 `plugins/mediaclaw/scripts/launch-agent.cmd` 的绝对路径，`env` 设置 `MEDIACLAW_AGENT_HOST = "grok-build"` 与 `MEDIACLAW_AGENT_DEVICE_NAME = "MediaClaw Agent (Grok Build)"`。随后用 `grok mcp list --json` 和 `grok mcp doctor mediaclaw --json` 复查。Grok 也会读取 `~/.claude.json`、`.cursor/mcp.json` 和项目 `.mcp.json`，需要确认只生效一份 `mediaclaw`。当前会话没有出现工具时，在 TUI 中用 `/mcps` 按 `r` 刷新，或重新运行 `grok`。之后在 Grok Build 中说“升级 MediaClaw Agent”即可自动更新：Agent 从官方地址拉取该目录并核对版本，提示重新运行 `grok` 激活。
+
+### DeepSeek Harness
+
+DeepSeek Harness 没有插件市场，使用官方 `@deepseek-ai/dsh-mcp-client` 的 stdio 连接。Agent 把官方仓库克隆到 `~/.mediaclaw/MediaClaw-Agent`，备份后在当前 profile 的 `~/.dsh/profiles/<profile>/cordis.patch.yml`（桌面版为 `desktop`）末尾追加一个 `insert` 补丁：补丁文件只能覆盖已有条目，新增插件不写成 `- insert: [ … ]` 会被静默跳过。条目为 `id: mediaclaw`、`name: '@deepseek-ai/dsh-mcp-client'`，`config` 中 `serverName: mediaclaw`、`transport: stdio`、`command` 指向 `plugins/mediaclaw/scripts/launch-agent.cmd` 的绝对路径，`env` 设置 `MEDIACLAW_AGENT_HOST: deepseek-harness` 与 `MEDIACLAW_AGENT_DEVICE_NAME: 'MediaClaw Agent (DeepSeek Harness)'`。宿主会过滤含 KEY、TOKEN、SECRET、PASSWORD 或以 `DSH_` 开头的变量名。保存后完全退出并重新打开 DeepSeek Harness，新会话中出现 `mcp__mediaclaw__*` 工具即接入成功。之后说“升级 MediaClaw Agent”即可自动更新，完成后重开 DeepSeek Harness 激活。
+
+### Cursor
+
+Cursor 的编辑器和 `cursor-agent` 命令行共用用户级 `~/.cursor/mcp.json`，配一次两边都能用，并共用同一个设备身份。Agent 把官方仓库克隆到 `~/.mediaclaw/MediaClaw-Agent`，备份后只新增或替换 `mcpServers.mediaclaw`：`command` 为该目录下 `plugins/mediaclaw/scripts/launch-agent.cmd` 的绝对路径，`env` 设置 `MEDIACLAW_AGENT_HOST: "cursor"` 与 `MEDIACLAW_AGENT_DEVICE_NAME: "MediaClaw Agent (Cursor)"`；不要写进项目的 `.cursor/mcp.json`。用 `cursor-agent mcp list-tools mediaclaw` 确认工具，编辑器中在 Cursor Settings → MCP 确认已启用，新开 Agent 对话后即可配对。之后说“升级 MediaClaw Agent”即可自动更新。
 
 ### Grok Bot（云电脑）
 
@@ -43,7 +51,7 @@ Grok Bot 在自己的云电脑上工作，浏览器插件和 Agent 都安装在�
 
 1. 浏览器插件：先在云电脑浏览器打开 Chrome 应用商店安装；不可用时从 `https://mediaclaw.app/download` 下载本地安装包，解压后在 `chrome://extensions` 开启开发者模式并加载已解压的扩展程序。
 2. 激活：用户在对话中提供激活码，Bot 在插件中填写并确认会员有效，不把激活码写入文件或日志。
-3. 连接器：克隆官方仓库到 `/workspace/mediaclaw/MediaClaw-Agent`，用 Grok Bot 的自定义 MCP 服务器能力新增 stdio 服务器 `mediaclaw`，启动命令为 `plugins/mediaclaw/scripts/launch-agent`，环境变量为 `MEDIACLAW_AGENT_HOST=grok-bot`、`MEDIACLAW_AGENT_DEVICE_NAME=MediaClaw Agent (Grok Bot 云电脑)`、`MEDIACLAW_AGENT_STATE_DIR=/workspace/mediaclaw/state`、`PLUGIN_DATA=/workspace/mediaclaw/plugin-data`，让设备身份与运行时在云电脑恢复后保留。
+3. 连接器：克隆官方仓库到 `/workspace/mediaclaw/MediaClaw-Agent`，用 Grok Bot 的自定义 MCP 服务器能力新增 stdio 服务器 `mediaclaw`，启动命令为 `plugins/mediaclaw/scripts/launch-agent`，环境变量为 `MEDIACLAW_AGENT_HOST=grok-bot`、`MEDIACLAW_AGENT_DEVICE_NAME=MediaClaw Agent (Grok Bot 云电脑)`、`MEDIACLAW_AGENT_STATE_DIR=/workspace/mediaclaw/state`、`PLUGIN_DATA=/workspace/mediaclaw/plugin-data`，让设备身份与运行时在云电脑恢复后保留。之后在 Grok Bot 中说“升级 MediaClaw Agent”，Bot 会从官方地址拉取 `/workspace/mediaclaw/MediaClaw-Agent` 并验版，新开对话即可激活。
 4. 配对与登录：在插件“Agent 接管”中开启调用；出现待批准设备时，由 Bot 在云电脑浏览器中自行点击“批准配对”，只批准设备名为 `MediaClaw Agent (Grok Bot 云电脑)` 且是自己刚启动的连接器，名称不符或出现其他设备时停止并告知用户。用户只需接管画面扫码或输入账号登录平台。
 
 同一云电脑上的其他 Bot 共享浏览器登录状态；平台提示环境或网络风险时，可在 Grok 设置的 Computer 中让流量经由用户桌面。
@@ -81,7 +89,7 @@ Grok Bot 在自己的云电脑上工作，浏览器插件和 Agent 都安装在�
 
 ## 后续更新
 
-在已有 MediaClaw 的 Codex、WorkBuddy 或 Claude Code 对话中直接说“升级 MediaClaw Agent”即可。这句话本身代表明确授权；Agent 会自行刷新官方 marketplace、安装、核验版本并保存原任务，不向用户展示或要求用户执行终端、CLI、斜杠命令、缓存清理或路径操作。
+在已有 MediaClaw 的 Codex、WorkBuddy、Claude Code、Grok Build、Grok Bot、DeepSeek Harness 或 Cursor 对话中直接说“升级 MediaClaw Agent”即可。这句话本身代表明确授权；Agent 会自行刷新官方 marketplace、安装、核验版本并保存原任务，不向用户展示或要求用户执行终端、CLI、斜杠命令、缓存清理或路径操作。
 
 安装完成后必须完全退出并重新打开当前宿主。运行中的旧对话不能热加载新 Skill/MCP，同一进程里再建对话也不能作为新版生效证据。重开后只有状态显示新版已经真实激活，才会自动继续原任务；已有设备批准默认复用。正式版更新只跟随正式 Release，不跟随 prerelease。
 

@@ -5,8 +5,11 @@
 合并了从未正式发布的 0.3.2 改动（见下方 0.3.2 小节），新增 TikTok 支持与 Claude Code、Grok Build、Grok Bot（云电脑）宿主。以正式 Release 发布（Latest），已安装的正式版会收到升级。
 
 - 新增 Claude Code 宿主：提供 Claude Code marketplace 与插件清单，复用同一套 MCP 与内容研究 Skill。Claude Code 的终端、桌面版和 IDE 共用一个设备身份，在浏览器插件中批准一次即可；支持“升级 MediaClaw Agent”自动更新，运行时保存在 Claude Code 的持久插件数据目录。
-- 新增 Grok Build 宿主：Grok Build 没有插件市场，Agent 把官方仓库克隆到用户目录，并在 `~/.grok/config.toml` 中登记 `mediaclaw` 本机 MCP 连接器（`MEDIACLAW_AGENT_HOST=grok-build`）；更新需重新拉取仓库，暂不支持自动升级。
+- 新增 Grok Build 宿主：Grok Build 没有插件市场，Agent 把官方仓库克隆到用户目录，并在 `~/.grok/config.toml` 中登记 `mediaclaw` 本机 MCP 连接器（`MEDIACLAW_AGENT_HOST=grok-build`）。
 - 新增 Grok Bot（云电脑）宿主：浏览器插件与 Agent 都安装在 Grok 云电脑中，持久文件位于 `/workspace/mediaclaw`；Bot 自行批准本设备配对，用户只需接管画面登录平台。
+- 新增 DeepSeek Harness 宿主：通过官方 `@deepseek-ai/dsh-mcp-client` 的 stdio 连接接入，在 profile 的 `cordis.patch.yml` 中以 `insert` 补丁登记 `mediaclaw`（`MEDIACLAW_AGENT_HOST=deepseek-harness`）。
+- 新增 Cursor 宿主：编辑器与 cursor-agent 命令行共用用户级 `~/.cursor/mcp.json`，在其中登记 `mediaclaw` 本机连接器（`MEDIACLAW_AGENT_HOST=cursor`），两边共用一个设备身份。
+- Grok Build、Grok Bot、DeepSeek Harness 与 Cursor 支持“升级 MediaClaw Agent”一句话自动更新：启动器从官方仓库的克隆目录运行时导出 `MEDIACLAW_AGENT_PACKAGE_ROOT`，Adapter 在用户同意后在安装目录干净时从官方地址获取已确认稳定版标签并仅快进到该版本，再核对清单版本，提示重开宿主激活；没有克隆目录时（如本地源码启动）仍提示重新执行安装提示。
 - 不受支持的宿主不能注册到 Broker、创建设备身份或请求升级。
 
 ## 0.3.2 — 未单独发布，并入 0.4.0

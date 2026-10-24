@@ -6,6 +6,7 @@ import {resolveStateDirectory} from "./device-identity.mjs";
 import {
   agentHostDisplayName,
   agentHostSupportsAutomaticUpdate,
+  agentHostUpdateSource,
   normalizeAgentHostKey,
   isSupportedAgentHost,
 } from "./agent-hosts.mjs";
@@ -14,6 +15,8 @@ const DEFAULT_RELEASES_URL =
   "https://api.github.com/repos/IvyXue18/MediaClaw-Agent/releases?per_page=5";
 const MARKETPLACE_NAME = "mediaclaw-agent";
 const PLUGIN_SELECTOR = "mediaclaw@mediaclaw-agent";
+const OFFICIAL_REPOSITORY_URL = "https://github.com/IvyXue18/MediaClaw-Agent.git";
+const PACKAGE_MANIFEST_PATH = "plugins/mediaclaw/.codex-plugin/plugin.json";
 const UPDATE_CHECK_TIMEOUT_MS = 3_000;
 const UPDATE_COMMAND_TIMEOUT_MS = 2 * 60 * 1000;
 const UPDATE_OUTPUT_LIMIT = 64 * 1024;
@@ -134,7 +137,49 @@ export function compareVersions(leftValue, rightValue) {
   return comparePrerelease(left.prerelease, right.prerelease);
 }
 
-function updateCommandPlan(hostKey) {
+// The launcher exports this only when it runs from a git checkout; local source launchers never do.
+function resolvePackageRoot(value) {
+  const root = String(value || "").trim();
+  return root && path.isAbsolute(root) ? root : "";
+}
+
+function canUpdateAutomatically(hostKey, packageRoot) {
+  if (!agentHostSupportsAutomaticUpdate(hostKey)) return false;
+  return agentHostUpdateSource(hostKey) !== "git_checkout" || Boolean(resolvePackageRoot(packageRoot));
+}
+
+function updateCommandPlan(hostKey, packageRootValue, targetVersion) {
+  if (agentHostUpdateSource(hostKey) === "git_checkout") {
+    const packageRoot = resolvePackageRoot(packageRootValue);
+    const version = parseVersion(targetVersion);
+    if (!packageRoot || !version || version.prerelease.length) return null;
+    // Fetch the approved stable release, never the potentially unreleased default branch.
+    return {
+      commands: [
+        {
+          file: "git",
+          args: ["-C", packageRoot, "status", "--porcelain"],
+          requireCleanCheckout: true,
+        },
+        {
+          file: "git",
+          args: ["-C", packageRoot, "fetch", "--no-tags", OFFICIAL_REPOSITORY_URL, `refs/tags/v${version.raw}`],
+        },
+        {
+          file: "git",
+          args: ["-C", packageRoot, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
+        },
+        {
+          file: "git",
+          args: ["-C", packageRoot, "merge", "--ff-only", "FETCH_HEAD"],
+        },
+      ],
+      verify: {
+        file: "git",
+        args: ["-C", packageRoot, "show", `HEAD:${PACKAGE_MANIFEST_PATH}`],
+      },
+    };
+  }
   if (hostKey === "workbuddy") {
     return {
       commands: [
@@ -248,7 +293,7 @@ export function createAgentUpdateStateStore({
   };
 }
 
-function buildUpdateState({currentVersion, latestVersion, hostKey, checkedAt}) {
+function buildUpdateState({currentVersion, latestVersion, hostKey, checkedAt, packageRoot}) {
   const comparison = compareVersions(currentVersion, latestVersion);
   if (comparison === null) {
     return {
@@ -270,7 +315,7 @@ function buildUpdateState({currentVersion, latestVersion, hostKey, checkedAt}) {
     };
   }
   const hostDisplayName = agentHostDisplayName(hostKey);
-  if (!agentHostSupportsAutomaticUpdate(hostKey)) {
+  if (!canUpdateAutomatically(hostKey, packageRoot)) {
     return {
       status: "manual_update_available",
       currentVersion,
@@ -341,6 +386,7 @@ export function createAgentUpdateChecker({
   manifestUrl =
     process.env.MEDIACLAW_AGENT_UPDATE_MANIFEST_URL || DEFAULT_RELEASES_URL,
   fetchImpl = globalThis.fetch,
+  packageRoot = process.env.MEDIACLAW_AGENT_PACKAGE_ROOT,
 } = {}) {
   if (!isSupportedAgentHost(hostKey)) throw new Error("Unsupported MediaClaw Agent host");
   let pendingCheck = null;
@@ -377,6 +423,7 @@ export function createAgentUpdateChecker({
           latestVersion,
           hostKey,
           checkedAt,
+          packageRoot,
         });
       } catch (error) {
         return {
@@ -551,6 +598,7 @@ export function createAgentUpdateOrchestrator({
   commandRunner = runAgentUpdateCommand,
   approvalIdFactory = () => `update_${crypto.randomUUID()}`,
   stateStore = createAgentUpdateStateStore({hostKey}),
+  packageRoot = process.env.MEDIACLAW_AGENT_PACKAGE_ROOT,
 } = {}) {
   if (!checker || typeof checker.check !== "function") {
     throw new TypeError("agent update checker is required");
@@ -721,7 +769,7 @@ export function createAgentUpdateOrchestrator({
     if (pendingApply) return await pendingApply;
     pendingApply = (async () => {
       dismissed = false;
-      const plan = updateCommandPlan(hostKey);
+      const plan = updateCommandPlan(hostKey, packageRoot, state.latestVersion);
       if (!plan) {
         return {
           ok: false,
@@ -734,7 +782,8 @@ export function createAgentUpdateOrchestrator({
       for (let index = 0; index < plan.commands.length; index += 1) {
         const command = plan.commands[index];
         const result = normalizeCommandResult(await commandRunner(command));
-        if (result.code !== 0) {
+        const dirtyCheckout = command.requireCleanCheckout && Boolean(result.stdout.trim());
+        if (result.code !== 0 || dirtyCheckout) {
           return {
             ok: false,
             agentUpdate: {
@@ -744,7 +793,7 @@ export function createAgentUpdateOrchestrator({
               approvalRequired: true,
               approvalId,
               failedStage: `install_${index + 1}`,
-              message: failureMessage(result),
+              message: dirtyCheckout ? "Agent 安装目录有本地修改，请保留并整理修改后再升级。" : failureMessage(result),
             },
           };
         }
