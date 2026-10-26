@@ -1,6 +1,6 @@
 {
   "contractVersion": "2.6.0",
-  "serverVersion": "0.4.0-rc.1",
+  "serverVersion": "0.4.0",
   "transport": "stdio+loopback_websocket",
   "protocolVersion": "3",
   "principles": {

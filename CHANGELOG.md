@@ -1,13 +1,12 @@
 # Changelog
 
-## 0.4.0-rc.1 — 2026-10-26（Pre-release）
+## 0.4.0 — 2026-10-27
 
-面向 `0.4.0` 浏览器插件的 Agent 候选版，合并了从未正式发布的 0.3.2 改动（见下方小节），提供 TikTok 能力接入及新增宿主入口。新增宿主属于候选支持，实际兼容性与可用能力以当前宿主和浏览器插件连接结果为准。
+面向 `0.4.0` 浏览器插件的 Agent 正式版（GitHub Latest），合并了从未正式发布的 0.3.2 改动（见下方小节），新增 TikTok 支持及豆包工作、Claude Code、Grok Build、Grok Bot、DeepSeek Harness、Cursor 宿主。已安装 `0.3.1` 的 Codex、WorkBuddy 会收到升级，安装过 `0.4.0-rc.1` 预发布版的宿主也可升级到本版本。
 
-- 通过固定标签 `v0.4.0-rc.1` 安装候选，宿主清单和正式启动器对应同一候选运行时；安装后核对真实活动版本，不能只看插件注册记录。
-- 提供 Codex、WorkBuddy、豆包工作、Claude Code、Grok Build、Grok Bot、DeepSeek Harness、Cursor 的候选安装说明。各宿主使用自己的身份标识，DeepSeek Harness 使用 `deepseek-harness`，不借用 `workbuddy`。
-- 本次为 GitHub Pre-release，稳定版 Latest 保持 `v0.3.1`，正式用户不会自动升级到候选。安装说明及可复制给 Agent 的提示词见 [安装与连接](docs/INSTALLATION.md#安装-04-候选版)。
-
+- 提供 Codex、WorkBuddy、豆包工作、Claude Code、Grok Build、Grok Bot、DeepSeek Harness、Cursor 的安装说明及可复制给 Agent 的提示词，见 [安装与连接](docs/INSTALLATION.md)。各宿主使用自己的身份标识，DeepSeek Harness 使用 `deepseek-harness`，不借用 `workbuddy`；安装后核对真实活动版本，不能只看插件注册记录。
+- 新增 TikTok 支持：Agent 可调用浏览器插件采集 TikTok 单篇作品、作者主页、搜索结果和已显示评论，支持采集增强与数据池读取；暂不支持探索页、逐字稿、配图文字、私信和监控。首次使用需在社媒虾侧栏授权 TikTok 访问，采集中出现人机验证时会暂停并保留已采结果。
+- 豆包工作连接器改用正式启动器 `plugins/mediaclaw/scripts/launch-agent.cmd`，只需 `MEDIACLAW_AGENT_HOST` 与 `MEDIACLAW_AGENT_DEVICE_NAME` 两个变量，不再需要用户安装 Node；暂不支持一句话自动升级，更新时重新发送安装提示词。
 - 新增 Claude Code 宿主：提供 Claude Code marketplace 与插件清单，复用同一套 MCP 与内容研究 Skill。Claude Code 的终端、桌面版和 IDE 共用一个设备身份，在浏览器插件中批准一次即可；支持“升级 MediaClaw Agent”自动更新，运行时保存在 Claude Code 的持久插件数据目录。
 - 新增 Grok Build 宿主：Grok Build 没有插件市场，Agent 把官方仓库克隆到用户目录，并在 `~/.grok/config.toml` 中登记 `mediaclaw` 本机 MCP 连接器（`MEDIACLAW_AGENT_HOST=grok-build`）。
 - 新增 Grok Bot（云电脑）宿主：浏览器插件与 Agent 都安装在 Grok 云电脑中，持久文件位于 `/workspace/mediaclaw`；Bot 自行批准本设备配对，用户只需接管画面登录平台。
