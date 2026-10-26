@@ -1,6 +1,6 @@
 {
   "name": "mediaclaw-agent",
-  "version": "0.4.0",
+  "version": "0.4.0-rc.1",
   "private": true,
   "description": "MediaClaw Agent host integration package",
   "type": "module",

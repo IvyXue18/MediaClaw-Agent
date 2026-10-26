@@ -1,10 +1,10 @@
 # MediaClaw Agent
 
-MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包，面向 Codex、WorkBuddy、Claude Code、Grok Build、Grok Bot（云电脑）、DeepSeek Harness 和 Cursor 提供安装入口。连接成功后，你可以直接使用 MediaClaw 浏览器插件已经提供的内容采集、资料读取和社媒研究能力，并继续完成选题、策划与内容创作。
+MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包。正式版支持 Codex 与 WorkBuddy；`0.4.0-rc.1` 候选版另提供豆包工作、Claude Code、Grok Build、Grok Bot（云电脑）、DeepSeek Harness 和 Cursor 接入入口，供配套 `0.4.0` 浏览器插件测试使用。连接成功后，你可以直接使用 MediaClaw 浏览器插件已经提供的内容采集、资料读取和社媒研究能力，并继续完成选题、策划与内容创作。
 
 它不能单独使用：你还需要安装 MediaClaw 浏览器插件、完成有效会员验证，并在浏览器中批准当前 Agent。设备配对与平台登录是接入前提；任务范围、费用和执行结果应在 Agent 对话中说明。
 
-> 当前正式版本为 `0.3.1`，仓库中的 `0.4.0`（含原 0.3.2 改动与 Claude Code 支持）尚未正式发布。请以 [Releases](https://github.com/IvyXue18/MediaClaw-Agent/releases) 中的版本说明和 MediaClaw 插件实际提示为准。
+> 正式版 Latest 保持 `0.3.1`。测试 `0.4.0` 浏览器插件时，请明确安装 [Agent `v0.4.0-rc.1` 预发布候选](https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v0.4.0-rc.1)，不要使用默认 `main` 或 Latest 安装入口。新增宿主属于候选支持，其实际兼容性和可用能力以当前宿主连接结果为准。
 
 ## 可以做什么
 
@@ -31,7 +31,7 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 
 ## 在对话里确定方案
 
-以下是尚未发布的 `0.4.0` 源码行为，已安装 `0.3.1` 的运行会话不会自动获得。插件和 Agent 需要使用匹配版本；以当前连接返回的可用能力为准，未接入项会明确说明。
+以下流程属于 `0.4.0-rc.1` 候选版，已安装 `0.3.1` 的运行会话不会自动获得。插件和 Agent 需要使用匹配版本；以当前连接返回的可用能力为准，未接入项会明确说明。
 
 设备配对完成后，研究、采集、修改、确认和停止都在 Agent 对话里完成。你已明确指定普通采集的对象和范围时，Agent 可以直接按请求执行；只说“帮我看看最近热门选题”时，Agent 应先给出可修改的来源、时间、数量和内容范围，再等你回复。默认的半年、80 条等只是建议。回复“可以”“按这个来”即可，不需要固定口令；同一方案拆成几批执行或按已说明的规则重试，不会反复询问。
 
@@ -56,12 +56,20 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 1. 安装或升级 MediaClaw 浏览器插件。
 2. 在 MediaClaw 插件中完成有效会员验证。
 3. 在浏览器中登录你要使用的小红书或抖音账号。
-4. 在 Codex、WorkBuddy 或 Claude Code 中安装本仓库的 MediaClaw 接入包。
+4. 按所选版本在当前宿主中安装 MediaClaw 接入包；候选版须配套 `0.4.0` 浏览器插件。
 5. 打开 MediaClaw 插件的“Agent 接管”，批准当前 Agent。
 
-## 第一次安装也可以交给 Agent
+## 安装 0.4 候选版
 
-你可以直接把下面的话发给 Codex、WorkBuddy 或 Claude Code：
+将下面的话发给你正在测试的宿主 Agent；豆包工作由 Agent 准备配置，再由你保存连接器，Grok Bot 在自己的云电脑上安装：
+
+> 请安装 MediaClaw Agent 候选版 `v0.4.0-rc.1`，配合我正在测试的 `0.4.0` 浏览器插件。先读取 https://github.com/IvyXue18/MediaClaw-Agent/blob/v0.4.0-rc.1/docs/INSTALLATION.md 的候选安装说明；从官方仓库获取并固定到这个标签，不使用默认 main 或 Latest。按当前宿主选择 marketplace 或 STDIO 接入，使用候选包的正式启动器和当前宿主的正确标识，DeepSeek Harness 必须是 deepseek-harness，不能冒充 workbuddy。保留其他插件与 MCP 配置。完成后核对实际运行版本为 0.4.0-rc.1、宿主身份与连接状态，再引导我批准设备；不要让我操作终端或下载运行时，不要把工具注册成功当成已经连接浏览器。
+
+固定标签、各宿主标识和连接器配置见[候选安装步骤](docs/INSTALLATION.md#安装-04-候选版)。普通“升级 MediaClaw Agent”检查的是稳定版，不会自动选取这个候选。
+
+## 安装正式版
+
+正式版 `0.3.1` 用户可以把下面的话发给 Codex 或 WorkBuddy：
 
 > 请从 https://github.com/IvyXue18/MediaClaw-Agent 通过当前宿主的 marketplace 安装、升级或修复 MediaClaw 官方接入包，完成后继续检查连接并引导我批准设备。平台和芯片识别、官方运行时准备、SHA-256 校验及连接复查都由你完成；不要让我下载 ZIP、选择 `.exe`、使用终端，或向我索取激活码、Cookie、平台 Token、端口和本机令牌。
 
@@ -73,7 +81,7 @@ WorkBuddy 中如果 Agent 声称找不到安装工具，请让它继续检查应
 
 - MediaClaw Agent 必须配合官方浏览器插件使用，不能替代浏览器插件。
 - Agent 只能使用你在浏览器插件中批准的能力。
-- 待发布的对话方案流程会沿用普通具体请求；尚未明确的范围和敏感操作先预览再等回复。除设备配对外，不要求回插件确认。
+- 候选版的对话方案流程会沿用普通具体请求；尚未明确的范围和敏感操作先预览再等回复。除设备配对外，不要求回插件确认。
 - 遇到登录失效、验证码、平台限制或风险提示时，任务可能暂停并请你在浏览器中处理。
 - 涉及会员、积分或外部写入的操作，以执行前显示的范围和确认信息为准。
 - 请不要在对话、Issue 或日志中提交 Cookie、Token、激活码、设备私钥或真实用户数据。

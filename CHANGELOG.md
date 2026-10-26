@@ -1,8 +1,12 @@
 # Changelog
 
-## 0.4.0 — Unreleased
+## 0.4.0-rc.1 — 2026-10-26（Pre-release）
 
-合并了从未正式发布的 0.3.2 改动（见下方 0.3.2 小节），新增 TikTok 支持与 Claude Code、Grok Build、Grok Bot（云电脑）宿主。以正式 Release 发布（Latest），已安装的正式版会收到升级。
+面向 `0.4.0` 浏览器插件的 Agent 候选版，合并了从未正式发布的 0.3.2 改动（见下方小节），提供 TikTok 能力接入及新增宿主入口。新增宿主属于候选支持，实际兼容性与可用能力以当前宿主和浏览器插件连接结果为准。
+
+- 通过固定标签 `v0.4.0-rc.1` 安装候选，宿主清单和正式启动器对应同一候选运行时；安装后核对真实活动版本，不能只看插件注册记录。
+- 提供 Codex、WorkBuddy、豆包工作、Claude Code、Grok Build、Grok Bot、DeepSeek Harness、Cursor 的候选安装说明。各宿主使用自己的身份标识，DeepSeek Harness 使用 `deepseek-harness`，不借用 `workbuddy`。
+- 本次为 GitHub Pre-release，稳定版 Latest 保持 `v0.3.1`，正式用户不会自动升级到候选。安装说明及可复制给 Agent 的提示词见 [安装与连接](docs/INSTALLATION.md#安装-04-候选版)。
 
 - 新增 Claude Code 宿主：提供 Claude Code marketplace 与插件清单，复用同一套 MCP 与内容研究 Skill。Claude Code 的终端、桌面版和 IDE 共用一个设备身份，在浏览器插件中批准一次即可；支持“升级 MediaClaw Agent”自动更新，运行时保存在 Claude Code 的持久插件数据目录。
 - 新增 Grok Build 宿主：Grok Build 没有插件市场，Agent 把官方仓库克隆到用户目录，并在 `~/.grok/config.toml` 中登记 `mediaclaw` 本机 MCP 连接器（`MEDIACLAW_AGENT_HOST=grok-build`）。
