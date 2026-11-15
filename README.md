@@ -4,7 +4,7 @@ MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包
 
 它不能单独使用：你还需要安装 MediaClaw 浏览器插件、完成有效会员验证，并在浏览器中批准当前 Agent。设备配对与平台登录是接入前提；任务范围、费用和执行结果应在 Agent 对话中说明。
 
-> 当前正式版本为 [`0.4.0`](https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v0.4.0)（GitHub Latest），支持上述八个宿主和 TikTok，请配合 MediaClaw 浏览器插件 `0.4.0` 使用。已安装 `0.3.1` 的 Codex、WorkBuddy 用户直接说“升级 MediaClaw Agent”即可；之前安装过 0.4 预发布版的宿主也可以同样升级到正式版。各项能力以当前宿主和浏览器插件连接后返回的结果为准。
+> 当前正式版本为 [`0.4.1`](https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v0.4.1)（GitHub Latest），支持上述八个宿主和 TikTok，请配合 MediaClaw 浏览器插件 `0.4.0` 或更新版本使用。已安装旧版的用户直接说“升级 MediaClaw Agent”即可；豆包工作从官方接入教程获取升级提示词。各项能力以当前宿主和浏览器插件连接后返回的结果为准。
 
 ## 可以做什么
 
@@ -48,7 +48,7 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 
 这句话本身就是升级授权。Agent 会自行刷新官方来源、安装并核验新版本，同时保存你升级前没有做完的请求；不会让你打开终端、输入命令、寻找缓存目录或重新描述需求。
 
-宿主不会给运行中的旧对话热加载已经替换的 Skill 和 MCP。安装完成后，Agent 会明确提示你完全退出并重新打开当前宿主（Grok Build 为重新运行 `grok`，Grok Bot 为新开对话）；这是用户唯一需要做的动作。重开后只有当前运行版本确实等于目标版本，Agent 才会宣布升级完成并继续原请求。安装记录变了但旧进程仍在运行时，不算升级成功。更新检查失败不会阻塞当前版本使用；正式版不会自动跟随 prerelease。豆包工作暂不支持这句话自动升级，需要更新时重新发送下方安装提示词，由 Agent 更新安装目录并给出连接器核对步骤。
+宿主不会给运行中的旧对话热加载已经替换的 Skill 和 MCP。安装完成后，Agent 会明确提示你完全退出并重新打开当前宿主（Grok Build 为重新运行 `grok`，Grok Bot 为新开对话）；这是用户唯一需要做的动作。重开后只有当前运行版本确实等于目标版本，Agent 才会宣布升级完成并继续原请求。安装记录变了但旧进程仍在运行时，不算升级成功。更新检查失败不会阻塞当前版本使用；正式版不会自动跟随 prerelease。豆包工作暂不支持这句话自动升级，需要更新时从下方官方接入教程获取豆包工作的升级提示词，由 Agent 更新安装目录并给出连接器核对步骤。
 
 ## 安装前准备
 
@@ -57,14 +57,14 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 1. 安装或升级 MediaClaw 浏览器插件。
 2. 在 MediaClaw 插件中完成有效会员验证。
 3. 在浏览器中登录你要使用的小红书、抖音或 TikTok 账号。
-4. 在当前宿主中安装本仓库的 MediaClaw 接入包；`0.4.0` Agent 配套 `0.4.0` 浏览器插件。
+4. 在当前宿主中安装本仓库的 MediaClaw 接入包；`0.4.1` Agent 配套 `0.4.0` 或更新版本的浏览器插件。
 5. 打开 MediaClaw 插件的“Agent 接管”，批准当前 Agent。
 
 ## 第一次安装也可以交给 Agent
 
-你可以直接把下面的话发给正在使用的宿主 Agent；豆包工作由 Agent 准备配置，再由你保存连接器，Grok Bot 在自己的云电脑上安装：
+在[官方接入教程](https://mediaclaw.app/docs/agent/setup)选择当前宿主及“安装”“修复”或“升级”，复制对应提示词发给该宿主 Agent。豆包工作由 Agent 准备配置，再由你保存连接器；Grok Bot 在自己的云电脑上安装。
 
-> 请从 https://github.com/IvyXue18/MediaClaw-Agent 安装、升级或修复 MediaClaw 官方接入包，先读取 https://github.com/IvyXue18/MediaClaw-Agent/blob/main/docs/INSTALLATION.md 中当前宿主的安装说明。按当前宿主选择 marketplace 或 STDIO 接入，使用官方仓库默认分支和正式启动器，以及当前宿主的正确标识，DeepSeek Harness 必须是 deepseek-harness，不能冒充 workbuddy；保留其他插件与 MCP 配置。平台和芯片识别、官方运行时准备、SHA-256 校验及连接复查都由你完成；完成后核对实际运行版本为 0.4.0、宿主身份与连接状态，再引导我批准设备。不要让我下载 ZIP、选择 `.exe`、使用终端，或向我索取激活码、Cookie、平台 Token、端口和本机令牌，也不要把工具注册成功当成已经连接浏览器。
+八个宿主的提示词统一维护在 [install-prompts.json](plugins/mediaclaw/contracts/install-prompts.json)，由[提示词接口](https://api.mediaclaw.app/api/agent-prompts)提供给浏览器插件和官网。`revision` 是提示词修订编号，`agentVersion` 才是目标 Agent 版本；更新安装指引不代表发布了新的 Agent 运行时。修复和升级都会核对官方来源、正式渠道及实际运行版本，并保留已有设备身份与数据。
 
 各宿主标识、连接器配置和排查方法见[安装与连接](docs/INSTALLATION.md)。
 

@@ -1,6 +1,6 @@
 # 安装与连接 MediaClaw Agent
 
-MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户不需要自行配置端口、令牌或运行服务。当前正式版本为 `0.4.0`（GitHub Latest），支持 Codex、WorkBuddy、豆包工作、Claude Code、Grok Build、Grok Bot（云电脑）、DeepSeek Harness 和 Cursor，需要配套 MediaClaw 浏览器插件 `0.4.0`。实际可用能力以连接后返回的结果为准。
+MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户不需要自行配置端口、令牌或运行服务。当前正式版本为 `0.4.1`（GitHub Latest），支持 Codex、WorkBuddy、豆包工作、Claude Code、Grok Build、Grok Bot（云电脑）、DeepSeek Harness 和 Cursor，需要配套 MediaClaw 浏览器插件 `0.4.0` 或更新版本。实际可用能力以连接后返回的结果为准。
 
 ## 第一步：准备浏览器插件
 
@@ -9,17 +9,19 @@ MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户�
 3. 在浏览器中登录需要使用的小红书、抖音或 TikTok 账号。
 4. 确认插件可以正常打开。
 
+Agent 配对请使用 Chrome / Edge 137 或以上版本，建议更新到最新版。在地址栏打开 `chrome://settings/help` 或 `edge://settings/help` 查看版本，更新后重启浏览器。配对所需的 Ed25519 验签能力从该版本起受支持，见 [MDN 兼容性数据](https://github.com/mdn/browser-compat-data/blob/main/api/SubtleCrypto.json)；插件可以采集不代表旧浏览器一定能配对。
+
 ## 第二步：把安装交给 Agent
 
-浏览器插件和 Agent 是两个独立安装包，版本须分别核对：`0.4.0` Agent 配套 `0.4.0` 浏览器插件。在当前宿主的新对话中直接发送以下提示词；豆包工作由 Agent 准备配置，再由你保存连接器，Grok Bot 在自己的云电脑上安装：
+浏览器插件和 Agent 是两个独立安装包，版本须分别核对：`0.4.1` Agent 配套 `0.4.0` 或更新版本的浏览器插件。前往[官方接入教程](https://mediaclaw.app/docs/agent/setup)，选择当前宿主及“安装”“修复”或“升级”，把对应提示词发给该宿主 Agent。豆包工作由 Agent 准备配置，再由你保存连接器，Grok Bot 在自己的云电脑上安装。
 
-> 请从 https://github.com/IvyXue18/MediaClaw-Agent 安装、升级或修复 MediaClaw 官方接入包，先读取 https://github.com/IvyXue18/MediaClaw-Agent/blob/main/docs/INSTALLATION.md 中当前宿主的安装说明。按当前宿主选择 marketplace 或 STDIO 接入，使用官方仓库默认分支和正式启动器，以及当前宿主的正确标识，DeepSeek Harness 必须是 deepseek-harness，不能改成 workbuddy；保留其他插件与 MCP 配置。平台和芯片识别、官方运行时准备、SHA-256 校验及连接复查都由你完成；完成后核对实际运行版本为 0.4.0、宿主身份与连接状态，再引导我批准设备。不要让我下载 ZIP、选择 `.exe` 或使用终端，不要向我索取平台 Cookie、Token 或本机令牌，也不要把工具注册成功当成已经连接浏览器。
+完整提示词只有一份来源：[install-prompts.json](../plugins/mediaclaw/contracts/install-prompts.json)。浏览器插件和官网通过[提示词接口](https://api.mediaclaw.app/api/agent-prompts)读取相同内容，使用 `revision` 区分提示词修订、`agentVersion` 区分目标运行时版本；本页保留配置字段与排查说明。修复或升级时，即使工具已经存在、浏览器已经连接，也必须核对当前官方来源、正式渠道和实际运行版本，不能只看安装列表。
 
 以下安装操作由 Agent 执行：
 
 1. **Codex、WorkBuddy、Claude Code**：用宿主自身的插件管理工具或 CLI 注册官方 `IvyXue18/MediaClaw-Agent` 为 `mediaclaw-agent` marketplace，再安装 `mediaclaw@mediaclaw-agent`。同名市场已存在时先核对来源并刷新；若仍指向旧本地目录或其他来源，仅移除这一个旧市场注册，按官方来源重新注册并重新安装，保留其他市场和插件。通过宿主列表核对来源、安装路径、启用状态和版本 `0.4.0`；不得手写安装注册文件。WorkBuddy 每次调用 CLI 都须使用实际用户数据目录，见下方排查说明。
 2. **豆包工作、Grok Build、Grok Bot、DeepSeek Harness、Cursor**：先把官方仓库 `https://github.com/IvyXue18/MediaClaw-Agent.git` 的默认分支克隆到长期目录：本机为 `~/.mediaclaw/MediaClaw-Agent`，Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`；Grok Bot 为 `/workspace/mediaclaw/MediaClaw-Agent`。已有目录先核对 origin 为官方地址、工作区无未保存改动，再从官方地址更新到当前正式版；之前固定在预发布标签的目录同样更新到正式版。有本地改动时保留原目录，在另一个长期目录准备正式版，也不要修改开发源码仓。然后按下方宿主说明配置 STDIO：命令指向该目录下 `plugins/mediaclaw/scripts/launch-agent.cmd` 的绝对路径，Grok Bot 使用 `plugins/mediaclaw/scripts/launch-agent`。这些正式启动器会自动下载并校验当前版本的原生运行时，不使用 `launch-agent-local.cmd`，不需要用户安装 Node。
-3. 重开需要重开的宿主，用 MCP 握手或连接状态核对实际 Adapter 版本为 `0.4.0`，且宿主标识与下表一致。运行的仍是旧版本、仅清单版本变了、或工具尚未加载时，都不能宣布安装完成。连接器工具已注册也不等于浏览器已配对；继续按“批准连接”核查。
+3. 重开需要重开的宿主，用 MCP 握手或连接状态核对实际 Adapter 版本为 `0.4.1`，且宿主标识与下表一致。运行的仍是旧版本、仅清单版本变了、或工具尚未加载时，都不能宣布安装完成。连接器工具已注册也不等于浏览器已配对；继续按“批准连接”核查。
 
 | 宿主 | `MEDIACLAW_AGENT_HOST` | 设备显示名 |
 | --- | --- | --- |
@@ -45,6 +47,22 @@ Agent 负责识别宿主、注册官方来源和安装接入包。接入包第�
 Agent 应先核实 WorkBuddy 的实际用户数据目录，每次调用内置 CLI 都通过 `CODEBUDDY_CONFIG_DIR` 指向同一目录（WorkBuddy AI 常见为 `~/.workbuddy-ai`）。先用插件与市场列表确认操作的是当前 WorkBuddy，避免写到独立 CodeBuddy 的配置目录。市场已注册时仍需确认官方来源并刷新，再安装或更新 `mediaclaw@mediaclaw-agent`，通过宿主列表复查实际版本、安装路径和启用状态。上述操作由 Agent 执行，不要求用户输入终端或斜杠命令，也不能靠手写安装记录代替宿主安装。
 
 安装能力与会话管理能力应分别检查。缺少自动新建会话能力时，Agent 仍应先完成安装、启用和验版，再说明必要的重开或新会话动作。没有实际创建续接会话或设置续接机制时，不能承诺新会话会自行开始检查。如果内置 CLI 也确实不可用，Agent 应简短说明具体失败点，并按当前界面给出最少操作步骤。
+
+### WorkBuddy 已安装但仍连接不上
+
+安装时建议选择 DeepSeek-V4.1-Flash（若当前宿主提供），并开启“允许完全访问”以完成本机安装检查；这是当前用户反馈中的推荐组合，其他模型也可能完成安装。更换模型不能代替浏览器升级、设备配对或启动配置修复。
+
+按当前失败环节处理：
+
+1. **当前对话没有工具**：按安装结果提示新开对话继续。升级或修复后先完全退出并重开 WorkBuddy，只关窗口可能仍在后台运行。需要续接文件时使用本机生成的路径，不照抄他人的路径。
+2. **发现设备但“批准配对”没有反应**：先核对 Chrome / Edge 是否为 137 或以上，更新并重启浏览器后再配对。若是总开关提示会员问题，则在扩展里完成有效会员验证。版本符合仍失败时保留错误继续诊断。
+3. **`MCP error -32000: Connection closed`、重连失败或状态反复变色**：完整保存报错，由当前 WorkBuddy 对话检查工具加载、扩展是否启用、调用开关、配对与实际运行版本。这句报错仅说明连接关闭，不能直接据此认定是网络或端口冲突。仍失败时检查实际启动命令、重复配置和临时预检残留；不要批量结束其他宿主或共享桥接进程。
+4. **日志提示“系统找不到指定的路径”**：检查当前宿主生效的命令路径及文件是否存在，使用官方安装机制修复后重开验证。另起临时适配器能运行，不代表宿主配置正确。
+5. **实际版本带 `local`**：从官方入口获取当前宿主的修复提示词，核对来源、启动命令和开发覆盖项，迁移回正式版，保留设备身份、配对与已有数据。不能只改版本文字。
+
+后台“常驻适配器”显示运行中，只能证明那个进程仍在运行。最终应由当前 WorkBuddy 对话调用 `mediaclaw_connection_status` 确认 `connected=true`，再读取一条已有数据验证；空数据如实报告，不新增采集或消耗积分。临时预检成功、授权列表仍保留设备或插件顶部一度变绿，都不能单独作为当前宿主接入完成的证据。
+
+同一台电脑可分别连接多个受支持宿主，每个宿主单独安装和配对，不需要先撤销其他宿主。共享桥接服务占用本机端口是正常运行的一部分；进程用途须先确认，多宿主接入也不代表可以并行操作同一个浏览器任务。更多用户步骤见[WorkBuddy 连接问题排查](https://mediaclaw.app/docs/agent/setup#workbuddy-连接问题怎么排查)。
 
 ### Claude Code
 
@@ -112,7 +130,7 @@ Grok Bot 在自己的云电脑上工作，浏览器插件和 Agent 都安装在�
 
 从旧版升级时，marketplace 宿主以 marketplace 为唯一版本来源，连接器宿主以官方仓库目录为唯一版本来源。升级后的第一次启动会在宿主提供的持久插件数据目录中准备当前平台的新运行时，原设备身份与浏览器批准不会因运行时替换而清空。原先“显示已安装但始终未连接”的用户可以再次发送同一条安装提示词；Agent 应刷新 marketplace、修复缺失运行时并复查连接，不要求先卸载。
 
-豆包工作暂不支持这句话自动升级。需要更新时，重新发送第二步的安装提示词：Agent 更新长期安装目录并重新完成握手预检，现有 `mediaclaw` 连接器的命令路径不变时无需重新填写，在连接器管理页关闭后重新启用一次即可。原连接器仍指向 `launch-agent-local.cmd`，或带有 `MEDIACLAW_AGENT_CHANNEL`、`MEDIACLAW_AGENT_NODE` 时，按上方配置表把命令改为 `launch-agent.cmd` 并删除这两个变量。
+豆包工作暂不支持这句话自动升级。需要更新时，从第二步的统一入口获取豆包工作的升级提示词：Agent 更新长期安装目录并重新完成握手预检，现有 `mediaclaw` 连接器的命令路径不变时无需重新填写，在连接器管理页关闭后重新启用一次即可。原连接器仍使用开发启动配置时，按上方配置表把命令改为正式 `launch-agent.cmd`，移除旧的 `MEDIACLAW_AGENT_CHANNEL`、`MEDIACLAW_AGENT_NODE`、`MEDIACLAW_AGENT_RUNTIME_VERSION`、`MEDIACLAW_AGENT_DISABLE_UPDATE_CHECK` 覆盖项。保留原设备身份、已批准配对和持久数据；已设置的 `MEDIACLAW_AGENT_STATE_DIR` 与 `PLUGIN_DATA` 继续沿用原值，不换到空目录。
 
 如果自动升级失败，让 Agent 直接说明失败发生在“检查、安装、验版、重开激活”中的哪一步即可，不需要用户改用命令行修复。
 
@@ -140,7 +158,7 @@ Grok Bot 在自己的云电脑上工作，浏览器插件和 Agent 都安装在�
 
 ### 安装后没有检测到 Agent
 
-- 确认安装完成后创建了全新的 Agent 会话。
+- 确认安装后按宿主提示进入已加载工具的新会话；升级或修复后先完全退出并重开宿主。
 - 确认 MediaClaw 浏览器插件已经开启。
 - 回到 Agent 再次要求它检查连接状态。
 - 如果仍未连接，让 Agent 报告具体安装状态和错误信息，不要反复重装。

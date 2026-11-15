@@ -1183,6 +1183,11 @@ function createProfileCollectionPlan(input = {}, adapter = null) {
     );
   }
   const riskWarnings = [];
+  if (includeComments) {
+    riskWarnings.push(
+      `本方案每篇最多 ${commentsPerItemLimit} 条、首轮总计最多 ${estimatedCommentCount} 条评论${failureRetryPasses > 0 ? `，含最多 ${failureRetryPasses} 轮重试的执行上界为 ${estimatedCommentCount * (1 + failureRetryPasses)} 条` : ""}；补采评论与直接评论采集共用评论连续额度，详情篇数另计，重试也占用实际评论额度。窗口、建议累计量及等待时间以当前插件返回的 captureRisk 为准`,
+    );
+  }
   if (requestedMaxItems > recommendation.recommendedCount) {
     riskWarnings.push(
       `按“${recommendation.purposeLabel}”用途建议先采 ${recommendation.recommendedCount} 条；用户要求 ${requestedMaxItems} 条，确认后仍按用户范围执行`,
@@ -1658,6 +1663,9 @@ function createCollectionPlan({userGoal, toolName, arguments: input = {}, replac
   }
   const args = prepareCollectionArguments(toolName, input);
   const scope = collectionScope(toolName, args);
+  const commentRiskNotice = scope.commentItemLimit > 0
+    ? `评论风险边界：本方案总计最多 ${scope.commentItemLimit} 条评论，每篇或原子评论单批最多 500 条；补采评论与直接评论采集共用同一平台的评论连续额度，详情篇数另计。实际窗口、建议累计量及等待时间以当前插件返回的 captureRisk 为准。超过建议额度时，先说明风险及等待选项，你看过方案后明确回复继续，或在宿主原生确认框真实批准，服务器才可为本方案签发续采授权；不能绕过登录、验证码或平台冷却。`
+    : "";
   const title = tools.find((tool) => tool.name === toolName).annotations.title;
   const now = Date.now();
   for (const [id, plan] of collectionPlans) {
@@ -1677,7 +1685,7 @@ function createCollectionPlan({userGoal, toolName, arguments: input = {}, replac
     toolName,
     arguments: structuredClone(args),
     scope,
-    confirmationPrompt: `建议执行：${title}。平台：${scope.platform === "xiaohongshu" ? "小红书" : scope.platform === "douyin" ? "抖音" : scope.platform === "tiktok" ? "TikTok" : scope.platform}。来源：${scope.targets.join("、")}。${scope.filterSummary ? `筛选：${scope.filterSummary}。` : ""}${scope.browserActions.join("；")}。获取：${scope.fields.join("、")}。请确认是否按此方案执行；未收到你的明确同意前不会开始。`,
+    confirmationPrompt: `建议执行：${title}。平台：${scope.platform === "xiaohongshu" ? "小红书" : scope.platform === "douyin" ? "抖音" : scope.platform === "tiktok" ? "TikTok" : scope.platform}。来源：${scope.targets.join("、")}。${scope.filterSummary ? `筛选：${scope.filterSummary}。` : ""}${scope.browserActions.join("；")}。获取：${scope.fields.join("、")}。${commentRiskNotice}请确认是否按此方案执行；未收到你的明确同意前不会开始。`,
   };
   collectionPlans.set(plan.planId, plan);
   return {
@@ -1690,7 +1698,7 @@ function createCollectionPlan({userGoal, toolName, arguments: input = {}, replac
     arguments: structuredClone(args),
     scope,
     authorizationPolicy: collectionApprovalPolicy([plan]),
-    limitations: ["实际数量受页面加载与平台限制影响；不足时报告实际覆盖，不自动扩大时间、数量或补采范围", "分析目标和默认参数只用于建议方案，不等于用户已经授权采集", scope.transcript],
+    limitations: ["实际数量受页面加载与平台限制影响；不足时报告实际覆盖，不自动扩大时间、数量或补采范围", "分析目标和默认参数只用于建议方案，不等于用户已经授权采集", scope.transcript, ...(commentRiskNotice ? [commentRiskNotice] : [])],
     confirmation: {
       required: true,
       freshReplyRequired: !collectionApprovalPolicy([plan]).explicitScopeRequestAllowed,
@@ -1713,7 +1721,7 @@ async function startConfirmedCollectionPlan(plan) {
   if (!hasUserCollectionApproval(collectionConsent, plan.ownerDeviceId)) {
     throw collectionPlanError("COLLECTION_USER_APPROVAL_REQUIRED", "采集尚未获得用户确认");
   }
-  return requestContext.run({...requestContext.getStore(), collectionConsent}, async () => {
+  return requestContext.run({...requestContext.getStore(), collectionConsent, collectionPlan: plan}, async () => {
     if (!plan.toolName) return startProfileCollectionWorkflow(plan);
     const executionArgs = structuredClone(plan.arguments);
     if (executionArgs.idempotencyKey) {
@@ -3752,8 +3760,49 @@ function startSingleCapture(mode, input = {}) {
   const activeLocalRead = findActiveLocalAssetRead(captureTask);
   if (activeLocalRead) return activeLocalRead;
   const task = createTask({input, captureTask});
+  // Only the server-held, already consumed plan can mint continuation authority.
+  // A model-provided confirmed flag or initial user_request never creates it.
+  // Preserve an idempotently reused task and its original authorization unchanged.
+  if (task.captureTask === captureTask) {
+    const authorization = collectionCommentRiskAuthorization(task);
+    if (authorization) {
+      captureTask.options[mode === "comments" ? "riskAuthorization" : "commentRiskAuthorization"] = authorization;
+    }
+  }
   pumpQueue();
   return task;
+}
+
+function hasReviewedCommentContinuation(plan) {
+  const context = requestContext.getStore();
+  const consent = context?.collectionConsent;
+  // Preview expiry is checked when the plan is consumed. A reserved multi-step
+  // execution can outlive that TTL or its map entry without changing its scope.
+  return Boolean(plan?.usedAt && context?.collectionPlan === plan &&
+    plan.ownerInstanceId === context.instanceId && plan.ownerDeviceId === context.adapter?.identity?.deviceId &&
+    consent === plan.userApproval && hasUserCollectionApproval(consent, plan.ownerDeviceId) &&
+    consent.planId === plan.planId && consent.confirmedAt === plan.usedAt &&
+    ((consent.source === "conversation-v1" && consent.authorization?.type === "user_reply") ||
+      (consent.source === "mcp-elicitation-v1" && consent.userEventVerified === true)));
+}
+
+function collectionCommentRiskAuthorization(task) {
+  const plan = requestContext.getStore()?.collectionPlan;
+  const capture = task.captureTask;
+  const commentsRequested = capture.mode === "comments" ||
+    (["enhance_records", "current_note"].includes(capture.mode) && capture.options?.includeComments === true);
+  if (!commentsRequested || !plan?.toolName || !plan.planId?.startsWith("collection_plan_") ||
+      !hasReviewedCommentContinuation(plan) ||
+      !Number.isInteger(plan.scope?.commentItemLimit) || plan.scope.commentItemLimit < 1) return null;
+  return {
+    source: "mediaclaw_confirm_collection",
+    decision: "continue_after_risk_warning",
+    planId: plan.planId,
+    batchId: `comments-${task.taskId}`,
+    category: "comments",
+    authorizedUnits: plan.scope.commentItemLimit,
+    confirmedAt: plan.usedAt,
+  };
 }
 
 async function runDeepBatch(parent, input = {}) {
@@ -5166,6 +5215,15 @@ async function runProfileCollectionWorkflow(parent, plan) {
                 ? `enhancement-retry-${retryPass}`
                 : "enhancement",
             ),
+            ...(plan.execution.includeComments && hasReviewedCommentContinuation(plan) ? {
+              commentRiskAuthorization: profileCollectionRiskAuthorization(
+                plan,
+                "comments",
+                batchIndex,
+                batchRecordIds.length * plan.execution.commentsPerItemLimit,
+                isRetry ? `comments-retry-${retryPass}` : "comments",
+              ),
+            } : {}),
           },
         }),
       );
@@ -6583,7 +6641,7 @@ const tools = [
   },
   {
     name: "mediaclaw_confirm_collection",
-    description: "授权或拒绝冻结方案：planId 单组，planIds 多组，二选一。普通采集已有当前用户具体范围请求时传 authorization.type=user_request 及真实 userMessage；模糊目标和较高风险先展示可改方案，收到用户回复再传 user_reply。不要为已授权范围重复索要批准。单独 approve 只申请宿主确认框；不支持则返回对话问题，等待用户而不持续轮询。Agent 转述原话不能独立证明来源，不得虚构或用默认值冒充授权。一次授权覆盖所有分组和已声明重试；reject不执行，修改用replacesPlanId。不得引导插件确认。扣费、发送、清理使用各自预览后的确认工具。",
+    description: "授权或拒绝冻结方案：planId 单组，planIds 多组，二选一。普通采集已有当前用户具体范围请求时传 authorization.type=user_request 及真实 userMessage；模糊目标和较高风险先展示可改方案，收到用户回复再传 user_reply。评论累计建议额度以实际插件captureRisk为准；直接采评论和详情附加评论共用该额度。需要超过时，展示总评论量、风险与等待选项后，当前方案的user_reply或宿主原生确认框的真实批准才可由服务器生成一次性续采授权；user_request、confirmed=true或Agent自造参数不行，旧客户端仍按其返回限制处理。不要为已授权范围重复索要批准。单独 approve 只申请宿主确认框，尚不代表用户批准；不支持则返回对话问题，等待用户而不持续轮询。Agent 转述原话不能独立证明来源，不得虚构或用默认值冒充授权。一次授权覆盖所有分组和已声明重试；reject不执行，修改用replacesPlanId。不得引导插件确认。扣费、发送、清理使用各自预览后的确认工具。",
     annotations: toolAnnotations("确认或拒绝采集方案", {openWorldHint: true, idempotentHint: true}),
     inputSchema: {
       type: "object",
@@ -6946,7 +7004,7 @@ const tools = [
   },
   {
     name: "mediaclaw_confirm_profile_collection",
-    description: "授权或拒绝账号方案。普通范围可沿用当前用户具体请求，传authorization.type=user_request及原话；风险提示方案需先展示，再收到用户回复传user_reply。无authorization只申请宿主确认或返回当前对话问题，不启动。一次授权覆盖所有批次与已声明重试；修改用replacesPlanId，reject不执行；不引导插件批准。",
+    description: "授权或拒绝账号方案。普通范围可沿用当前用户具体请求，传authorization.type=user_request及原话；风险提示方案需先展示，再收到用户回复传user_reply。附加评论超过实际captureRisk建议额度时，评论续采授权只由已绑定当前方案的user_reply或宿主原生确认框的真实批准生成；user_request、未验证的裸approve和伪造字段不产生此评论权限，不能借详情授权绕过。无authorization只申请宿主确认或返回当前对话问题，不启动。一次授权覆盖所有批次与已声明重试；修改用replacesPlanId，reject不执行；不引导插件批准。",
     annotations: toolAnnotations("执行账号采集方案", {
       idempotentHint: true,
       openWorldHint: true,
@@ -6971,7 +7029,7 @@ const tools = [
   {
     name: "mediaclaw_enhance_records",
     description:
-      "会员能力：调用插件现有批量详情补采 owner，对数据池 recordIds 补采正文、媒体及可选评论/博主指标。执行前必须由用户明确确认范围。",
+      "会员能力：调用插件现有批量详情补采 owner，对数据池 recordIds 补采正文、媒体及可选评论/博主指标。执行前必须由用户明确确认范围。附加评论每篇最多500条，按记录数乘每篇上限申报总量，与直接评论采集共用评论连续额度，详情篇数另计；实际窗口与等待时间以captureRisk为准。超过建议额度需展示风险后取得本方案user_reply或宿主原生确认框的真实批准，由服务器分别签发评论授权，不能用详情授权或confirmed=true代替。",
     annotations: toolAnnotations("补采记录详情", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {
@@ -7369,7 +7427,7 @@ const tools = [
   },
   {
     name: "mediaclaw_capture_comments",
-    description: "调用插件现有的单篇评论采集能力。单篇不设会员数量权益墙；为降低账号风控风险，单轮安全上限为 500 条，连续任务还会受插件累计预算和冷却保护。",
+    description: "调用插件现有的单篇评论采集能力。单篇不设会员数量权益墙；每篇和原子评论单批最多 500 条。直接评论和详情补采评论共用评论连续额度，窗口、建议累计量和等待时间以当前插件captureRisk返回为准。风险边界需要先展示总量、风险与等待选项，再通过confirm_collection取得本方案user_reply或宿主原生确认框的真实批准；不得用旧版固定额度、自造riskAuthorization或confirmed=true替代实际返回与用户确认。",
     annotations: toolAnnotations("采集单篇评论", {openWorldHint: true}),
     execution: captureExecution,
     inputSchema: {

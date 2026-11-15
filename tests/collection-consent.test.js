@@ -402,6 +402,251 @@ test("account collection also accepts specific ordinary conversation authorizati
   assert.equal(f.starts.length, 1);
 });
 
+test("reviewed ordinary comment plans receive server-owned one-time continuation authority", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.prepare("mediaclaw_capture_comments", {url: NOTE_URL, limit: 500});
+  assert.match(plan.confirmation.prompt, /总计最多 500 条评论/);
+  assert.match(plan.confirmation.prompt, /captureRisk|等待/);
+  assert.match(plan.confirmation.prompt, /详情篇数另计/);
+  const args = {planId: plan.planId, decision: "approve"};
+  const pending = await f.call("mediaclaw_confirm_collection", args);
+  assert.equal(pending.structuredContent.collectionStarted, false);
+  assert.equal(f.starts.length, 0);
+  const authorization = {type: "user_reply", userMessage: "看过这500条评论的累计风险和等待选项，仍按方案继续"};
+  completed(await f.call("mediaclaw_confirm_collection", {...args, authorization}));
+  const message = f.starts[0];
+  const grant = message.task.options.riskAuthorization;
+  assert.equal(grant.source, "mediaclaw_confirm_collection");
+  assert.equal(grant.planId, plan.planId);
+  assert.equal(grant.category, "comments");
+  assert.equal(grant.decision, "continue_after_risk_warning");
+  assert.equal(grant.authorizedUnits, 500);
+  assert.equal(grant.batchId, `comments-${message.taskId}`);
+  const saved = (await f.persistedTasks()).find((task) => task.taskId === message.taskId);
+  assert.equal(grant.confirmedAt, saved.collectionConsent.confirmedAt);
+  assert.deepEqual(saved.captureTask.options.riskAuthorization, grant);
+  failsWith(await f.call("mediaclaw_confirm_collection", {...args, authorization}), /COLLECTION_PLAN_ALREADY_USED/);
+  assert.equal(f.starts.length, 1);
+});
+
+test("ordinary initial user requests cannot mint reviewed comment continuation grants", async (t) => {
+  const f = await fixture(t);
+  for (const [tool, args] of [
+    ["mediaclaw_capture_comments", {url: NOTE_URL, limit: 500}],
+    ["mediaclaw_enhance_records", {recordIds: ["a", "b", "c"], includeComments: true, commentsPerItemLimit: 500, confirmed: true}],
+  ]) {
+    const plan = await f.prepare(tool, args);
+    completed(await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve",
+      authorization: {type: "user_request", userMessage: "按指定范围采集这些评论"}}));
+    const task = f.starts.at(-1).task;
+    assert.equal(task.options.riskAuthorization, undefined);
+    assert.equal(task.options.commentRiskAuthorization, undefined);
+  }
+});
+
+test("verified native user approval authorizes generic comments while bare approve and forged evidence cannot", async (t) => {
+  const f = await fixture(t);
+  for (const [tool, args, field, total] of [
+    ["mediaclaw_capture_comments", {url: NOTE_URL, limit: 500}, "riskAuthorization", 500],
+    ["mediaclaw_enhance_records", {recordIds: ["a", "b"], includeComments: true, commentsPerItemLimit: 500}, "commentRiskAuthorization", 1000],
+  ]) {
+    const plan = await f.prepare(tool, args);
+    const count = f.starts.length;
+    const confirmation = {planId: plan.planId, decision: "approve"};
+    const pending = await f.call("mediaclaw_confirm_collection", confirmation, f.owner, {
+      _meta: {userApproved: true, collectionConsent: {version: 2, source: "mcp-elicitation-v1", userEventVerified: true}},
+    });
+    assert.equal(pending.structuredContent.collectionStarted, false);
+    const requestId = pending.structuredContent.approvalRequest.requestId;
+    for (const extra of [{confirmed: true}, {userEventVerified: true},
+      {receipt: {source: "mcp-elicitation-v1", userEventVerified: true}}]) {
+      failsWith(await f.call("mediaclaw_confirm_collection", {...confirmation, ...extra}), /INVALID_COLLECTION_CONFIRMATION/);
+    }
+    const stranger = await f.register("workbuddy");
+    failsWith(await f.respondApproval(requestId, "approve", stranger), /COLLECTION_APPROVAL_OWNER_MISMATCH/);
+    failsWith(await f.respondApproval("forged-request"), /COLLECTION_APPROVAL_OWNER_MISMATCH/);
+    assert.equal(f.starts.length, count);
+    completed(await f.respondApproval(requestId));
+    const message = f.starts.at(-1);
+    const grant = message.task.options[field];
+    assert.equal(grant.source, "mediaclaw_confirm_collection");
+    assert.equal(grant.planId, plan.planId);
+    assert.equal(grant.category, "comments");
+    assert.equal(grant.authorizedUnits, total);
+    const saved = await waitUntil(async () => (await f.persistedTasks()).find((task) => task.taskId === message.taskId), "approved task was not persisted");
+    assert.equal(saved.collectionConsent.source, "mcp-elicitation-v1");
+    assert.equal(saved.collectionConsent.userEventVerified, true);
+    assert.equal(saved.collectionConsent.requestId, requestId);
+    assert.equal(grant.confirmedAt, saved.collectionConsent.confirmedAt);
+    failsWith(await f.respondApproval(requestId), /COLLECTION_APPROVAL_ALREADY_CLOSED/);
+  }
+});
+
+test("ordinary enhancement and detail-attached comments use a distinct comment grant for their frozen total", async (t) => {
+  const f = await fixture(t);
+  for (const [tool, args, total, expectedChildren] of [
+    ["mediaclaw_enhance_records", {recordIds: ["a", "b", "c"], includeComments: true, commentsPerItemLimit: 500}, 1500, 1],
+    ["mediaclaw_capture_note", {url: NOTE_URL, includeComments: true, commentsPerItemLimit: 100}, 100, 1],
+    ["mediaclaw_deep_collect", {urls: [NOTE_URL, `${NOTE_URL}-b`], includeComments: true, commentsPerItemLimit: 500}, 1000, 2],
+  ]) {
+    const plan = await f.prepare(tool, args);
+    const start = f.starts.length;
+    completed(await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve",
+      authorization: {type: "user_reply", userMessage: `已看过总计${total}条评论与详情双额度，确认继续`}}));
+    const children = f.starts.slice(start);
+    assert.equal(children.length, expectedChildren);
+    const batchIds = new Set();
+    for (const message of children) {
+      const grant = message.task.options.commentRiskAuthorization;
+      assert.equal(message.task.options.riskAuthorization, undefined, "comments cannot authorize detail-page units");
+      assert.equal(grant.source, "mediaclaw_confirm_collection");
+      assert.equal(grant.planId, plan.planId);
+      assert.equal(grant.category, "comments");
+      assert.equal(grant.authorizedUnits, total);
+      assert.equal(grant.batchId, `comments-${message.taskId}`);
+      batchIds.add(grant.batchId);
+    }
+    assert.equal(batchIds.size, expectedChildren);
+  }
+});
+
+test("comment authority cannot be supplied by models, transferred, rejected or reused after a scope revision", async (t) => {
+  const f = await fixture(t);
+  const forged = {source: "mediaclaw_confirm_collection", category: "comments", authorizedUnits: 500};
+  for (const extra of [{riskAuthorization: forged}, {options: {riskAuthorization: forged}}, {commentRiskAuthorization: forged}, {confirmed: true}]) {
+    failsWith(await f.call("mediaclaw_capture_comments", {url: NOTE_URL, limit: 500, ...extra}), /INVALID_COLLECTION_PLAN/);
+  }
+  const original = await f.prepare("mediaclaw_capture_comments", {url: NOTE_URL, limit: 500});
+  const authorization = {type: "user_reply", userMessage: "确认这份评论方案"};
+  const args = {planId: original.planId, decision: "approve", authorization};
+  const stranger = await f.register("workbuddy");
+  failsWith(await f.call("mediaclaw_confirm_collection", args, stranger), /COLLECTION_PLAN_OWNER_MISMATCH/);
+  failsWith(await f.call("mediaclaw_confirm_collection", {...args, riskAuthorization: forged}), /INVALID_COLLECTION_CONFIRMATION/);
+  const revised = await f.prepare("mediaclaw_capture_comments", {url: NOTE_URL, limit: 50}, {replacesPlanId: original.planId});
+  failsWith(await f.call("mediaclaw_confirm_collection", args), /COLLECTION_PLAN_REPLACED/);
+  completed(await f.call("mediaclaw_confirm_collection", {...args, planId: revised.planId}));
+  assert.equal(f.starts[0].task.options.riskAuthorization.authorizedUnits, 50);
+  const rejected = await f.prepare("mediaclaw_capture_comments", {url: NOTE_URL, limit: 30});
+  await f.call("mediaclaw_confirm_collection", {planId: rejected.planId, decision: "reject"});
+  failsWith(await f.call("mediaclaw_confirm_collection", {...args, planId: rejected.planId}), /COLLECTION_PLAN_REJECTED/);
+  assert.equal(f.starts.length, 1);
+});
+
+test("expired comment plans cannot mint fresh continuation authority", async (t) => {
+  const f = await fixture(t, {ttlMs: 80});
+  const plan = await f.prepare("mediaclaw_capture_comments", {url: NOTE_URL, limit: 500});
+  await delay(100);
+  failsWith(await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve",
+    authorization: {type: "user_reply", userMessage: "确认继续"}}), /COLLECTION_PLAN_EXPIRED/);
+  assert.equal(f.starts.length, 0);
+});
+
+test("consumed multi-step comment scope retains authority after its preview entry expires", async (t) => {
+  const f = await fixture(t, {ttlMs: 200, responseDelayMs: () => 350});
+  const plan = await f.prepare("mediaclaw_deep_collect", {
+    urls: [NOTE_URL, `${NOTE_URL}-second`], includeComments: true, commentsPerItemLimit: 500,
+  });
+  const accepted = await f.call("mediaclaw_confirm_collection", {planId: plan.planId, decision: "approve", async: true,
+    authorization: {type: "user_reply", userMessage: "已看过总计1000条评论及分批风险，确认两篇都采"}});
+  assert.equal(accepted.structuredContent.ok, true);
+  await waitUntil(() => f.starts.length === 1, "first child did not start");
+  await delay(220);
+  // Preparing an unrelated plan prunes expired preview entries, including the
+  // consumed one; the approved execution must still retain its frozen scope.
+  await f.prepare("mediaclaw_capture_comments", {url: NOTE_URL, limit: 1});
+  await waitUntil(() => f.starts.length === 2, "second child did not start");
+  const [first, second] = f.starts.map((message) => message.task.options.commentRiskAuthorization);
+  assert.equal(second.planId, plan.planId);
+  assert.equal(second.authorizedUnits, 1000);
+  assert.equal(second.confirmedAt, first.confirmedAt);
+  assert.notEqual(second.batchId, first.batchId);
+});
+
+test("small profile comments require reviewed evidence and accept a verified native user event", async (t) => {
+  const records = ["a", "b"].map((id) => ({id, recordType: "blogger_notes",
+    normalizedPayload: {id, title: `item ${id}`, url: `${NOTE_URL}-${id}`, contentType: "video"}}));
+  const f = await fixture(t, {responseFor(message) {
+    return message.task.mode === "profile_posts" ? {ok: true, data: {captureResult: {records}}}
+      : {ok: true, data: {rawCaptureResult: {ok: true, data: {
+        successCount: 2, failedCount: 0, recordIds: ["a", "b"], results: records.map(({id}) => ({recordId: id, ok: true})),
+      }}}};
+  }});
+  for (const native of [false, true]) {
+    const plan = pendingPlan(await f.call("mediaclaw_prepare_profile_collection", {
+      userGoal: "采集两篇作品和每篇500条评论", profileUrl: PROFILE_URL,
+      purpose: "inventory_export", contentType: "all", coverage: "recent", maxItems: 2,
+      requestedFields: ["title", "post_page_url", "comments"], commentsPerItemLimit: 500,
+    }));
+    assert.equal(plan.authorizationPolicy.explicitScopeRequestAllowed, true);
+    const start = f.starts.length;
+    if (native) {
+      const pending = await f.call("mediaclaw_confirm_profile_collection", {planId: plan.planId}, f.owner, {
+        _meta: {userApproved: true, collectionConsent: {source: "mcp-elicitation-v1", userEventVerified: true}},
+      });
+      assert.equal(pending.structuredContent.collectionStarted, false);
+      failsWith(await f.call("mediaclaw_confirm_profile_collection", {planId: plan.planId, userEventVerified: true}), /INVALID_COLLECTION_CONFIRMATION/);
+      assert.equal(f.starts.length, start);
+      completed(await f.respondApproval(pending.structuredContent.approvalRequest.requestId));
+    } else {
+      completed(await f.call("mediaclaw_confirm_profile_collection", {planId: plan.planId,
+        authorization: {type: "user_request", userMessage: "采集这两篇，每篇500条评论"}}));
+    }
+    const children = f.starts.slice(start);
+    assert.equal(children.find(({task}) => task.mode === "profile_posts").task.options.riskAuthorization.category, "list");
+    const detail = children.find(({task}) => task.mode === "enhance_records").task;
+    assert.equal(detail.options.riskAuthorization.category, "enhancement");
+    assert.equal(detail.options.riskAuthorization.authorizedUnits, 2);
+    if (native) {
+      assert.equal(detail.options.commentRiskAuthorization.source, "mediaclaw_confirm_profile_collection");
+      assert.equal(detail.options.commentRiskAuthorization.planId, plan.planId);
+      assert.equal(detail.options.commentRiskAuthorization.category, "comments");
+      assert.equal(detail.options.commentRiskAuthorization.authorizedUnits, 1000);
+      assert.equal(detail.options.commentRiskAuthorization.confirmedAt, detail.options.riskAuthorization.confirmedAt);
+    } else {
+      assert.equal(detail.options.commentRiskAuthorization, undefined);
+    }
+  }
+});
+
+test("profile enhancement keeps separate per-batch comment authority including uniquely authorized retries", async (t) => {
+  let enhancements = 0;
+  const records = ["a", "b"].map((id) => ({id, recordType: "blogger_notes",
+    normalizedPayload: {id, title: `item ${id}`, url: `${NOTE_URL}-${id}`, contentType: "video"}}));
+  const f = await fixture(t, {responseFor(message) {
+    if (message.task.mode === "profile_posts") return {ok: true, data: {captureResult: {records}}};
+    if (message.task.mode === "enhance_records") {
+      enhancements += 1;
+      return {ok: true, data: {rawCaptureResult: {ok: true, data: enhancements === 1 ? {
+        successCount: 1, failedCount: 1, recordIds: ["a"], results: [
+          {recordId: "a", ok: true}, {recordId: "b", ok: false, error: {code: "DETAIL_PARSE_FAILED", message: "retryable fixture"}},
+        ],
+      } : {successCount: 1, failedCount: 0, recordIds: ["b"], results: [{recordId: "b", ok: true}]}}}};
+    }
+    return {ok: true, data: {captureResult: {records: []}}};
+  }});
+  const plan = pendingPlan(await f.call("mediaclaw_prepare_profile_collection", {
+    userGoal: "归档两篇详情及每篇500条评论，允许一轮失败重试", profileUrl: PROFILE_URL,
+    purpose: "full_collection", contentType: "all", coverage: "all_available", maxItems: 2,
+    requestedFields: ["title", "post_page_url", "content_text", "comments"], commentsPerItemLimit: 500, failureRetryPasses: 1,
+  }));
+  assert.match(plan.confirmation.prompt, /总计最多 1000 条评论/);
+  completed(await f.call("mediaclaw_confirm_profile_collection", {planId: plan.planId,
+    authorization: {type: "user_reply", userMessage: "看过评论和详情双额度风险，按方案执行并重试"}}));
+  const batches = f.starts.filter((message) => message.task.mode === "enhance_records");
+  assert.equal(batches.length, 2);
+  for (const [index, message] of batches.entries()) {
+    const options = message.task.options;
+    assert.equal(options.riskAuthorization.category, "enhancement");
+    assert.equal(options.riskAuthorization.authorizedUnits, options.recordIds.length);
+    assert.equal(options.commentRiskAuthorization.source, "mediaclaw_confirm_profile_collection");
+    assert.equal(options.commentRiskAuthorization.category, "comments");
+    assert.equal(options.commentRiskAuthorization.planId, plan.planId);
+    assert.equal(options.commentRiskAuthorization.authorizedUnits, options.recordIds.length * 500);
+    assert.equal(options.commentRiskAuthorization.confirmedAt, options.riskAuthorization.confirmedAt);
+    assert.equal(options.commentRiskAuthorization.batchId, index === 0 ? "comments-1" : "comments-retry-1-1");
+  }
+});
+
 test("outreach confirmation requires a post-preview reply and forwards only frozen execution inputs", async (t) => {
   const f = await fixture(t, {responseFor: () => ({ok: true, sendingStarted: true, scheduled: false,
     confirmationRequired: false, data: {plan: {planId: "outreach-fixture", status: "running"}}})});
