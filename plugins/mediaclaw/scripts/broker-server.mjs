@@ -5712,7 +5712,10 @@ function startProfileCollectionWorkflow(plan) {
     },
     ttlMs: archiveEnabled ? PROFILE_ARCHIVE_JOB_TTL_MS : TASK_TTL_MS,
   });
-  plan.usedAt = nowIso();
+  // The approval already stamped usedAt together with the consent record.
+  // Restamping here could land in a later millisecond and make the comment
+  // continuation check treat a real approval as a different one.
+  plan.usedAt ||= nowIso();
   void runProfileCollectionWorkflow(task, plan);
   return task;
 }
