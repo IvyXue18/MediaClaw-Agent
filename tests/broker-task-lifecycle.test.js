@@ -884,3 +884,176 @@ test("legacy captures without approval cannot resume or block a confirmed task a
     [approvedTaskId],
   );
 });
+
+// A deep batch parent exists only in the Broker; the browser only knows its
+// current_note children. Cancelling the parent must stop the current child and
+// settle the parent locally instead of asking the browser about the parent id.
+const DEEP_BATCH_URLS = [
+  "https://www.douyin.com/video/7400000000000000001",
+  "https://www.douyin.com/video/7400000000000000002",
+];
+
+async function startTwoItemDeepBatch(t, portBase, {cancelTimeoutMs = 1_000} = {}) {
+  const port = portBase + Math.floor(Math.random() * 400);
+  const stateDirectory = await mkdtemp(path.join(tmpdir(), "mediaclaw-deep-batch-cancel-"));
+  const broker = await startBroker({port, stateDirectory, cancelTimeoutMs});
+  t.after(async () => {
+    await stopChild(broker);
+    await rm(stateDirectory, {recursive: true, force: true});
+  });
+  const registration = await registerAdapter(port);
+  const extension = await connectExtension(port, registration.device.deviceId);
+  t.after(() => extension.socket.close());
+  const started = await callApprovedCollection(
+    port,
+    registration.token,
+    "mediaclaw_deep_collect",
+    {urls: DEEP_BATCH_URLS, async: true},
+  );
+  const batchId = started.structuredContent.taskId;
+  assert.match(batchId, /^batch/);
+  const first = await extension.waitFor((message) => message.type === "task.start");
+  extension.socket.send(JSON.stringify({
+    type: "task.result",
+    taskId: first.taskId,
+    deviceId: first.deviceId,
+    response: {ok: true, data: {records: [{basic: {noteId: "deep-one", title: "第一条"}}]}},
+  }));
+  const second = await extension.waitFor(
+    (message) => message.type === "task.start" && message.taskId !== first.taskId,
+  );
+  const status = (taskId) => callTool(port, registration.token, "mediaclaw_task_status", {taskId});
+  const cancel = (taskId) => callTool(port, registration.token, "mediaclaw_cancel_task", {taskId});
+  const waitingTaskCount = async () =>
+    (await callTool(port, registration.token, "mediaclaw_connection_status", {})).structuredContent.waitingTaskCount;
+  return {port, registration, extension, batchId, first, second, status, cancel, waitingTaskCount};
+}
+
+async function waitForTaskStatus(read, taskId, expected, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const response = await read(taskId);
+    if (response.structuredContent.task.status === expected) return response;
+    if (Date.now() > deadline) {
+      throw new Error(`task ${taskId} stayed ${response.structuredContent.task.status}, expected ${expected}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+test("cancelling a deep batch parent stops the running child and settles the parent in the Broker", async (t) => {
+  const f = await startTwoItemDeepBatch(t, 26000);
+  const cancelRequest = f.cancel(f.batchId);
+  const childCancel = await f.extension.waitFor(
+    (message) => message.type === "task.cancel" && message.taskId === f.second.taskId,
+  );
+  const pending = await f.status(f.batchId);
+  assert.equal(pending.structuredContent.task.status, "working");
+  f.extension.socket.send(JSON.stringify({
+    type: "task.cancel.result",
+    taskId: f.second.taskId,
+    deviceId: childCancel.deviceId,
+    response: {ok: true, canceled: true},
+  }));
+  const cancelled = await cancelRequest;
+  assert.equal(cancelled.structuredContent.ok, true);
+  assert.equal(cancelled.structuredContent.canceled, true);
+  assert.equal(cancelled.structuredContent.task.status, "cancelled");
+  assert.match(cancelled.structuredContent.task.statusMessage, /批量任务已停止/);
+  assert.equal(
+    f.extension.messagesOfType("task.cancel").some((message) => message.taskId === f.batchId),
+    false,
+  );
+
+  const parent = await f.status(f.batchId);
+  assert.equal(parent.structuredContent.task.status, "cancelled");
+  assert.equal(parent.structuredContent.result.cancelled, true);
+  assert.equal(parent.structuredContent.result.results.length, 1);
+  assert.equal(parent.structuredContent.result.remainingCount, 1);
+  assert.equal(parent.structuredContent.progress.processedCount, 1);
+  assert.equal(parent.structuredContent.progress.totalCount, 2);
+  const child = await f.status(f.second.taskId);
+  assert.equal(child.structuredContent.task.status, "cancelled");
+  // The confirmation pointer follows the parent completion; nothing stays waiting.
+  assert.equal(await f.waitingTaskCount(), 0);
+  // A repeated cancel returns the settled parent unchanged.
+  const repeated = await f.cancel(f.batchId);
+  assert.equal(repeated.structuredContent.canceled, false);
+  assert.equal(repeated.structuredContent.task.status, "cancelled");
+});
+
+test("cancelling a deep batch after it succeeded leaves it unchanged", async (t) => {
+  const f = await startTwoItemDeepBatch(t, 26400);
+  f.extension.socket.send(JSON.stringify({
+    type: "task.result",
+    taskId: f.second.taskId,
+    deviceId: f.second.deviceId,
+    response: {ok: true, data: {records: [{basic: {noteId: "deep-two", title: "第二条"}}]}},
+  }));
+  const done = await waitForTaskStatus(f.status, f.batchId, "completed");
+  const cancelled = await f.cancel(f.batchId);
+  assert.equal(cancelled.structuredContent.ok, true);
+  assert.equal(cancelled.structuredContent.canceled, false);
+  assert.equal(cancelled.structuredContent.task.status, "completed");
+  assert.equal(f.extension.messagesOfType("task.cancel").length, 0);
+  const after = await f.status(f.batchId);
+  assert.equal(after.structuredContent.task.status, "completed");
+  assert.deepEqual(after.structuredContent.result, done.structuredContent.result);
+  assert.equal(await f.waitingTaskCount(), 0);
+});
+
+test("a rejected child cancel restores the deep batch parent and returns the rejection", async (t) => {
+  const f = await startTwoItemDeepBatch(t, 26800);
+  const cancelRequest = f.cancel(f.batchId);
+  const childCancel = await f.extension.waitFor(
+    (message) => message.type === "task.cancel" && message.taskId === f.second.taskId,
+  );
+  f.extension.socket.send(JSON.stringify({
+    type: "task.cancel.result",
+    taskId: f.second.taskId,
+    deviceId: childCancel.deviceId,
+    response: {ok: false, canceled: false, reason: "capture_tab_not_found"},
+  }));
+  const rejected = await cancelRequest;
+  assert.equal(rejected.structuredContent.ok, false);
+  assert.equal(rejected.structuredContent.canceled, false);
+  assert.equal(rejected.structuredContent.error.code, "CANCEL_REJECTED");
+  assert.equal(rejected.structuredContent.task.status, "working");
+  assert.doesNotMatch(rejected.structuredContent.task.statusMessage, /停止|取消/);
+  assert.equal(
+    f.extension.messagesOfType("task.cancel").some((message) => message.taskId === f.batchId),
+    false,
+  );
+
+  // The batch keeps running and finishes normally once the browser completes.
+  f.extension.socket.send(JSON.stringify({
+    type: "task.result",
+    taskId: f.second.taskId,
+    deviceId: f.second.deviceId,
+    response: {ok: true, data: {records: [{basic: {noteId: "deep-two", title: "第二条"}}]}},
+  }));
+  const done = await waitForTaskStatus(f.status, f.batchId, "completed");
+  assert.equal(done.structuredContent.result.successCount, 2);
+  assert.equal(await f.waitingTaskCount(), 0);
+});
+
+test("a child that completes during the parent cancel keeps its result and the batch still stops", async (t) => {
+  const f = await startTwoItemDeepBatch(t, 27200);
+  const cancelRequest = f.cancel(f.batchId);
+  await f.extension.waitFor(
+    (message) => message.type === "task.cancel" && message.taskId === f.second.taskId,
+  );
+  f.extension.socket.send(JSON.stringify({
+    type: "task.result",
+    taskId: f.second.taskId,
+    deviceId: f.second.deviceId,
+    response: {ok: true, data: {records: [{basic: {noteId: "deep-two", title: "第二条"}}]}},
+  }));
+  const cancelled = await cancelRequest;
+  assert.equal(cancelled.structuredContent.canceled, true);
+  assert.equal(cancelled.structuredContent.task.status, "cancelled");
+  const parent = await f.status(f.batchId);
+  assert.equal(parent.structuredContent.result.results.length, 2);
+  assert.equal(parent.structuredContent.result.remainingCount, 0);
+  assert.equal(await f.waitingTaskCount(), 0);
+});

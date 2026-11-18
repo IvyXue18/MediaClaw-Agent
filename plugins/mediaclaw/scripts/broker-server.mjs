@@ -255,6 +255,16 @@ const tasks = new Map();
 const idempotentTaskIds = new Map();
 const resultTransfers = new Map();
 const pendingTaskCancellations = new Map();
+// Broker-owned parents (batch/workflow) never exist in the extension, so their
+// cancellation is settled here: stop the current child, then finish the parent.
+const pendingParentCancellations = new Map();
+// A parent loop that tries to finish while its cancel is pending hands the
+// outcome to the cancel: cancelled wins, a rejected cancel replays the outcome.
+const deferredParentFinishes = new WeakMap();
+// Loops register how to summarize completed work if they are stopped early.
+const parentPartialResults = new WeakMap();
+// input_required stays resumable (a confirmation moves on to running).
+const FINAL_TASK_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
 const profileCollectionPlans = new Map();
 // A plan is a proposal, never permission. Scope authorization is either a host
 // user event or an explicitly recorded conversation relay; only the former is
@@ -1745,17 +1755,24 @@ function startCollectionPlanBatch(plans) {
       completedCount: results.filter((item) => item.status === "succeeded").length,
       remainingPlanIds: plans.slice(results.length).map((plan) => plan.planId),
     });
+    parentPartialResults.set(parent, () => ({
+      result: {ok: false, cancelled: true, ...summary()},
+      message: `批量任务已停止，已完成 ${summary().completedCount}/${plans.length} 组；按各组 taskId 读取结果`,
+    }));
     try {
       updateTask(parent, {status: "running", message: `正在执行已确认的 ${plans.length} 组采集`});
       for (const [index, plan] of plans.entries()) {
-        if (["cancelled", "cancel_pending"].includes(parent.status)) return;
+        if (parentStopRequested(parent)) return;
         const child = addChildTask(parent, await startConfirmedCollectionPlan(plan));
-        updateTask(parent, {
+        // A stop requested while this group was starting must reach the new child.
+        if (parentStopRequested(parent)) void cancelTask(child.taskId);
+        else updateTask(parent, {
           progress: {processedCount: index, totalCount: plans.length},
           message: `正在执行第 ${index + 1}/${plans.length} 组，全部范围已确认`,
         });
         await child.completion;
         results.push({planId: plan.planId, taskId: child.taskId, status: child.status});
+        if (parentStopRequested(parent)) return;
         // Never turn a stopped, failed or input-required child into another
         // browser action. Completed data remains reachable by child task ID.
         if (child.status !== "succeeded" || child.result?.ok === false) {
@@ -2222,7 +2239,24 @@ async function restoreTaskState() {
   }
 }
 
+function isBrokerParentTask(task) {
+  return task?.kind === "batch" || task?.kind === "workflow";
+}
+
+// Parent loops stop on a requested cancel as well as on any terminal outcome.
+function parentStopRequested(parent) {
+  return parent.status === "cancel_pending" || TERMINAL_TASK_STATUSES.has(parent.status);
+}
+
 function updateTask(task, patch = {}) {
+  // A finished task keeps its outcome; late status writes are dropped whole.
+  if (
+    FINAL_TASK_STATUSES.has(task.status) &&
+    patch.status !== undefined &&
+    patch.status !== task.status
+  ) {
+    return task;
+  }
   Object.assign(task, patch, {updatedAt: nowIso()});
   void scheduleTaskStatePersist();
   return task;
@@ -2336,7 +2370,17 @@ function recoverTaskFromResult(taskId, message = {}) {
   return task;
 }
 
-function finishTask(task, {status, result = null, error = null, message = ""}) {
+function finishTask(task, outcome) {
+  const {status, result = null, error = null, message = ""} = outcome;
+  if (FINAL_TASK_STATUSES.has(task.status)) return task;
+  if (
+    task.status === "cancel_pending" &&
+    isBrokerParentTask(task) &&
+    status !== "cancelled"
+  ) {
+    deferredParentFinishes.set(task, outcome);
+    return task;
+  }
   const progress =
     status === "succeeded" &&
     task.progress &&
@@ -3820,12 +3864,29 @@ async function runDeepBatch(parent, input = {}) {
   }
 
   const results = [];
+  const stoppedOutcome = () => {
+    const failedCount = results.filter((item) => item?.ok === false).length;
+    return {
+      result: {
+        ok: false,
+        cancelled: true,
+        requestedCount: urls.length,
+        successCount: results.length - failedCount,
+        failedCount,
+        remainingCount: urls.length - results.length,
+        results,
+      },
+      message: `批量任务已停止，已保留 ${results.length}/${urls.length} 条已完成结果`,
+    };
+  };
+  parentPartialResults.set(parent, stoppedOutcome);
   updateTask(parent, {
     status: "running",
     message: `开始补采 ${urls.length} 条重点内容`,
   });
   for (let index = 0; index < urls.length; index += 1) {
-    if (parent.status === "cancelled") return;
+    // The parent cancel owns the final state once it is requested.
+    if (parentStopRequested(parent)) return;
     const child = startSingleCapture("current_note", {
       url: urls[index],
       platform: input.platform,
@@ -3848,6 +3909,15 @@ async function runDeepBatch(parent, input = {}) {
       message: `正在补采第 ${index + 1}/${urls.length} 条`,
     });
     await child.completion;
+    // A child that finished during a pending cancel still keeps its result.
+    if (child.status !== "cancelled" && !child.error?.paywall) {
+      results.push(child.result || {ok: false, error: child.error});
+    }
+    if (parentStopRequested(parent)) return;
+    if (child.status === "cancelled") {
+      finishTask(parent, {status: "cancelled", error: null, ...stoppedOutcome()});
+      return;
+    }
     if (child.error?.paywall) {
       finishTask(parent, {
         status: "failed",
@@ -3864,7 +3934,6 @@ async function runDeepBatch(parent, input = {}) {
       });
       return;
     }
-    results.push(child.result || {ok: false, error: child.error});
   }
   const failedCount = results.filter((item) => item?.ok === false).length;
   finishTask(parent, {
@@ -4904,7 +4973,7 @@ async function runProfileCollectionWorkflow(parent, plan) {
       }),
     );
     await profileTask.completion;
-    if (parent.status === "cancelled") return;
+    if (parentStopRequested(parent)) return;
     profile = profileTask.result?.profile || null;
     Object.assign(stage, {
       status: profileTask.status === "succeeded" ? "completed" : "failed",
@@ -4949,7 +5018,7 @@ async function runProfileCollectionWorkflow(parent, plan) {
     batchIndex < plan.execution.scanBatches.length && !executionInterruption;
     batchIndex += 1
   ) {
-    if (parent.status === "cancelled") return;
+    if (parentStopRequested(parent)) return;
     const batchLimit = plan.execution.scanBatches[batchIndex];
     const attempts = [];
     let scanTask = null;
@@ -4987,7 +5056,7 @@ async function runProfileCollectionWorkflow(parent, plan) {
         }),
       );
       await scanTask.completion;
-      if (parent.status === "cancelled") return;
+      if (parentStopRequested(parent)) return;
       const attemptError = scanTask.error || scanTask.result?.error || null;
       const classification =
         scanTask.status === "succeeded"
@@ -5228,7 +5297,7 @@ async function runProfileCollectionWorkflow(parent, plan) {
         }),
       );
       await detailTask.completion;
-      if (parent.status === "cancelled") return false;
+      if (parentStopRequested(parent)) return false;
       detailBatchResults.push({
         batchIndex: batchIndex + 1,
         requestedCount: batchRecordIds.length,
@@ -5270,7 +5339,7 @@ async function runProfileCollectionWorkflow(parent, plan) {
       batchIndex < detailBatchCount;
       batchIndex += 1
     ) {
-      if (parent.status === "cancelled") return;
+      if (parentStopRequested(parent)) return;
       const batchRecordIds = recordIds.slice(
         batchIndex * MAX_DEEP_COLLECT_LIMIT,
         (batchIndex + 1) * MAX_DEEP_COLLECT_LIMIT,
@@ -5303,7 +5372,7 @@ async function runProfileCollectionWorkflow(parent, plan) {
         batchIndex < retryBatchCount;
         batchIndex += 1
       ) {
-        if (parent.status === "cancelled") return;
+        if (parentStopRequested(parent)) return;
         const batchRecordIds = retryRecordIds.slice(
           batchIndex * MAX_DEEP_COLLECT_LIMIT,
           (batchIndex + 1) * MAX_DEEP_COLLECT_LIMIT,
@@ -5426,7 +5495,7 @@ async function runProfileCollectionWorkflow(parent, plan) {
       }),
     );
     await quoteTask.completion;
-    if (parent.status === "cancelled") return;
+    if (parentStopRequested(parent)) return;
     transcriptQuote = quoteTask.result;
     Object.assign(quoteStage, {
       status: quoteTask.status === "succeeded" ? "completed" : "failed",
@@ -5968,7 +6037,7 @@ async function runBenchmarkAccountResearch(parent, input = {}) {
   let missingProfileUrlCount = 0;
   let failedProfileCount = 0;
   for (let index = 0; index < candidates.length; index += 1) {
-    if (parent.status === "cancelled") return;
+    if (parentStopRequested(parent)) return;
     const candidate = candidates[index];
     if (!candidate.authorUrl) {
       missingProfileUrlCount += 1;
@@ -6442,13 +6511,7 @@ async function cancelTask(taskId) {
   ) {
     return {ok: true, canceled: false, task: taskSnapshot(task)};
   }
-  if (
-    (task.kind === "batch" || task.kind === "workflow") &&
-    task.currentChildTaskId
-  ) {
-    const childResult = await cancelTask(task.currentChildTaskId);
-    if (!childResult.canceled) return childResult;
-  }
+  if (isBrokerParentTask(task)) return await cancelParentTask(task);
   if (task.status === "queued" && activeExtensionTaskId !== task.taskId) {
     updateTask(task, {status: "cancelled", message: "等待中的任务已取消"});
     task.resolveCompletion(task);
@@ -6547,6 +6610,63 @@ async function cancelTask(taskId) {
     sessionId: deviceSessions.get(task.owner?.deviceId)?.sessionId || "",
   });
   return await promise;
+}
+
+// A batch/workflow parent lives only in the Broker; the extension knows its
+// children. Stop the current child through the normal child path, then settle
+// the parent here instead of sending task.cancel for an id the browser never saw.
+function cancelParentTask(task) {
+  const pending = pendingParentCancellations.get(task.taskId);
+  if (pending) return pending;
+  const previous = {status: task.status, message: task.message};
+  updateTask(task, {status: "cancel_pending", message: "正在停止批量任务"});
+  const promise = (async () => {
+    const child = tasks.get(task.currentChildTaskId);
+    let childResult = null;
+    if (child && !TERMINAL_TASK_STATUSES.has(child.status)) {
+      childResult = await cancelTask(child.taskId);
+    }
+    const deferred = deferredParentFinishes.get(task);
+    deferredParentFinishes.delete(task);
+    // The parent finished on its own (e.g. a loop recorded its cancelled child).
+    if (task.status !== "cancel_pending") {
+      return {
+        ok: task.status === "cancelled",
+        canceled: task.status === "cancelled",
+        ...(task.status === "cancelled"
+          ? {}
+          : {error: {code: "CANCEL_TOO_LATE", message: "任务已在取消确认前结束"}}),
+        task: taskSnapshot(task),
+      };
+    }
+    if (child && !TERMINAL_TASK_STATUSES.has(child.status)) {
+      // The browser kept the child running: restore the parent, never a false
+      // cancelled state, and replay any outcome the loop reported meanwhile.
+      updateTask(task, previous);
+      if (deferred) finishTask(task, deferred);
+      return {
+        ok: false,
+        canceled: false,
+        error: childResult?.error || {code: "CANCEL_REJECTED", message: "浏览器未确认子任务取消"},
+        task: taskSnapshot(task),
+        childTask: childResult?.task || taskSnapshot(child),
+      };
+    }
+    const partial = parentPartialResults.get(task)?.() || null;
+    finishTask(task, {
+      status: "cancelled",
+      result: deferred?.result || partial?.result || task.result || {
+        ok: false,
+        cancelled: true,
+        childTaskIds: [...task.childTaskIds],
+      },
+      error: null,
+      message: partial?.message || "批量任务已停止",
+    });
+    return {ok: true, canceled: true, task: taskSnapshot(task)};
+  })().finally(() => pendingParentCancellations.delete(task.taskId));
+  pendingParentCancellations.set(task.taskId, promise);
+  return promise;
 }
 
 // Keep the portable async:true + task_status contract as the advertised path.
