@@ -36,9 +36,13 @@ Agent 配对请使用 Chrome / Edge 137 或以上版本，建议更新到最新�
 
 marketplace 安装由包内清单提供这些环境变量。直连配置只新增或更新 MediaClaw 自己的条目，不覆盖整个配置文件；如曾把 DeepSeek 配成 `workbuddy`，应改回 `deepseek-harness`，保留真正的 WorkBuddy 配置。各宿主会使用各自身份并分别请求配对。
 
-Agent 负责识别宿主、注册官方来源和安装接入包。接入包第一次启动时会自动识别 Windows、macOS 或 Linux 及当前芯片，从官方 Release 获取唯一匹配的原生运行时并校验；用户不需要安装 Node、Bash、WSL 或 Git Bash。首次安装发生在当前对话已经启动之后时，宿主可能要求重新打开应用或进入一个已加载插件的新对话；Agent 应说明原因并把下一步收敛为一个明确的界面动作，不要求用户输入安装命令。
+Agent 负责识别宿主、注册官方来源和安装接入包。接入包第一次启动时会自动识别 Windows、macOS 或 Linux 及当前芯片，先从官方国内下载源 `media.mediaclaw.app` 获取唯一匹配的原生运行时并校验，失败时再从 GitHub Release 获取；用户不需要安装 Node、Bash、WSL 或 Git Bash。首次安装发生在当前对话已经启动之后时，宿主可能要求重新打开应用或进入一个已加载插件的新对话；Agent 应说明原因并把下一步收敛为一个明确的界面动作，不要求用户输入安装命令。
 
-当前原生运行时覆盖 macOS x64/ARM64、Windows x64/ARM64，以及 Linux glibc/musl 的 x64/ARM64。浏览器或系统策略完全禁止本机程序、GitHub 下载或 `127.0.0.1` 回环连接时，Agent 必须报告具体受限环节，不能把它误报为安装成功。
+当前原生运行时覆盖 macOS x64/ARM64、Windows x64/ARM64，以及 Linux glibc/musl 的 x64/ARM64。浏览器或系统策略完全禁止本机程序、下载或 `127.0.0.1` 回环连接时，Agent 必须报告具体受限环节，不能把它误报为安装成功。
+
+### 打不开 GitHub 时
+
+不需要 VPN。运行时默认从国内下载源获取；如果 marketplace 注册、`git clone` 或 `git pull` 连接被重置或 2 分钟内没有完成，安装提示词会让 Agent 改用同版本的官方国内副本 `https://media.mediaclaw.app/agent/package/v0.4.1/MediaClaw-Agent.zip`：核对同名 `.sha256` 文件后解压到长期目录（本机为 `~/.mediaclaw/MediaClaw-Agent`，Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`），有插件市场的宿主用该目录的本地路径注册 `mediaclaw-agent` 市场，其他宿主直接指向该目录中的正式启动器。国内副本没有 git 记录，更新时由 Agent 重新下载新版本副本并整体替换，设备身份和数据保留不变。
 
 ### WorkBuddy 提示没有安装能力时
 
@@ -115,7 +119,7 @@ Grok Bot 在自己的云电脑上工作，浏览器插件和 Agent 都安装在�
 
 连接失败时保留并编辑现有的 `mediaclaw`，不要创建第二个。优先按以下顺序定位：
 
-1. 运行时下载或校验失败：核对安装目录的版本、当前平台以及 GitHub 下载是否可达；不要改成旧版运行时或源码启动器绕过。
+1. 运行时下载或校验失败：核对安装目录的版本、当前平台，以及国内下载源 `media.mediaclaw.app` 和 GitHub 是否可达；不要改成旧版运行时或源码启动器绕过。
 2. 命令文件不存在：重新定位长期保存的 Agent 仓库，禁止使用下载临时目录。
 3. 权限不足：确认启动脚本可执行以及仓库目录可读取。
 4. `TRANSPORT_CLOSED`：只在豆包连接器管理页关闭后重新启用一次，不结束相关进程、不重复卸载。

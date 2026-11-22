@@ -66,6 +66,8 @@ export function validateInstallPrompts(catalog, {expectedAgentVersion, sourceTex
         [`MEDIACLAW_AGENT_DEVICE_NAME=${agentHostDeviceDisplayName(host)}`, "device identity"],
         ["plugins/mediaclaw/scripts/launch-agent.cmd", "official launcher"],
         ["SHA-256", "verified runtime"],
+        [`https://media.mediaclaw.app/agent/package/v${catalog.agentVersion}/MediaClaw-Agent.zip`, "domestic package mirror"],
+        ["https://media.mediaclaw.app", "domestic runtime mirror"],
         [`实际运行版本为 ${catalog.agentVersion}`, "actual runtime version"],
         ["device.agentChannel=release", "release channel"],
         ["保留设备身份、已批准配对和持久数据", "identity preservation"],

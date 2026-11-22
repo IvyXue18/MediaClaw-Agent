@@ -35,6 +35,19 @@ test("malformed and incomplete remote catalogs fail validation", () => {
   assert.ok(validateInstallPrompts(catalog, {expectedAgentVersion: "9.0.0"}).length);
 });
 
+test("every prompt offers the same-version domestic package when GitHub is unreachable", () => {
+  for (const host of SUPPORTED_AGENT_HOST_KEYS) {
+    forPurposes(host, (prompt) => {
+      assert.match(prompt, new RegExp(`media\\.mediaclaw\\.app/agent/package/v${catalog.agentVersion.replaceAll(".", "\\.")}/MediaClaw-Agent\\.zip\\.sha256`));
+      assert.match(prompt, /不需要 VPN/);
+    });
+  }
+  const withoutMirror = mutate((value) => {
+    value.hosts.cursor.install = value.hosts.cursor.install.replaceAll("https://media.mediaclaw.app/agent/package/", "https://example.com/");
+  });
+  assert.ok(validateInstallPrompts(withoutMirror).some((error) => /domestic package mirror/.test(error)));
+});
+
 test("source and field size limits match the backend, including UTF-8 JSON bytes", () => {
   const exactPrompt = mutate((value) => {
     value.hosts.codex.install += "文".repeat(30_000 - value.hosts.codex.install.length);
@@ -81,7 +94,9 @@ test("versions use at most six digits per component and prohibit leading zeros",
     value.agentVersion = maximumVersion;
     value.extensionCompatibility = {minVersion: "0.0.0", maxVersion: maximumVersion};
     for (const host of SUPPORTED_AGENT_HOST_KEYS) {
-      for (const purpose of INSTALL_PROMPT_PURPOSES) value.hosts[host][purpose] = value.hosts[host][purpose].replaceAll(`实际运行版本为 ${catalog.agentVersion}`, `实际运行版本为 ${maximumVersion}`);
+      for (const purpose of INSTALL_PROMPT_PURPOSES) value.hosts[host][purpose] = value.hosts[host][purpose]
+        .replaceAll(`实际运行版本为 ${catalog.agentVersion}`, `实际运行版本为 ${maximumVersion}`)
+        .replaceAll(`/package/v${catalog.agentVersion}/`, `/package/v${maximumVersion}/`);
     }
   });
   assert.deepEqual(validateInstallPrompts(valid), []);

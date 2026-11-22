@@ -40,23 +40,29 @@ fi
 
 BINARY="$RUNTIME_ROOT/$ASSET"
 CHECKSUMS="$RUNTIME_ROOT/checksums.txt"
-BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION"
+# The mirror serves the same release files for networks where GitHub downloads stall.
+MIRROR_BASE_URL="https://media.mediaclaw.app/agent/runtime/$RELEASE_VERSION"
+GITHUB_BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION"
 
+# A source slower than 50 KB/s for 30 seconds is abandoned so the next one can be tried.
 download_file() {
   source_url="$1"
   destination="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl --fail --location --silent --show-error "$source_url" --output "$destination"
+    curl --fail --location --silent --show-error \
+      --connect-timeout 15 --speed-limit 51200 --speed-time 30 \
+      "$source_url" --output "$destination"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$source_url" -O "$destination"
+    wget -q --timeout=30 --tries=2 "$source_url" -O "$destination"
   elif command -v python3 >/dev/null 2>&1; then
     python3 - "$source_url" "$destination" <<'PY'
 import sys
 import urllib.request
 
-with urllib.request.urlopen(sys.argv[1], timeout=60) as response:
+with urllib.request.urlopen(sys.argv[1], timeout=30) as response:
     with open(sys.argv[2], "wb") as output:
-        output.write(response.read())
+        for chunk in iter(lambda: response.read(1024 * 1024), b""):
+            output.write(chunk)
 PY
   else
     echo "MediaClaw Agent 无法下载官方运行时：系统缺少 curl、wget 或 python3。" >&2
@@ -96,16 +102,30 @@ if [ ! -x "$BINARY" ]; then
   BINARY_TEMP="$BINARY.tmp.$$"
   CHECKSUMS_TEMP="$CHECKSUMS.tmp.$$"
   trap 'rm -f "$BINARY_TEMP" "$CHECKSUMS_TEMP"' EXIT HUP INT TERM
-  download_file "$BASE_URL/$ASSET" "$BINARY_TEMP"
-  download_file "$BASE_URL/checksums.txt" "$CHECKSUMS_TEMP"
-  EXPECTED="$(awk -v name="$ASSET" '$2 == name || $2 == "*" name {print $1; exit}' "$CHECKSUMS_TEMP")"
-  if [ -z "$EXPECTED" ]; then
-    echo "MediaClaw Agent 发布清单缺少 $ASSET 的校验值。" >&2
-    exit 1
-  fi
-  ACTUAL="$(sha256_file "$BINARY_TEMP")"
-  if [ "$ACTUAL" != "$EXPECTED" ]; then
-    echo "MediaClaw Agent 运行时校验失败，已拒绝启动。" >&2
+  # Each source is verified against its own release checksum list; a failed source leaves nothing behind.
+  fetch_runtime() {
+    base_url="$1"
+    label="$2"
+    rm -f "$BINARY_TEMP" "$CHECKSUMS_TEMP"
+    if ! download_file "$base_url/$ASSET" "$BINARY_TEMP" ||
+      ! download_file "$base_url/checksums.txt" "$CHECKSUMS_TEMP"; then
+      echo "MediaClaw Agent 无法从${label}完成下载。" >&2
+      return 1
+    fi
+    EXPECTED="$(awk -v name="$ASSET" '$2 == name || $2 == "*" name {print $1; exit}' "$CHECKSUMS_TEMP")"
+    if [ -z "$EXPECTED" ]; then
+      echo "MediaClaw Agent ${label}的发布清单缺少 $ASSET 的校验值。" >&2
+      return 1
+    fi
+    ACTUAL="$(sha256_file "$BINARY_TEMP")" || return 1
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+      echo "MediaClaw Agent ${label}的运行时校验失败，已丢弃。" >&2
+      return 1
+    fi
+  }
+  if ! fetch_runtime "$MIRROR_BASE_URL" "国内下载源" &&
+    ! fetch_runtime "$GITHUB_BASE_URL" " GitHub "; then
+    echo "MediaClaw Agent 官方组件下载或校验失败（国内下载源与 GitHub 均未成功），已拒绝启动。请检查网络后重试。" >&2
     exit 1
   fi
   mv "$CHECKSUMS_TEMP" "$CHECKSUMS"

@@ -30,38 +30,56 @@ if defined PLUGIN_DATA (
 set "BINARY=%RUNTIME_ROOT%\%ASSET%"
 if exist "%BINARY%" goto run
 
-echo MediaClaw Agent 正在准备当前电脑所需的官方组件…… 1>&2
+echo MediaClaw Agent 正在准备当前电脑所需的官方组件（优先使用国内下载源，失败时改用 GitHub）…… 1>&2
 set "MEDIACLAW_AGENT_RUNTIME_ROOT=%RUNTIME_ROOT%"
 set "MEDIACLAW_AGENT_RUNTIME_ASSET=%ASSET%"
-set "MEDIACLAW_AGENT_RUNTIME_BASE_URL=https://github.com/%REPOSITORY%/releases/download/%RELEASE_VERSION%"
+set "MEDIACLAW_AGENT_RUNTIME_MIRROR_URL=https://media.mediaclaw.app/agent/runtime/%RELEASE_VERSION%"
+set "MEDIACLAW_AGENT_RUNTIME_GITHUB_URL=https://github.com/%REPOSITORY%/releases/download/%RELEASE_VERSION%"
 
+rem Each source is verified against its own release checksum list; curl.exe abandons a source slower than 50 KB/s for 30 seconds.
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference = 'Stop';" ^
+  "$ProgressPreference = 'SilentlyContinue';" ^
   "$root = $env:MEDIACLAW_AGENT_RUNTIME_ROOT;" ^
   "$asset = $env:MEDIACLAW_AGENT_RUNTIME_ASSET;" ^
-  "$base = $env:MEDIACLAW_AGENT_RUNTIME_BASE_URL;" ^
   "$binary = Join-Path $root $asset;" ^
   "$nonce = [Guid]::NewGuid().ToString('N');" ^
   "$binaryTemp = $binary + '.' + $nonce + '.tmp';" ^
   "$checksums = Join-Path $root 'checksums.txt';" ^
   "$checksumsTemp = $checksums + '.' + $nonce + '.tmp';" ^
   "New-Item -ItemType Directory -Force -Path $root | Out-Null;" ^
-  "try {" ^
-  "  Invoke-WebRequest -UseBasicParsing -Uri ($base + '/' + $asset) -OutFile $binaryTemp;" ^
-  "  Invoke-WebRequest -UseBasicParsing -Uri ($base + '/checksums.txt') -OutFile $checksumsTemp;" ^
-  "  $line = Get-Content $checksumsTemp | Where-Object { $_ -match ('\s+\*?' + [regex]::Escape($asset) + '$') } | Select-Object -First 1;" ^
-  "  if (-not $line) { throw ('Release manifest has no checksum for ' + $asset) };" ^
-  "  $expected = ($line -split '\s+')[0].ToLowerInvariant();" ^
-  "  $actual = (Get-FileHash -Algorithm SHA256 -Path $binaryTemp).Hash.ToLowerInvariant();" ^
-  "  if ($actual -ne $expected) { throw 'Runtime checksum verification failed' };" ^
-  "  Move-Item -Force $checksumsTemp $checksums;" ^
-  "  Move-Item -Force $binaryTemp $binary;" ^
-  "} finally {" ^
-  "  Remove-Item -Force -ErrorAction SilentlyContinue $binaryTemp, $checksumsTemp;" ^
-  "}"
+  "$curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1;" ^
+  "function Save-RuntimeFile([string]$uri, [string]$out) {" ^
+  "  if ($curl) {" ^
+  "    & $curl.Source --fail --location --silent --show-error --connect-timeout 15 --speed-limit 51200 --speed-time 30 --output $out $uri;" ^
+  "    if ($LASTEXITCODE -ne 0) { throw ('curl exit ' + $LASTEXITCODE) }" ^
+  "  } else {" ^
+  "    Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri $uri -OutFile $out" ^
+  "  }" ^
+  "}" ^
+  "function Get-Runtime([string]$base) {" ^
+  "  try {" ^
+  "    Save-RuntimeFile ($base + '/' + $asset) $binaryTemp;" ^
+  "    Save-RuntimeFile ($base + '/checksums.txt') $checksumsTemp;" ^
+  "    $line = Get-Content $checksumsTemp | Where-Object { $_ -match ('\s+\*?' + [regex]::Escape($asset) + '$') } | Select-Object -First 1;" ^
+  "    if (-not $line) { throw ('release manifest has no checksum for ' + $asset) };" ^
+  "    $expected = ($line -split '\s+')[0].ToLowerInvariant();" ^
+  "    $actual = (Get-FileHash -Algorithm SHA256 -Path $binaryTemp).Hash.ToLowerInvariant();" ^
+  "    if ($actual -ne $expected) { throw 'runtime checksum verification failed' };" ^
+  "    Move-Item -Force $checksumsTemp $checksums;" ^
+  "    Move-Item -Force $binaryTemp $binary;" ^
+  "    return $true" ^
+  "  } catch {" ^
+  "    [Console]::Error.WriteLine('MediaClaw Agent runtime source failed: ' + $base + ' (' + $_.Exception.Message + ')');" ^
+  "    return $false" ^
+  "  } finally {" ^
+  "    Remove-Item -Force -ErrorAction SilentlyContinue $binaryTemp, $checksumsTemp" ^
+  "  }" ^
+  "}" ^
+  "if (-not (Get-Runtime $env:MEDIACLAW_AGENT_RUNTIME_MIRROR_URL) -and -not (Get-Runtime $env:MEDIACLAW_AGENT_RUNTIME_GITHUB_URL)) { exit 1 }"
 
 if errorlevel 1 (
-  echo MediaClaw Agent 官方组件下载或校验失败，已拒绝启动。 1>&2
+  echo MediaClaw Agent 官方组件下载或校验失败（国内下载源与 GitHub 均未成功），已拒绝启动。请检查网络后重试。 1>&2
   exit /b 1
 )
 echo MediaClaw Agent 官方组件已校验，正在建立本机连接。 1>&2
