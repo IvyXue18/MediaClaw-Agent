@@ -53,7 +53,8 @@ download_file() {
       --connect-timeout 15 --speed-limit 51200 --speed-time 30 \
       "$source_url" --output "$destination"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=30 --tries=2 "$source_url" -O "$destination"
+    # Short options only: BusyBox wget accepts -T and -t in every build, but not always the long forms.
+    wget -q -T 30 -t 2 "$source_url" -O "$destination"
   elif command -v python3 >/dev/null 2>&1; then
     python3 - "$source_url" "$destination" <<'PY'
 import sys

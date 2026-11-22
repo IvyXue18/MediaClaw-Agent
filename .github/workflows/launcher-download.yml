@@ -1,0 +1,55 @@
+name: Launcher download smoke
+
+# Starts every platform launcher from an empty runtime folder so the download, checksum and
+# first start are exercised against the published mirror. Run it after the mirror for the
+# launcher's version is published; pushing to ci/launcher-download checks a candidate first.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/launcher-download
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15
+          - macos-15-intel
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download, verify and start the runtime through the platform launcher
+        run: node tests/launcher-smoke.mjs --download
+
+  download-alpine:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # node:22-alpine has BusyBox wget and no curl, which is the launcher's second download path.
+      - name: Download, verify and start the musl runtime through the platform launcher
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/work" --workdir /work node:22-alpine \
+            node tests/launcher-smoke.mjs --download

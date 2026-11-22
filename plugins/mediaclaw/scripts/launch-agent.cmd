@@ -36,7 +36,9 @@ set "MEDIACLAW_AGENT_RUNTIME_ASSET=%ASSET%"
 set "MEDIACLAW_AGENT_RUNTIME_MIRROR_URL=https://media.mediaclaw.app/agent/runtime/%RELEASE_VERSION%"
 set "MEDIACLAW_AGENT_RUNTIME_GITHUB_URL=https://github.com/%REPOSITORY%/releases/download/%RELEASE_VERSION%"
 
-rem Each source is verified against its own release checksum list; curl.exe abandons a source slower than 50 KB/s for 30 seconds.
+rem Each source is verified against its own release checksum list. curl.exe abandons a source slower than
+rem 50 KB/s for 30 seconds; when curl.exe itself cannot run or cannot complete TLS on this PC (exit 2, 35, 60),
+rem the same file is fetched with Invoke-WebRequest instead.
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference = 'Stop';" ^
   "$ProgressPreference = 'SilentlyContinue';" ^
@@ -51,11 +53,11 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Comma
   "$curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1;" ^
   "function Save-RuntimeFile([string]$uri, [string]$out) {" ^
   "  if ($curl) {" ^
-  "    & $curl.Source --fail --location --silent --show-error --connect-timeout 15 --speed-limit 51200 --speed-time 30 --output $out $uri;" ^
-  "    if ($LASTEXITCODE -ne 0) { throw ('curl exit ' + $LASTEXITCODE) }" ^
-  "  } else {" ^
-  "    Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri $uri -OutFile $out" ^
-  "  }" ^
+  "    & $curl.Path --fail --location --silent --connect-timeout 15 --speed-limit 51200 --speed-time 30 --output $out $uri;" ^
+  "    if ($LASTEXITCODE -eq 0) { return };" ^
+  "    if (@(2, 35, 60) -notcontains $LASTEXITCODE) { throw ('curl exit ' + $LASTEXITCODE) }" ^
+  "  };" ^
+  "  Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $out" ^
   "}" ^
   "function Get-Runtime([string]$base) {" ^
   "  try {" ^
@@ -76,7 +78,8 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Comma
   "    Remove-Item -Force -ErrorAction SilentlyContinue $binaryTemp, $checksumsTemp" ^
   "  }" ^
   "}" ^
-  "if (-not (Get-Runtime $env:MEDIACLAW_AGENT_RUNTIME_MIRROR_URL) -and -not (Get-Runtime $env:MEDIACLAW_AGENT_RUNTIME_GITHUB_URL)) { exit 1 }"
+  "if (-not (Get-Runtime $env:MEDIACLAW_AGENT_RUNTIME_MIRROR_URL) -and -not (Get-Runtime $env:MEDIACLAW_AGENT_RUNTIME_GITHUB_URL)) { exit 1 };" ^
+  "exit 0"
 
 if errorlevel 1 (
   echo MediaClaw Agent 官方组件下载或校验失败（国内下载源与 GitHub 均未成功），已拒绝启动。请检查网络后重试。 1>&2

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import {spawn} from "node:child_process";
 import {once} from "node:events";
-import {chmod, copyFile, mkdir, mkdtemp, readFile, rm} from "node:fs/promises";
+import {access, chmod, copyFile, mkdir, mkdtemp, readFile, rm} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+// `--download` starts from an empty runtime folder, so the launcher has to fetch and verify the
+// published runtime itself; any other argument is a freshly built runtime to place there first.
+const downloadMode = process.argv[2] === "--download";
 const runtime = path.resolve(process.argv[2] || "");
-assert.ok(process.argv[2], "standalone runtime path is required");
+assert.ok(process.argv[2], "standalone runtime path or --download is required");
 
 const pluginRoot = path.resolve("plugins/mediaclaw");
 const packageJson = JSON.parse(await readFile("package.json", "utf8"));
@@ -32,9 +35,11 @@ const pluginData = path.join(temporaryRoot, "plugin-data");
 const stateDirectory = path.join(temporaryRoot, "state");
 const runtimeDirectory = path.join(pluginData, "runtime", `v${packageJson.version}`);
 const installedRuntime = path.join(runtimeDirectory, asset);
-await mkdir(runtimeDirectory, {recursive: true});
-await copyFile(runtime, installedRuntime);
-if (process.platform !== "win32") await chmod(installedRuntime, 0o755);
+if (!downloadMode) {
+  await mkdir(runtimeDirectory, {recursive: true});
+  await copyFile(runtime, installedRuntime);
+  if (process.platform !== "win32") await chmod(installedRuntime, 0o755);
+}
 
 const launcher = path.join(pluginRoot, "scripts", "launch-agent.cmd");
 const port = 20_000 + Math.floor(Math.random() * 20_000);
@@ -74,7 +79,7 @@ try {
     method: "initialize",
     params: {protocolVersion: "2025-11-25"},
   })}\n`);
-  const deadline = Date.now() + 15_000;
+  const deadline = Date.now() + (downloadMode ? 10 * 60_000 : 15_000);
   let response = null;
   while (Date.now() < deadline && !response) {
     response = stdout
@@ -88,7 +93,13 @@ try {
   }
   assert.ok(response, `platform launcher did not initialize: ${stderr}`);
   assert.equal(response.result?.serverInfo?.version, packageJson.version);
-  console.log(`Platform launcher smoke passed for ${targetKey}.`);
+  if (downloadMode) {
+    await access(installedRuntime);
+    await access(path.join(runtimeDirectory, "checksums.txt"));
+    // The first source is the domestic mirror; a fallback to GitHub means the mirror is broken or incomplete.
+    assert.doesNotMatch(stderr, /runtime source failed|无法从|校验失败|缺少/, `launcher fell back or failed: ${stderr}`);
+  }
+  console.log(`Platform launcher ${downloadMode ? "download " : ""}smoke passed for ${targetKey}.`);
 } finally {
   child.stdin.end();
   if (process.platform === "win32" && child.pid) {

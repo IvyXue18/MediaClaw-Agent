@@ -42,7 +42,7 @@ Agent 负责识别宿主、注册官方来源和安装接入包。接入包第�
 
 ### 打不开 GitHub 时
 
-不需要 VPN。运行时默认从国内下载源获取；如果 marketplace 注册、`git clone` 或 `git pull` 连接被重置或 2 分钟内没有完成，安装提示词会让 Agent 改用同版本的官方国内副本 `https://media.mediaclaw.app/agent/package/v0.4.1/MediaClaw-Agent.zip`：核对同名 `.sha256` 文件后解压到长期目录（本机为 `~/.mediaclaw/MediaClaw-Agent`，Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`），有插件市场的宿主用该目录的本地路径注册 `mediaclaw-agent` 市场，其他宿主直接指向该目录中的正式启动器。国内副本没有 git 记录，更新时由 Agent 重新下载新版本副本并整体替换，设备身份和数据保留不变。
+不需要 VPN。运行时默认从国内下载源获取；如果 marketplace 注册、`git clone` 或 `git pull` 连接被重置或 2 分钟内没有完成，安装提示词会让 Agent 改用同版本的官方国内副本 `https://media.mediaclaw.app/agent/package/v0.4.1/MediaClaw-Agent.zip`：核对同名 `.sha256` 文件后解压，把压缩包里的 `MediaClaw-Agent` 文件夹保存为长期目录（本机为 `~/.mediaclaw/MediaClaw-Agent`，Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`；macOS/Linux 需保留启动器的可执行权限），有插件市场的宿主用该目录的本地路径注册 `mediaclaw-agent` 市场，其他宿主直接指向该目录中的正式启动器。国内副本没有 git 记录，更新时由 Agent 重新下载新版本副本并整体替换，设备身份和数据保留不变。
 
 ### WorkBuddy 提示没有安装能力时
 
