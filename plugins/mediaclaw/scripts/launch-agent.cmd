@@ -39,6 +39,10 @@ set "MEDIACLAW_AGENT_RUNTIME_GITHUB_URL=https://github.com/%REPOSITORY%/releases
 rem Each source is verified against its own release checksum list. curl.exe abandons a source slower than
 rem 50 KB/s for 30 seconds; when curl.exe itself cannot run or cannot complete TLS on this PC (exit 2, 35, 60),
 rem the same file is fetched with Invoke-WebRequest instead.
+rem A host started from PowerShell 7 passes down its PSModulePath, which makes Windows PowerShell lose
+rem cmdlets such as Get-FileHash; the variable is cleared for this call only and the hash uses .NET directly.
+setlocal
+set "PSModulePath="
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference = 'Stop';" ^
   "$ProgressPreference = 'SilentlyContinue';" ^
@@ -66,7 +70,8 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Comma
   "    $line = Get-Content $checksumsTemp | Where-Object { $_ -match ('\s+\*?' + [regex]::Escape($asset) + '$') } | Select-Object -First 1;" ^
   "    if (-not $line) { throw ('release manifest has no checksum for ' + $asset) };" ^
   "    $expected = ($line -split '\s+')[0].ToLowerInvariant();" ^
-  "    $actual = (Get-FileHash -Algorithm SHA256 -Path $binaryTemp).Hash.ToLowerInvariant();" ^
+  "    $stream = [System.IO.File]::OpenRead($binaryTemp);" ^
+  "    try { $actual = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)) -replace '-', '').ToLowerInvariant() } finally { $stream.Dispose() };" ^
   "    if ($actual -ne $expected) { throw 'runtime checksum verification failed' };" ^
   "    Move-Item -Force $checksumsTemp $checksums;" ^
   "    Move-Item -Force $binaryTemp $binary;" ^
@@ -85,6 +90,7 @@ if errorlevel 1 (
   echo MediaClaw Agent 官方组件下载或校验失败（国内下载源与 GitHub 均未成功），已拒绝启动。请检查网络后重试。 1>&2
   exit /b 1
 )
+endlocal
 echo MediaClaw Agent 官方组件已校验，正在建立本机连接。 1>&2
 
 :run

@@ -33,7 +33,13 @@ jobs:
         with:
           node-version: 22
 
+      # The default Windows shell is PowerShell 7, which hands its module path down to the launcher.
       - name: Download, verify and start the runtime through the platform launcher
+        run: node tests/launcher-smoke.mjs --download
+
+      - name: Repeat from a plain cmd shell
+        if: runner.os == 'Windows'
+        shell: cmd
         run: node tests/launcher-smoke.mjs --download
 
   download-alpine:
