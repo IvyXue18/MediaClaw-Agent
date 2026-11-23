@@ -68,6 +68,7 @@ async function fixture(t, {ttlMs = 60_000, respond, responseFor, responseDelayMs
       MEDIACLAW_AGENT_PORT: String(port),
       MEDIACLAW_AGENT_STATE_DIR: stateDirectory,
       MEDIACLAW_COLLECTION_PLAN_TTL_MS: String(ttlMs),
+      MEDIACLAW_PAGE_NOT_LOADED_RETRY_DELAY_MS: "20",
       MEDIACLAW_AGENT_CHANNEL: "local",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -1044,6 +1045,44 @@ test("a failed group preserves earlier results and stops unstarted groups", asyn
   assert.deepEqual(result.structuredContent.result.remainingPlanIds, [plans[2].planId]);
   assert.deepEqual(f.starts.map((message) => message.task.keyword), ["已完成", "筛选失败"]);
   completed(await f.call("mediaclaw_task_status", {taskId: result.structuredContent.result.results[0].taskId}));
+});
+
+test("a group whose page had not loaded is retried once and never blocks the other groups", async (t) => {
+  const attempts = new Map();
+  const f = await fixture(t, {responseFor(message) {
+    const keyword = message.task.keyword;
+    attempts.set(keyword, (attempts.get(keyword) || 0) + 1);
+    if (keyword === "第二次就好" && attempts.get(keyword) === 1) {
+      return {ok: false, error: {code: "PAGE_NOT_LOADED", message: "搜索页还没加载完，筛选面板没能打开，这次没有采集。等搜索结果显示出来后再试"}};
+    }
+    // Older plugins report the same case by wording only.
+    if (keyword === "一直没加载") return {ok: false, error: {code: "TASK_FAILED", message: "页面还没加载完，这次没有采集，也没有保存任何内容。等页面内容显示出来后再试"}};
+  }});
+  const plans = [];
+  for (const keyword of ["第二次就好", "一直没加载", "照常完成"]) plans.push(await f.prepare("mediaclaw_capture_search_basic", {keyword, limit: 1}));
+  const result = await f.approve("mediaclaw_confirm_collection", {planIds: plans.map((plan) => plan.planId), decision: "approve"});
+  assert.deepEqual(f.starts.map((message) => message.task.keyword), ["第二次就好", "第二次就好", "一直没加载", "一直没加载", "照常完成"]);
+  assert.equal(result.structuredContent.task.status, "completed");
+  const outcome = result.structuredContent.result;
+  assert.equal(outcome.partial, true);
+  assert.equal(outcome.completedCount, 2);
+  assert.deepEqual(outcome.remainingPlanIds, []);
+  assert.deepEqual(outcome.pageNotLoadedPlanIds, [plans[1].planId]);
+  assert.deepEqual(outcome.results.map(({status, attempts: count, reason}) => [status, count, reason]), [
+    ["succeeded", 2, undefined], ["failed", 2, "page_not_loaded"], ["succeeded", undefined, undefined],
+  ]);
+  assert.match(result.structuredContent.task.statusMessage, /已完成 2\/3 组；1 组连续两次页面没加载出来.*刷新/);
+});
+
+test("a batch where every page failed to load ends as failed with one clear instruction", async (t) => {
+  const f = await fixture(t, {responseFor: () => ({ok: false, error: {code: "PAGE_NOT_LOADED", message: "页面还没加载完，这次没有采集，也没有保存任何内容。等页面内容显示出来后再试"}})});
+  const plans = [];
+  for (const keyword of ["甲", "乙"]) plans.push(await f.prepare("mediaclaw_capture_search_basic", {keyword, limit: 1}));
+  const result = await f.approve("mediaclaw_confirm_collection", {planIds: plans.map((plan) => plan.planId), decision: "approve"});
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.task.status, "failed");
+  assert.equal(f.starts.length, 4);
+  assert.deepEqual(result.structuredContent.result.pageNotLoadedPlanIds, plans.map((plan) => plan.planId));
 });
 
 test("concurrent batch confirmations consume all plans once and expose an async task handle", async (t) => {

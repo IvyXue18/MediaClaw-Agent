@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {AsyncLocalStorage} from "node:async_hooks";
+import {setTimeout as delay} from "node:timers/promises";
 import METHOD_REGISTRY from "../contracts/methods-v1.json" with {type: "json"};
 import MCP_CONTRACT from "../contracts/mcp-v1.json" with {type: "json"};
 import {AGENT_UPDATE_TOOL, compareVersions} from "./agent-update.mjs";
@@ -76,6 +77,18 @@ const TASK_CANCEL_TIMEOUT_MS = Math.max(
   100,
   Number(process.env.MEDIACLAW_AGENT_CANCEL_TIMEOUT_MS || 10_000),
 );
+// A page that had not finished loading is worth one automatic retry; the plugin
+// reports it with this code or wording (utils/errors.js in the plugin repository).
+const PAGE_NOT_LOADED_RETRY_DELAY_MS = Math.max(
+  0,
+  Number(process.env.MEDIACLAW_PAGE_NOT_LOADED_RETRY_DELAY_MS || 4_000),
+);
+const PAGE_NOT_LOADED_PATTERN = /(?:页面还没加载完|搜索页还没加载完)/;
+function isPageNotLoadedFailure(task) {
+  const error = task?.error || task?.result?.error;
+  return error?.code === "PAGE_NOT_LOADED" ||
+    PAGE_NOT_LOADED_PATTERN.test(`${error?.message || ""} ${task?.message || ""}`);
+}
 const AGENT_PRICING_URL =
   "https://mediaclaw.app/pricing?source=agent";
 const BROWSER_EXTENSION_DOWNLOAD_URL = "https://mediaclaw.app/download";
@@ -1729,7 +1742,7 @@ function captureNeedsCollectionConsent(captureTask) {
   return ["current_note", "search_results", "profile_posts", "profile_info", "comments", "enhance_records", "extract_image_text"].includes(captureTask?.mode);
 }
 
-async function startConfirmedCollectionPlan(plan) {
+async function startConfirmedCollectionPlan(plan, {retry = 0} = {}) {
   const collectionConsent = plan.userApproval;
   if (!hasUserCollectionApproval(collectionConsent, plan.ownerDeviceId)) {
     throw collectionPlanError("COLLECTION_USER_APPROVAL_REQUIRED", "采集尚未获得用户确认");
@@ -1740,6 +1753,8 @@ async function startConfirmedCollectionPlan(plan) {
     if (executionArgs.idempotencyKey) {
       const {idempotencyKey, ...scopeArgs} = executionArgs;
       executionArgs.idempotencyKey = `${idempotencyKey.slice(0, 160)}:${crypto.createHash("sha256").update(JSON.stringify([plan.toolName, scopeArgs])).digest("hex").slice(0, 32)}`;
+      // A retry of the same approved scope must start a new task, not return the failed one.
+      if (retry > 0) executionArgs.idempotencyKey += `:retry${retry}`;
     }
     if (plan.toolName === "mediaclaw_enhance_records") executionArgs.confirmed = true;
     return executeCaptureTool(plan.toolName, executionArgs);
@@ -1764,9 +1779,10 @@ function startCollectionPlanBatch(plans) {
     }));
     try {
       updateTask(parent, {status: "running", message: `正在执行已确认的 ${plans.length} 组采集`});
+      const notCompleted = (child) => child.status !== "succeeded" || child.result?.ok === false;
       for (const [index, plan] of plans.entries()) {
         if (parentStopRequested(parent)) return;
-        const child = addChildTask(parent, await startConfirmedCollectionPlan(plan));
+        let child = addChildTask(parent, await startConfirmedCollectionPlan(plan));
         // A stop requested while this group was starting must reach the new child.
         if (parentStopRequested(parent)) void cancelTask(child.taskId);
         else updateTask(parent, {
@@ -1774,11 +1790,38 @@ function startCollectionPlanBatch(plans) {
           message: `正在执行第 ${index + 1}/${plans.length} 组，全部范围已确认`,
         });
         await child.completion;
-        results.push({planId: plan.planId, taskId: child.taskId, status: child.status});
+        if (parentStopRequested(parent)) {
+          results.push({planId: plan.planId, taskId: child.taskId, status: child.status});
+          return;
+        }
+        let attempts = 1;
+        // A slow page usually loads on the second try. Retry the same approved
+        // scope once before reporting it; this is not a new or wider request.
+        if (child.status === "failed" && isPageNotLoadedFailure(child)) {
+          updateTask(parent, {message: `第 ${index + 1}/${plans.length} 组页面还没加载完，稍后自动重试一次`});
+          await delay(PAGE_NOT_LOADED_RETRY_DELAY_MS);
+          if (parentStopRequested(parent)) {
+            results.push({planId: plan.planId, taskId: child.taskId, status: child.status});
+            return;
+          }
+          child = addChildTask(parent, await startConfirmedCollectionPlan(plan, {retry: 1}));
+          if (parentStopRequested(parent)) void cancelTask(child.taskId);
+          await child.completion;
+          attempts = 2;
+        }
+        const pageNotLoaded = child.status === "failed" && isPageNotLoadedFailure(child);
+        results.push({
+          planId: plan.planId, taskId: child.taskId, status: child.status,
+          ...(attempts > 1 ? {attempts} : {}),
+          ...(pageNotLoaded ? {reason: "page_not_loaded"} : {}),
+        });
         if (parentStopRequested(parent)) return;
-        // Never turn a stopped, failed or input-required child into another
-        // browser action. Completed data remains reachable by child task ID.
-        if (child.status !== "succeeded" || child.result?.ok === false) {
+        // One group whose page would not load does not block the others; it is
+        // reported at the end so the user can refresh that page and retry it.
+        if (pageNotLoaded) continue;
+        // Never turn any other stopped, failed or input-required child into
+        // another browser action. Completed data remains reachable by child task ID.
+        if (notCompleted(child)) {
           finishTask(parent, {
             status: child.status === "input_required" ? "input_required" : child.status === "cancelled" ? "cancelled" : "failed",
             result: {ok: false, ...summary(), nextAction: child.result?.nextAction || null},
@@ -1787,6 +1830,18 @@ function startCollectionPlanBatch(plans) {
           });
           return;
         }
+      }
+      const notLoaded = results.filter((item) => item.reason === "page_not_loaded");
+      if (notLoaded.length > 0) {
+        const completedCount = summary().completedCount;
+        const message = `已完成 ${completedCount}/${plans.length} 组；${notLoaded.length} 组连续两次页面没加载出来，没有采集。请先在浏览器刷新对应页面，能正常看到内容后再重试这几组`;
+        finishTask(parent, {
+          status: completedCount > 0 ? "succeeded" : "failed",
+          result: {ok: completedCount > 0, partial: true, ...summary(), pageNotLoadedPlanIds: notLoaded.map((item) => item.planId)},
+          error: completedCount > 0 ? null : {code: "PAGE_NOT_LOADED", message},
+          message,
+        });
+        return;
       }
       finishTask(parent, {
         status: "succeeded", result: {ok: true, ...summary()}, error: null,
