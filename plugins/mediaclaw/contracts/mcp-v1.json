@@ -87,6 +87,7 @@
     {"name": "mediaclaw_quote_video_transcript", "kind": "quote", "stability": "stable", "requiresCredential": true},
     {"name": "mediaclaw_confirm_video_transcript", "kind": "extract", "stability": "stable", "requiresCredential": true, "metered": true, "confirmationArgument": "quoteId"},
     {"name": "mediaclaw_task_status", "kind": "control", "stability": "stable"},
+    {"name": "mediaclaw_stop_active_tasks", "kind": "control", "stability": "stable"},
     {"name": "mediaclaw_cancel_task", "kind": "control", "stability": "stable"},
     {"name": "mediaclaw_scan_keyword", "requiresCollectionPlan": true, "startsCollection": false, "kind": "legacy", "stability": "deprecated"},
     {"name": "mediaclaw_expand_keywords", "requiresCollectionPlan": true, "startsCollection": false, "kind": "legacy", "stability": "deprecated"},

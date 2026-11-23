@@ -378,3 +378,24 @@ test("empty changes allow explicit approval, while lost cancellation preserves t
     assert.deepEqual(f.decisions.map((item) => item.decision), ["cancel"]);
   });
 });
+
+test("interrupting a running tool call tells the Broker to stop the tasks that request started", async (t) => {
+  const f = await fixture(t, {mcpDelayMs: 300});
+  f.call("running-capture", "mediaclaw_capture_search_basic", {arguments: {keyword: "收纳"}});
+  await f.waitFor(() => f.brokerRequests.some((item) => item.params?.name === "mediaclaw_capture_search_basic"), "forwarded call");
+  f.send({method: "notifications/cancelled", params: {requestId: "running-capture"}});
+  const stop = await f.waitFor(() => f.brokerRequests.find((item) => item.method === "mediaclaw/stop-request-tasks"), "stop request");
+  const stopRequest = f.brokerRequests.find((item) => item.method === "mediaclaw/stop-request-tasks");
+  assert.ok(stop);
+  assert.equal(stopRequest.token, "private-adapter-session");
+  const since = Date.parse(stopRequest.params.since);
+  assert.ok(Number.isFinite(since) && since <= Date.now(), "since is when the interrupted request began");
+});
+
+test("a cancellation for an unknown or non-tool request stops nothing", async (t) => {
+  const f = await fixture(t);
+  f.send({method: "notifications/cancelled", params: {requestId: "never-sent"}});
+  f.send({id: "barrier", method: "ping"});
+  await f.result("barrier");
+  assert.equal(f.brokerRequests.some((item) => item.method === "mediaclaw/stop-request-tasks"), false);
+});

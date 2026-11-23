@@ -846,6 +846,18 @@ test("platform inference uses URL hostnames rather than lookalike domains or pat
   assert.equal(f.starts.length, 0);
 });
 
+test("Douyin search accepts its 内容形式 filter and still rejects filters it does not have", async (t) => {
+  const f = await fixture(t);
+  for (const contentType of ["video", "image"]) {
+    const plan = await f.prepare("mediaclaw_capture_search_basic", {keyword: "收纳", platform: "douyin", contentType});
+    assert.equal(plan.arguments.contentType, contentType);
+    assert.equal(plan.arguments.platform, "douyin");
+  }
+  const unsupported = await f.call("mediaclaw_capture_search_basic", {keyword: "收纳", platform: "douyin", locationScope: "city"});
+  failsWith(unsupported, /INVALID_COLLECTION_PLAN/);
+  assert.match(unsupported.structuredContent.error.message, /douyin 不支持筛选参数 locationScope=city/);
+});
+
 test("TikTok links infer the tiktok platform for capture, enhancement and deep collection only", async (t) => {
   const f = await fixture(t);
   const video = "https://www.tiktok.com/@fixture/video/7412345678901234567";

@@ -1704,6 +1704,7 @@ test("Codex MCP bridge exposes paired async tasks and complete plugin records", 
     "mediaclaw_confirm_video_transcript",
     "mediaclaw_extract_image_text",
     "mediaclaw_manage_agent_update",
+    "mediaclaw_stop_active_tasks",
   ].sort());
   assert.deepEqual(annotatedToolNames("openWorldHint"), [
     "mediaclaw_capture_account_profile",

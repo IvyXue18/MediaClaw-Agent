@@ -602,6 +602,9 @@ const SEARCH_FILTER_CAPABILITIES = Object.freeze({
       "over_5m",
     ]),
     searchScope: Object.freeze(["all", "seen", "unseen", "followed"]),
+    // 内容形式（不限/视频/图文）. The plugin sets it from 0.4.2 on; an older
+    // plugin rejects a non-neutral value and the capture stops.
+    contentType: Object.freeze(["all", "video", "image"]),
   }),
   // TikTok search exposes no native filter the plugin can apply; only neutral values pass.
   tiktok: Object.freeze({}),
@@ -2306,6 +2309,9 @@ function createTask({
           hostKey: owner.hostKey,
           deviceId: owner.identity.deviceId,
           displayName: owner.displayName,
+          // The conversation connection that started it, so stopping that
+          // conversation's request stops its tasks and nothing else.
+          instanceId: requestContext.getStore()?.instanceId || "",
         }
       : null,
     progress: null,
@@ -6491,6 +6497,39 @@ function queryDataset(task, input = {}) {
   };
 }
 
+const STOPPABLE_TASK_STATUSES_EXCLUDED = new Set(["succeeded", "failed", "cancelled", "input_required"]);
+
+/**
+ * Stop every task `matches` selects that is still running or waiting. Parent
+ * tasks go first so their running child is stopped through them; a child that
+ * its parent already settled is then skipped.
+ */
+async function stopActiveTasks(matches) {
+  const candidates = [...tasks.values()]
+    .filter((task) => matches(task) && !STOPPABLE_TASK_STATUSES_EXCLUDED.has(task.status))
+    .sort((left, right) => Number(isBrokerParentTask(right)) - Number(isBrokerParentTask(left)));
+  const stopped = [];
+  const failed = [];
+  for (const task of candidates) {
+    if (STOPPABLE_TASK_STATUSES_EXCLUDED.has(task.status)) continue;
+    const result = await cancelTask(task.taskId);
+    if (result.ok === false) {
+      failed.push({taskId: task.taskId, error: result.error || null});
+    } else if (result.canceled !== false) {
+      stopped.push({taskId: task.taskId, status: tasks.get(task.taskId)?.status || "cancelled"});
+    }
+  }
+  return {
+    ok: failed.length === 0,
+    stoppedCount: stopped.length,
+    stopped,
+    ...(failed.length ? {failed} : {}),
+    message: stopped.length
+      ? `已停止 ${stopped.length} 个任务，已保存的部分保留。`
+      : failed.length ? "有任务没能确认停止，请在插件里点「终止」。" : "当前没有正在运行的任务。",
+  };
+}
+
 async function cancelTask(taskId) {
   const task = tasks.get(taskId);
   if (!task) {
@@ -6692,7 +6731,7 @@ const SEARCH_FILTER_SCHEMA_PROPERTIES = Object.freeze({
     type: "string",
     enum: ["all", "video", "image"],
     default: "all",
-    description: "小红书笔记类型；抖音仅允许中性值 all。",
+    description: "小红书笔记类型、抖音内容形式（视频/图文）；抖音的非中性值需要插件 0.4.2 及以上。",
   }),
   videoDuration: Object.freeze({
     type: "string",
@@ -7940,6 +7979,19 @@ const tools = [
     },
   },
   {
+    name: "mediaclaw_stop_active_tasks",
+    description: "用户说停止、别采了、取消、先停一下时调用：立即停止本设备上由 Agent 发起、仍在运行或等待中的全部任务，不需要任务编号，已保存的部分保留。不影响用户在插件里自己发起的任务和私信触达计划。",
+    annotations: toolAnnotations("停止当前任务", {
+      destructiveHint: true,
+      idempotentHint: true,
+    }),
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
     name: "mediaclaw_cancel_task",
     description: "取消仍在运行或等待中的采集任务。",
     annotations: toolAnnotations("取消采集任务", {
@@ -8436,6 +8488,9 @@ async function handleToolCall(params = {}) {
           {isError: true},
         );
   }
+  if (name === "mediaclaw_stop_active_tasks") {
+    return toolResult(await stopActiveTasks((task) => adapterOwnsTask(adapter, task)));
+  }
   if (name === "mediaclaw_cancel_task") {
     const task = tasks.get(String(args.taskId || ""));
     if (!task || !adapterOwnsTask(adapter, task)) {
@@ -8621,6 +8676,17 @@ async function handleBrokerMcp(adapter, payload = {}) {
   const params = payload.params || {};
   if (method === "tools/list") return {tools};
   if (method === "tools/call") return await handleToolCall(params);
+  // The user interrupted a request in their host: stop the tasks this
+  // conversation connection started since that request began.
+  if (method === "mediaclaw/stop-request-tasks") {
+    const since = Date.parse(String(params.since || ""));
+    const instanceId = requestContext.getStore()?.instanceId || "";
+    if (!Number.isFinite(since) || !instanceId) return {ok: false, stoppedCount: 0, stopped: []};
+    return await stopActiveTasks((task) =>
+      adapterOwnsTask(adapter, task) &&
+      task.owner?.instanceId === instanceId &&
+      Date.parse(task.createdAt) >= since);
+  }
   if (method === "tasks/list") {
     return {
       tasks: [...tasks.values()]

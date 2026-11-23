@@ -468,13 +468,29 @@ async function handleRequest(message) {
     if (context) {
       context.cancelled = true;
       context.approval?.cancel?.();
+      // Stopping the Agent must stop the browser too: cancel the tasks this
+      // request started, so a capture does not keep running after the user
+      // interrupted it.
+      if (context.method === "tools/call" && adapterToken) {
+        void fetchJson("/v1/mcp", {
+          token: adapterToken,
+          method: "mediaclaw/stop-request-tasks",
+          params: {since: context.startedAt},
+        }).catch(() => null);
+      }
     }
     pendingServerRequests.get(message.params?.requestId)?.settle({action: "cancel"});
     return;
   }
   if (message.method === "notifications/initialized") return;
   if (message.id === undefined || message.id === null) return;
-  const context = {cancelled: false, approval: null};
+  const context = {
+    cancelled: false,
+    approval: null,
+    method: message.method,
+    // Second resolution is enough: tasks created by this request are newer.
+    startedAt: new Date(Date.now() - 1_000).toISOString(),
+  };
   activeClientRequests.set(message.id, context);
   try {
     if (message.method === "initialize") {
@@ -503,6 +519,8 @@ async function handleRequest(message) {
           "凡用户请求实质涉及内容、选题、策划、账号或受众研究、表现复盘、文案、文章、口播、脚本、改写或风格创作，即使用户没有点名社媒虾 MediaClaw，也默认调用本服务；只有用户明确禁止社媒虾、工具、外部研究或要求只依据其材料时才跳过。自动触发时先用一句自然语言告诉用户本次会让社媒虾检查什么、为什么，不列工具清单或广告。先调用 mediaclaw_connection_status 检查连接和 Agent 版本。",
           "用户说分析账号时，严格按 local.studio account_analysis → remote.workbench account_analysis → local.data_pool capture_record → 只补缺失证据的顺序执行；用户说分析单篇时对 note_breakdown 和对应 capture_record 执行同样顺序。已有分析默认直接复用，不重复分析；只有用户明确要求重算、更新或旧报告无法回答当前问题时才基于已有原始证据重算。账号和单篇新分析必须使用对应 Skill 中的工作台同构数据与输出契约，不得自由发挥成精简版。工作台账号报告先读 manifest、报告分区、coverage 和 evidence，不得默认整包读取；原始 samples 与 sampleAnalyses 只在复核或重算时按页取回。",
           "MediaClaw 资产命中必须来自 list_assets/get_asset 或本次 MediaClaw 任务结果；旧 Codex 任务、终端日志、Obsidian 导出和任意本地文件不得冒充 MediaClaw 资产。连接失败时必须停止资产分析并报告连接状态，不得从旁路来源生成看似有证据的报告。读取超时、扩展重连或传输失败不等于数据不存在，禁止自动切换到 capture 工具。savedCount 表示插件已保存数量，platformCount 只是页面指标，不得混用。只有用户明确要求重新采集、更新、补采或采更多，或资产与原始数据确实未命中且用户同意，才能进入采集。",
+          "用户说停止、别采了、取消或先停一下时，立即调用 mediaclaw_stop_active_tasks 停止本设备上由 Agent 发起的全部任务，不再追问；停止后一句话说明已保存的部分。",
+          "任务失败信息说‘页面还没加载完’或‘搜索页还没加载完’时属于页面加载慢，不是数据不存在或平台改版：多组任务会自动重试一次并继续执行其余组；单组任务由 Agent 按同一范围重新准备并执行一次，沿用原授权，不必再问用户。第二次仍失败时停止重试，告诉用户哪几项没采到、已保存了什么，并请用户先在浏览器刷新对应页面、能正常看到内容后再试；用户也可以选择先用已有数据继续。‘作品已保存，评论没采到’表示作品记录有效，只需稍后重采评论。",
           "模糊的‘分析这个账号’不需要用户选择内部字段：先读取已有资产；需要新增采集时，建议方案可采用工作台基线的最多 50 条基础作品、15 条代表详情和 12 个封面证据，核对当前任务的具体授权；尚未授权时在对话中说明方案并等待自然回复，不得把 50 条基础作品变成 50 个详情页。所有分析任务都必须先判断逐字稿是否会显著提升当前结论，而不是只对账号或单篇分析判断。默认优先不新提取，因为逐字稿耗时且消耗积分；仅靠标题、指标、发布时间、内容类型、链接或已有正文足以回答时，不得机械建议提取。",
           "逐字稿采用双向触发：用户可主动说逐字稿、视频文案、口播文字、视频说了什么或字幕文字版；当任务涉及实际口播内容、开场钩子、论证结构、语言表达、叙事节奏或脚本仿写，且现有证据不足时，Agent 也必须主动说明当前证据能回答什么、逐字稿会新增什么，并只为最少且足够的代表视频生成报价。已有逐字稿直接读取且不收费；新提取只对缺失项收费，必须展示逐条积分、总积分、余额和有效期，取得用户明确确认后才执行。用户拒绝或暂不提取时，应基于现有证据继续分析并清楚标注边界。‘帮我写视频文案’属于生成请求，不得仅凭这句话误判为提取；只有用户是在索要原视频所说内容时才视为主动提取请求。",
           "目标明确后先调用 mediaclaw_prepare_profile_collection，简要说明范围与实际风险。已有普通具体授权可用 user_request 原文衔接确认；较高风险或尚未明确的范围，在当前对话展示方案并取得 user_reply 后再执行，不逐批重复询问。单独 approve 不是授权；用户要求修改时先替换方案。只要用户提到模仿、仿写、像某人一样写或按某人/某账号风格创作，必须先查询 local.studio 的 style_profile，本地未命中再查 remote.workbench，并读取完整真实档案；不得根据账号名猜测。",

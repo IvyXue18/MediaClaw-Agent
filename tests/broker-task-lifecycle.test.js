@@ -1057,3 +1057,61 @@ test("a child that completes during the parent cancel keeps its result and the b
   assert.equal(parent.structuredContent.result.remainingCount, 0);
   assert.equal(await f.waitingTaskCount(), 0);
 });
+
+test("stop_active_tasks stops every running task this device's Agent started, with no task id", async (t) => {
+  const f = await startTwoItemDeepBatch(t, 26400);
+  const stopping = callTool(f.port, f.registration.token, "mediaclaw_stop_active_tasks", {});
+  const childCancel = await f.extension.waitFor(
+    (message) => message.type === "task.cancel" && message.taskId === f.second.taskId,
+  );
+  f.extension.socket.send(JSON.stringify({
+    type: "task.cancel.result",
+    taskId: f.second.taskId,
+    deviceId: childCancel.deviceId,
+    response: {ok: true, canceled: true},
+  }));
+  const stopped = await stopping;
+  assert.equal(stopped.structuredContent.ok, true, JSON.stringify(stopped.structuredContent));
+  assert.ok(stopped.structuredContent.stoppedCount >= 1);
+  assert.ok(stopped.structuredContent.stopped.some((item) => item.taskId === f.batchId));
+  assert.match(stopped.structuredContent.message, /已停止 \d+ 个任务/);
+  await waitForTaskStatus(f.status, f.batchId, "cancelled");
+
+  const again = await callTool(f.port, f.registration.token, "mediaclaw_stop_active_tasks", {});
+  assert.equal(again.structuredContent.stoppedCount, 0);
+  assert.equal(again.structuredContent.message, "当前没有正在运行的任务。");
+});
+
+test("stopping one Agent's tasks leaves another device's tasks running", async (t) => {
+  const f = await startTwoItemDeepBatch(t, 26800);
+  const other = await registerAdapter(f.port);
+  const stopped = await callTool(f.port, other.token, "mediaclaw_stop_active_tasks", {});
+  assert.equal(stopped.structuredContent.stoppedCount, 0);
+  const status = await f.status(f.batchId);
+  assert.equal(status.structuredContent.task.status, "working");
+});
+
+test("an interrupted request stops only the tasks its conversation started after it began", async (t) => {
+  const f = await startTwoItemDeepBatch(t, 27200);
+  const before = new Date(Date.now() + 60_000).toISOString();
+  const none = await post(f.port, "/v1/mcp", {token: f.registration.token, method: "mediaclaw/stop-request-tasks", params: {since: before}});
+  assert.equal(none.stoppedCount, 0, "tasks started before the interrupted request are left alone");
+
+  const since = new Date(Date.now() - 60_000).toISOString();
+  const stopping = post(f.port, "/v1/mcp", {token: f.registration.token, method: "mediaclaw/stop-request-tasks", params: {since}});
+  const childCancel = await f.extension.waitFor(
+    (message) => message.type === "task.cancel" && message.taskId === f.second.taskId,
+  );
+  f.extension.socket.send(JSON.stringify({
+    type: "task.cancel.result",
+    taskId: f.second.taskId,
+    deviceId: childCancel.deviceId,
+    response: {ok: true, canceled: true},
+  }));
+  const stopped = await stopping;
+  assert.ok(stopped.stoppedCount >= 1, JSON.stringify(stopped));
+  await waitForTaskStatus(f.status, f.batchId, "cancelled");
+
+  const invalid = await post(f.port, "/v1/mcp", {token: f.registration.token, method: "mediaclaw/stop-request-tasks", params: {since: "not a date"}});
+  assert.equal(invalid.ok, false);
+});
