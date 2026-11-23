@@ -79,8 +79,11 @@ export function validateInstallPrompts(catalog, {expectedAgentVersion, sourceTex
       require(!/launch-agent-local|\.mcp\.[\w-]+\.local\.json|MEDIACLAW_AGENT_CHANNEL\s*=\s*["']?local/i.test(prompt), `${label}: developer launch instructions are forbidden`);
       require(!/已经能调用 mediaclaw_connection_status，跳过安装/.test(prompt), `${label}: tools presence cannot bypass verification`);
       require(!/你不需要研究该采什么数据，也不用记任何命令/.test(prompt), `${label}: business welcome copy belongs to the runtime`);
-      if (purpose !== "install") require(prompt.includes("即使工具已经存在或 connected=true，也必须核对实际运行版本、正式渠道、官方来源及启动路径"), `${label}: repair and upgrade must verify existing installations`);
+      require(prompt.includes("即使工具已经存在或 connected=true，也必须核对实际运行版本、正式渠道、官方来源及启动路径"), `${label}: the prompt must verify existing installations`);
     }
+    // The extension shows one prompt for install, repair and upgrade. The three
+    // keys stay only for published extensions that still read each purpose.
+    require(INSTALL_PROMPT_PURPOSES.every((purpose) => entry?.[purpose] === entry?.install), `hosts.${host}: install, repair and upgrade must carry the same universal prompt`);
   }
   return errors;
 }

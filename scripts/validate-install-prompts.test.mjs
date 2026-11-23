@@ -50,12 +50,13 @@ test("every prompt offers the same-version domestic package when GitHub is unrea
 
 test("source and field size limits match the backend, including UTF-8 JSON bytes", () => {
   const exactPrompt = mutate((value) => {
-    value.hosts.codex.install += "文".repeat(30_000 - value.hosts.codex.install.length);
+    const padded = value.hosts.codex.install + "文".repeat(30_000 - value.hosts.codex.install.length);
+    for (const purpose of INSTALL_PROMPT_PURPOSES) value.hosts.codex[purpose] = padded;
     value.hosts.codex.displayName = "A".repeat(80);
   });
   assert.deepEqual(validateInstallPrompts(exactPrompt), []);
   const oversizedPrompt = structuredClone(exactPrompt);
-  oversizedPrompt.hosts.codex.install += "文";
+  for (const purpose of INSTALL_PROMPT_PURPOSES) oversizedPrompt.hosts.codex[purpose] += "文";
   assert.ok(validateInstallPrompts(oversizedPrompt).some((error) => /30000/.test(error)));
   const oversizedName = structuredClone(exactPrompt);
   oversizedName.hosts.codex.displayName += "A";
@@ -114,8 +115,22 @@ test("public prompts reject the previous development launcher and connected shor
   }
 });
 
-test("repair and upgrade cannot lose identity preservation or actual-version checks", () => {
-  for (const purpose of ["repair", "upgrade"]) {
+test("install, repair and upgrade carry one universal prompt", () => {
+  for (const host of SUPPORTED_AGENT_HOST_KEYS) {
+    forPurposes(host, (prompt) => {
+      assert.equal(prompt, catalog.hosts[host].install);
+      assert.match(prompt, /^本次目的：安装、修复或升级 MediaClaw Agent/);
+      assert.match(prompt, /本提示词已授权本次官方安装、修复或升级/);
+    });
+  }
+  for (const purpose of INSTALL_PROMPT_PURPOSES) {
+    const diverged = mutate((value) => { value.hosts.cursor[purpose] = value.hosts.cursor[purpose].replace("本次目的：", "本次目的（分叉）："); });
+    assert.ok(validateInstallPrompts(diverged).some((error) => /same universal prompt/.test(error)), `must reject a diverged ${purpose}`);
+  }
+});
+
+test("every purpose keeps identity preservation and actual-version checks", () => {
+  for (const purpose of INSTALL_PROMPT_PURPOSES) {
     for (const required of [
       "即使工具已经存在或 connected=true，也必须核对实际运行版本、正式渠道、官方来源及启动路径",
       `实际运行版本为 ${catalog.agentVersion}`,
