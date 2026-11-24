@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import {spawn} from "node:child_process";
+import {spawn, spawnSync} from "node:child_process";
 import {once} from "node:events";
 import {mkdtemp, rm} from "node:fs/promises";
 import os from "node:os";
@@ -8,6 +8,19 @@ import packageJson from "../package.json" with {type: "json"};
 
 const binary = path.resolve(process.argv[2] || "");
 assert.ok(process.argv[2], "standalone runtime path is required");
+
+// macOS 27 kills executables whose signature does not match their contents,
+// so a runtime that only launches on older macOS must not be released.
+if (process.platform === "darwin") {
+  const verify = spawnSync("codesign", ["--verify", "--strict", binary], {
+    encoding: "utf8",
+  });
+  assert.equal(
+    verify.status,
+    0,
+    `macOS runtime signature is invalid: ${verify.stderr.trim()}`,
+  );
+}
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

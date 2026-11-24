@@ -99,6 +99,18 @@ jobs:
             sleep $((attempt * 5))
           done
 
+      # bun build --compile writes the bundle into the executable without
+      # re-signing it, so the embedded signature no longer matches. macOS 27
+      # kills such a process at launch; earlier releases tolerated it. Re-sign
+      # ad hoc and fail the release if the signature is not strictly valid.
+      # This runs before attestation and upload, so checksums.txt covers the
+      # signed file.
+      - name: Re-sign macOS runtime
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          codesign --force --sign - dist/${{ matrix.asset }}
+          codesign --verify --strict --verbose=2 dist/${{ matrix.asset }}
+
       - name: Smoke test MCP and browser WebSocket transport
         if: ${{ !contains(matrix.asset, 'musl') }}
         run: node tests/standalone-runtime-smoke.mjs dist/${{ matrix.asset }}
