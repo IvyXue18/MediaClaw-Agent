@@ -4,7 +4,7 @@ MediaClaw Agent 是 [MediaClaw](https://mediaclaw.app) 的官方 Agent 接入包
 
 它不能单独使用：你还需要安装 MediaClaw 浏览器插件、完成有效会员验证，并在浏览器中批准当前 Agent。设备配对与平台登录是接入前提；任务范围、费用和执行结果应在 Agent 对话中说明。
 
-> 当前正式版本为 [`0.4.1`](https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v0.4.1)（GitHub Latest），支持上述八个宿主和 TikTok，请配合 MediaClaw 浏览器插件 `0.4.0` 或更新版本使用。已安装旧版的用户直接说“升级 MediaClaw Agent”即可；豆包工作从官方接入教程获取升级提示词。各项能力以当前宿主和浏览器插件连接后返回的结果为准。
+> 当前正式版本为 [`0.4.2`](https://github.com/IvyXue18/MediaClaw-Agent/releases/tag/v0.4.2)（GitHub Latest），支持上述八个宿主和 TikTok，请配合 MediaClaw 浏览器插件 `0.4.0` 或更新版本使用。已安装旧版的用户直接说“升级 MediaClaw Agent”即可；豆包工作从官方接入教程获取升级提示词。各项能力以当前宿主和浏览器插件连接后返回的结果为准。
 
 ## 可以做什么
 
@@ -57,7 +57,7 @@ Agent 接管需要有效会员。逐字稿等计费能力还会在执行前展�
 1. 安装或升级 MediaClaw 浏览器插件。
 2. 在 MediaClaw 插件中完成有效会员验证。
 3. 在浏览器中登录你要使用的小红书、抖音或 TikTok 账号。
-4. 在当前宿主中安装本仓库的 MediaClaw 接入包；`0.4.1` Agent 配套 `0.4.0` 或更新版本的浏览器插件。
+4. 在当前宿主中安装本仓库的 MediaClaw 接入包；`0.4.2` Agent 配套 `0.4.0` 或更新版本的浏览器插件。
 5. 打开 MediaClaw 插件的“Agent 接管”，批准当前 Agent。
 
 ## 第一次安装也可以交给 Agent

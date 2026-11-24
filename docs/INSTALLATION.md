@@ -1,6 +1,6 @@
 # 安装与连接 MediaClaw Agent
 
-MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户不需要自行配置端口、令牌或运行服务。当前正式版本为 `0.4.1`（GitHub Latest），支持 Codex、WorkBuddy、豆包工作、Claude Code、Grok Build、Grok Bot（云电脑）、DeepSeek Harness 和 Cursor，需要配套 MediaClaw 浏览器插件 `0.4.0` 或更新版本。实际可用能力以连接后返回的结果为准。
+MediaClaw Agent 需要与 MediaClaw 浏览器插件配合使用。普通用户不需要自行配置端口、令牌或运行服务。当前正式版本为 `0.4.2`（GitHub Latest），支持 Codex、WorkBuddy、豆包工作、Claude Code、Grok Build、Grok Bot（云电脑）、DeepSeek Harness 和 Cursor，需要配套 MediaClaw 浏览器插件 `0.4.0` 或更新版本。实际可用能力以连接后返回的结果为准。
 
 ## 第一步：准备浏览器插件
 
@@ -13,15 +13,15 @@ Agent 配对请使用 Chrome / Edge 137 或以上版本，建议更新到最新�
 
 ## 第二步：把安装交给 Agent
 
-浏览器插件和 Agent 是两个独立安装包，版本须分别核对：`0.4.1` Agent 配套 `0.4.0` 或更新版本的浏览器插件。前往[官方接入教程](https://mediaclaw.app/docs/agent/setup)，选择当前宿主及“安装”“修复”或“升级”，把对应提示词发给该宿主 Agent。豆包工作由 Agent 准备配置，再由你保存连接器，Grok Bot 在自己的云电脑上安装。
+浏览器插件和 Agent 是两个独立安装包，版本须分别核对：`0.4.2` Agent 配套 `0.4.0` 或更新版本的浏览器插件。前往[官方接入教程](https://mediaclaw.app/docs/agent/setup)，选择当前宿主及“安装”“修复”或“升级”，把对应提示词发给该宿主 Agent。豆包工作由 Agent 准备配置，再由你保存连接器，Grok Bot 在自己的云电脑上安装。
 
 完整提示词只有一份来源：[install-prompts.json](../plugins/mediaclaw/contracts/install-prompts.json)。浏览器插件和官网通过[提示词接口](https://api.mediaclaw.app/api/agent-prompts)读取相同内容，使用 `revision` 区分提示词修订、`agentVersion` 区分目标运行时版本；本页保留配置字段与排查说明。修复或升级时，即使工具已经存在、浏览器已经连接，也必须核对当前官方来源、正式渠道和实际运行版本，不能只看安装列表。
 
 以下安装操作由 Agent 执行：
 
-1. **Codex、WorkBuddy、Claude Code**：用宿主自身的插件管理工具或 CLI 注册官方 `IvyXue18/MediaClaw-Agent` 为 `mediaclaw-agent` marketplace，再安装 `mediaclaw@mediaclaw-agent`。同名市场已存在时先核对来源并刷新；若仍指向旧本地目录或其他来源，仅移除这一个旧市场注册，按官方来源重新注册并重新安装，保留其他市场和插件。通过宿主列表核对来源、安装路径、启用状态和版本 `0.4.1`；不得手写安装注册文件。WorkBuddy 每次调用 CLI 都须使用实际用户数据目录，见下方排查说明。
+1. **Codex、WorkBuddy、Claude Code**：用宿主自身的插件管理工具或 CLI 注册官方 `IvyXue18/MediaClaw-Agent` 为 `mediaclaw-agent` marketplace，再安装 `mediaclaw@mediaclaw-agent`。同名市场已存在时先核对来源并刷新；若仍指向旧本地目录或其他来源，仅移除这一个旧市场注册，按官方来源重新注册并重新安装，保留其他市场和插件。通过宿主列表核对来源、安装路径、启用状态和版本 `0.4.2`；不得手写安装注册文件。WorkBuddy 每次调用 CLI 都须使用实际用户数据目录，见下方排查说明。
 2. **豆包工作、Grok Build、Grok Bot、DeepSeek Harness、Cursor**：先把官方仓库 `https://github.com/IvyXue18/MediaClaw-Agent.git` 的默认分支克隆到长期目录：本机为 `~/.mediaclaw/MediaClaw-Agent`，Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`；Grok Bot 为 `/workspace/mediaclaw/MediaClaw-Agent`。已有目录先核对 origin 为官方地址、工作区无未保存改动，再从官方地址更新到当前正式版；之前固定在预发布标签的目录同样更新到正式版。有本地改动时保留原目录，在另一个长期目录准备正式版，也不要修改开发源码仓。然后按下方宿主说明配置 STDIO：命令指向该目录下 `plugins/mediaclaw/scripts/launch-agent.cmd` 的绝对路径，Grok Bot 使用 `plugins/mediaclaw/scripts/launch-agent`。这些正式启动器会自动下载并校验当前版本的原生运行时，不使用 `launch-agent-local.cmd`，不需要用户安装 Node。
-3. 重开需要重开的宿主，用 MCP 握手或连接状态核对实际 Adapter 版本为 `0.4.1`，且宿主标识与下表一致。运行的仍是旧版本、仅清单版本变了、或工具尚未加载时，都不能宣布安装完成。连接器工具已注册也不等于浏览器已配对；继续按“批准连接”核查。
+3. 重开需要重开的宿主，用 MCP 握手或连接状态核对实际 Adapter 版本为 `0.4.2`，且宿主标识与下表一致。运行的仍是旧版本、仅清单版本变了、或工具尚未加载时，都不能宣布安装完成。连接器工具已注册也不等于浏览器已配对；继续按“批准连接”核查。
 
 | 宿主 | `MEDIACLAW_AGENT_HOST` | 设备显示名 |
 | --- | --- | --- |
@@ -42,7 +42,7 @@ Agent 负责识别宿主、注册官方来源和安装接入包。接入包第�
 
 ### 打不开 GitHub 时
 
-不需要 VPN。运行时默认从国内下载源获取；如果 marketplace 注册、`git clone` 或 `git pull` 连接被重置或 2 分钟内没有完成，安装提示词会让 Agent 改用同版本的官方国内副本 `https://media.mediaclaw.app/agent/package/v0.4.1/MediaClaw-Agent.zip`：核对同名 `.sha256` 文件后解压，把压缩包里的 `MediaClaw-Agent` 文件夹保存为长期目录（本机为 `~/.mediaclaw/MediaClaw-Agent`，Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`；macOS/Linux 需保留启动器的可执行权限），有插件市场的宿主用该目录的本地路径注册 `mediaclaw-agent` 市场，其他宿主直接指向该目录中的正式启动器。国内副本没有 git 记录，更新时由 Agent 重新下载新版本副本并整体替换，设备身份和数据保留不变。
+不需要 VPN。运行时默认从国内下载源获取；如果 marketplace 注册、`git clone` 或 `git pull` 连接被重置或 2 分钟内没有完成，安装提示词会让 Agent 改用同版本的官方国内副本 `https://media.mediaclaw.app/agent/package/v0.4.2/MediaClaw-Agent.zip`：核对同名 `.sha256` 文件后解压，把压缩包里的 `MediaClaw-Agent` 文件夹保存为长期目录（本机为 `~/.mediaclaw/MediaClaw-Agent`，Windows 为 `%USERPROFILE%\.mediaclaw\MediaClaw-Agent`；macOS/Linux 需保留启动器的可执行权限），有插件市场的宿主用该目录的本地路径注册 `mediaclaw-agent` 市场，其他宿主直接指向该目录中的正式启动器。国内副本没有 git 记录，更新时由 Agent 重新下载新版本副本并整体替换，设备身份和数据保留不变。
 
 ### WorkBuddy 提示没有安装能力时
 
@@ -115,7 +115,7 @@ Grok Bot 在自己的云电脑上工作，浏览器插件和 Agent 都安装在�
 
 填写时变量名和值必须分栏输入，不加引号、不写等号、不留首尾空格。设备名必须完整保留空格、括号和“豆包工作”。命令必须是绝对路径，参数必须真正留空。界面没有工作目录输入框，不需要填写 CWD（工作目录）；启动器按自身位置定位程序文件。
 
-在让用户保存前，安装 Agent 必须使用同一命令绝对路径和上表两个环境变量，在仓库外的工作目录、GUI 常见的精简 `PATH` 下完成 MCP `initialize` 和 `tools/list`；只有服务名为 `mediaclaw-agent-adapter`、实际版本为 `0.4.1` 且工具列表包含 `mediaclaw_connection_status` 才算预检通过。宿主保存后仍应以连接器管理页真实列出工具为最终成功标准。
+在让用户保存前，安装 Agent 必须使用同一命令绝对路径和上表两个环境变量，在仓库外的工作目录、GUI 常见的精简 `PATH` 下完成 MCP `initialize` 和 `tools/list`；只有服务名为 `mediaclaw-agent-adapter`、实际版本为 `0.4.2` 且工具列表包含 `mediaclaw_connection_status` 才算预检通过。宿主保存后仍应以连接器管理页真实列出工具为最终成功标准。
 
 连接失败时保留并编辑现有的 `mediaclaw`，不要创建第二个。优先按以下顺序定位：
 
