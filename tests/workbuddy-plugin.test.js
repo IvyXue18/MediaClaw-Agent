@@ -89,12 +89,12 @@ test("the marketplace ships native launchers for POSIX and Windows hosts", () =>
   assert.match(fs.readFileSync(windowsLauncher, "utf8"), /Get-FileHash/);
   assert.match(
     fs.readFileSync(windowsLauncher, "utf8"),
-    /^#!\/bin\/sh\n@goto windows 2>NUL\n/,
+    /^#!\/bin\/sh\n@goto windows 2>NUL #\r\n/,
     "the shared .cmd launcher must remain directly executable on POSIX and jump over POSIX lines on Windows",
   );
   assert.match(
     fs.readFileSync(localLauncher, "utf8"),
-    /^#!\/bin\/sh\n@goto windows 2>NUL\n/,
+    /^#!\/bin\/sh\n@goto windows 2>NUL #\r\n/,
     "the local source launcher must remain directly executable on POSIX and Windows",
   );
 });

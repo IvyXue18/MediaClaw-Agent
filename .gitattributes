@@ -1,0 +1,3 @@
+# Polyglot sh/cmd launchers: line 1 ends in LF for the shebang, later lines in CRLF for cmd.exe.
+# Store and export the exact bytes (git archive builds the domestic mirror zip).
+*.cmd -text

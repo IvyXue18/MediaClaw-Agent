@@ -1,10 +1,10 @@
 #!/bin/sh
-@goto windows 2>NUL
-rm -f NUL
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec "$SCRIPT_DIR/launch-agent" "$@"
-exit 1
-
+@goto windows 2>NUL #
+rm -f NUL #
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)" #
+exec "$SCRIPT_DIR/launch-agent" "$@" #
+exit 1 #
+#
 :windows
 @echo off
 setlocal
